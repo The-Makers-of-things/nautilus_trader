@@ -1,0 +1,447 @@
+// -------------------------------------------------------------------------------------------------
+//  Copyright (C) 2015-2026 Nautech Systems Pty Ltd. All rights reserved.
+//  https://nautechsystems.io
+//
+//  Licensed under the GNU Lesser General Public License Version 3.0 (the "License");
+//  You may not use this file except in compliance with the License.
+//  You may obtain a copy of the License at https://www.gnu.org/licenses/lgpl-3.0.en.html
+//
+//  Unless required by applicable law or agreed to in writing, software
+//  distributed under the License is distributed on an "AS IS" BASIS,
+//  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+//  See the License for the specific language governing permissions and
+//  limitations under the License.
+// -------------------------------------------------------------------------------------------------
+
+use nautilus_model::{
+    data::{BookOrder, OrderBookDelta, OrderBookDeltas, OrderBookDepth},
+    enums::OrderSide,
+};
+
+use super::{
+    super::{SbeCursor, SbeDecodeError, SbeEncodeError, SbeWriter},
+    FromSbeReuse, MarketSbeMessage,
+    common::{
+        BOOK_ORDER_BLOCK_LENGTH, DEPTH10_COUNTS_BLOCK_LENGTH, DEPTH10_LEVEL_BLOCK_LENGTH,
+        DEPTH10_LEVEL_COUNT, GROUP_HEADER_16_LENGTH, MessageHeader,
+        ORDER_BOOK_DELTA_GROUP_BLOCK_LENGTH, decode_book_action, decode_header,
+        decode_instrument_id, decode_order_side, decode_price, decode_quantity, decode_unix_nanos,
+        encode_group_header_16, encode_instrument_id, encode_price, encode_quantity,
+        encode_unix_nanos, encoded_instrument_id_size, validate_header,
+    },
+    template_id,
+};
+
+impl MarketSbeMessage for BookOrder {
+    const TEMPLATE_ID: u16 = template_id::BOOK_ORDER;
+    const BLOCK_LENGTH: u16 = BOOK_ORDER_BLOCK_LENGTH;
+
+    fn encode_body(&self, writer: &mut SbeWriter<'_>) -> Result<(), SbeEncodeError> {
+        encode_book_order(writer, self);
+        Ok(())
+    }
+
+    fn decode_body(cursor: &mut SbeCursor<'_>) -> Result<Self, SbeDecodeError> {
+        decode_book_order(cursor)
+    }
+}
+
+impl MarketSbeMessage for OrderBookDelta {
+    const TEMPLATE_ID: u16 = template_id::ORDER_BOOK_DELTA;
+    const BLOCK_LENGTH: u16 = ORDER_BOOK_DELTA_GROUP_BLOCK_LENGTH;
+
+    fn encode_body(&self, writer: &mut SbeWriter<'_>) -> Result<(), SbeEncodeError> {
+        encode_order_book_delta_fields(writer, self);
+        encode_instrument_id(writer, &self.instrument_id)
+    }
+
+    fn decode_body(cursor: &mut SbeCursor<'_>) -> Result<Self, SbeDecodeError> {
+        let action = decode_book_action(cursor)?;
+        let order = decode_book_order(cursor)?;
+        let flags = cursor.read_u8()?;
+        let sequence = cursor.read_u64_le()?;
+        let ts_event = decode_unix_nanos(cursor)?;
+        let ts_init = decode_unix_nanos(cursor)?;
+        let instrument_id = decode_instrument_id(cursor)?;
+
+        Ok(Self {
+            instrument_id,
+            action,
+            order,
+            flags,
+            sequence,
+            ts_event,
+            ts_init,
+        })
+    }
+
+    fn encoded_body_size(&self) -> usize {
+        usize::from(Self::BLOCK_LENGTH) + encoded_instrument_id_size(&self.instrument_id)
+    }
+}
+
+impl MarketSbeMessage for OrderBookDeltas {
+    const TEMPLATE_ID: u16 = template_id::ORDER_BOOK_DELTAS;
+    const BLOCK_LENGTH: u16 = 25;
+
+    fn encode_body(&self, writer: &mut SbeWriter<'_>) -> Result<(), SbeEncodeError> {
+        writer.write_u8(self.flags);
+        writer.write_u64_le(self.sequence);
+        encode_unix_nanos(writer, self.ts_event);
+        encode_unix_nanos(writer, self.ts_init);
+        encode_instrument_id(writer, &self.instrument_id)?;
+        encode_group_header_16(
+            writer,
+            "OrderBookDeltas.deltas",
+            self.deltas.len(),
+            ORDER_BOOK_DELTA_GROUP_BLOCK_LENGTH,
+        )?;
+
+        for delta in &self.deltas {
+            <OrderBookDelta as MarketSbeMessage>::encode_body(delta, writer)?;
+        }
+        Ok(())
+    }
+
+    fn decode_body(cursor: &mut SbeCursor<'_>) -> Result<Self, SbeDecodeError> {
+        let mut scratch = Vec::new();
+        decode_order_book_deltas_body(cursor, &mut scratch)
+    }
+
+    fn encoded_body_size(&self) -> usize {
+        usize::from(Self::BLOCK_LENGTH)
+            + encoded_instrument_id_size(&self.instrument_id)
+            + GROUP_HEADER_16_LENGTH
+            + self
+                .deltas
+                .iter()
+                .map(MarketSbeMessage::encoded_body_size)
+                .sum::<usize>()
+    }
+}
+
+impl FromSbeReuse for OrderBookDeltas {
+    type Scratch = Vec<OrderBookDelta>;
+
+    fn from_sbe_reuse(
+        bytes: &[u8],
+        scratch: &mut Vec<OrderBookDelta>,
+    ) -> Result<Self, SbeDecodeError> {
+        let mut cursor = SbeCursor::new(bytes);
+        let header = decode_header(&mut cursor)?;
+        validate_header(
+            header,
+            <Self as MarketSbeMessage>::TEMPLATE_ID,
+            <Self as MarketSbeMessage>::BLOCK_LENGTH,
+        )?;
+        decode_order_book_deltas_body(&mut cursor, scratch)
+    }
+}
+
+fn decode_order_book_deltas_body(
+    cursor: &mut SbeCursor<'_>,
+    scratch: &mut Vec<OrderBookDelta>,
+) -> Result<OrderBookDeltas, SbeDecodeError> {
+    let flags = cursor.read_u8()?;
+    let sequence = cursor.read_u64_le()?;
+    let ts_event = decode_unix_nanos(cursor)?;
+    let ts_init = decode_unix_nanos(cursor)?;
+    let instrument_id = decode_instrument_id(cursor)?;
+    let (block_length, count) = cursor.read_group_header_16()?;
+
+    if block_length != ORDER_BOOK_DELTA_GROUP_BLOCK_LENGTH {
+        return Err(SbeDecodeError::InvalidBlockLength {
+            expected: ORDER_BOOK_DELTA_GROUP_BLOCK_LENGTH,
+            actual: block_length,
+        });
+    }
+
+    let count = usize::from(count);
+    scratch.clear();
+    scratch.reserve(count);
+
+    for _ in 0..count {
+        scratch.push(<OrderBookDelta as MarketSbeMessage>::decode_body(cursor)?);
+    }
+
+    Ok(OrderBookDeltas {
+        instrument_id,
+        deltas: std::mem::take(scratch),
+        flags,
+        sequence,
+        ts_event,
+        ts_init,
+    })
+}
+
+impl MarketSbeMessage for OrderBookDepth {
+    const TEMPLATE_ID: u16 = template_id::ORDER_BOOK_DEPTH;
+    const BLOCK_LENGTH: u16 =
+        (DEPTH10_LEVEL_BLOCK_LENGTH * 20) + (DEPTH10_COUNTS_BLOCK_LENGTH as u16 * 2) + 25;
+
+    fn template_id(&self) -> u16 {
+        if depth_uses_legacy_layout(self) {
+            Self::TEMPLATE_ID
+        } else {
+            template_id::ORDER_BOOK_DEPTH_FULL
+        }
+    }
+
+    fn block_length(&self) -> u16 {
+        if depth_uses_legacy_layout(self) {
+            Self::BLOCK_LENGTH
+        } else {
+            DEPTH_FULL_BLOCK_LENGTH
+        }
+    }
+
+    fn decode_with_header(
+        header: MessageHeader,
+        cursor: &mut SbeCursor<'_>,
+    ) -> Result<Self, SbeDecodeError> {
+        if header.template_id == template_id::ORDER_BOOK_DEPTH_FULL {
+            validate_header(
+                header,
+                template_id::ORDER_BOOK_DEPTH_FULL,
+                DEPTH_FULL_BLOCK_LENGTH,
+            )?;
+            decode_depth_full(cursor)
+        } else {
+            validate_header(header, Self::TEMPLATE_ID, Self::BLOCK_LENGTH)?;
+            Self::decode_body(cursor)
+        }
+    }
+
+    fn encode_body(&self, writer: &mut SbeWriter<'_>) -> Result<(), SbeEncodeError> {
+        if !depth_uses_legacy_layout(self) {
+            return encode_depth_full(self, writer);
+        }
+
+        for bid in &self.bids {
+            encode_price(writer, &bid.price);
+            encode_quantity(writer, &bid.size);
+        }
+
+        for ask in &self.asks {
+            encode_price(writer, &ask.price);
+            encode_quantity(writer, &ask.size);
+        }
+
+        for count in &self.bid_counts {
+            writer.write_u32_le(*count);
+        }
+
+        for count in &self.ask_counts {
+            writer.write_u32_le(*count);
+        }
+        writer.write_u8(self.flags);
+        writer.write_u64_le(self.sequence);
+        encode_unix_nanos(writer, self.ts_event);
+        encode_unix_nanos(writer, self.ts_init);
+        encode_instrument_id(writer, &self.instrument_id)
+    }
+
+    fn decode_body(cursor: &mut SbeCursor<'_>) -> Result<Self, SbeDecodeError> {
+        let mut bids = [BookOrder::default(); DEPTH10_LEVEL_COUNT];
+        let mut asks = [BookOrder::default(); DEPTH10_LEVEL_COUNT];
+
+        for bid in &mut bids {
+            *bid = BookOrder::new(
+                OrderSide::Buy,
+                decode_price(cursor)?,
+                decode_quantity(cursor)?,
+                0,
+            );
+        }
+
+        for ask in &mut asks {
+            *ask = BookOrder::new(
+                OrderSide::Sell,
+                decode_price(cursor)?,
+                decode_quantity(cursor)?,
+                0,
+            );
+        }
+
+        let mut bid_counts = [0u32; DEPTH10_LEVEL_COUNT];
+        let mut ask_counts = [0u32; DEPTH10_LEVEL_COUNT];
+
+        for count in &mut bid_counts {
+            *count = cursor.read_u32_le()?;
+        }
+
+        for count in &mut ask_counts {
+            *count = cursor.read_u32_le()?;
+        }
+
+        let flags = cursor.read_u8()?;
+        let sequence = cursor.read_u64_le()?;
+        let ts_event = decode_unix_nanos(cursor)?;
+        let ts_init = decode_unix_nanos(cursor)?;
+        let instrument_id = decode_instrument_id(cursor)?;
+
+        Ok(Self {
+            instrument_id,
+            bids: bids.into(),
+            asks: asks.into(),
+            bid_counts: bid_counts.into(),
+            ask_counts: ask_counts.into(),
+            flags,
+            sequence,
+            ts_event,
+            ts_init,
+        })
+    }
+
+    fn encoded_body_size(&self) -> usize {
+        let body = if depth_uses_legacy_layout(self) {
+            usize::from(Self::BLOCK_LENGTH)
+        } else {
+            usize::from(DEPTH_FULL_BLOCK_LENGTH)
+                + GROUP_HEADER_16_LENGTH * 2
+                + (self.bids.len() + self.asks.len()) * usize::from(DEPTH_FULL_LEVEL_BLOCK_LENGTH)
+        };
+
+        body + encoded_instrument_id_size(&self.instrument_id)
+    }
+}
+
+const DEPTH_FULL_BLOCK_LENGTH: u16 = 25;
+const DEPTH_FULL_LEVEL_BLOCK_LENGTH: u16 = BOOK_ORDER_BLOCK_LENGTH + 4;
+
+fn depth_uses_legacy_layout(value: &OrderBookDepth) -> bool {
+    value.bids.len() == DEPTH10_LEVEL_COUNT
+        && value.asks.len() == DEPTH10_LEVEL_COUNT
+        && value.bid_counts.len() == DEPTH10_LEVEL_COUNT
+        && value.ask_counts.len() == DEPTH10_LEVEL_COUNT
+        && value
+            .bids
+            .iter()
+            .all(|order| order.side == Some(OrderSide::Buy) && order.order_id == 0)
+        && value
+            .asks
+            .iter()
+            .all(|order| order.side == Some(OrderSide::Sell) && order.order_id == 0)
+}
+
+fn encode_depth_full(
+    value: &OrderBookDepth,
+    writer: &mut SbeWriter<'_>,
+) -> Result<(), SbeEncodeError> {
+    for (group, count, expected) in [
+        ("bid_counts", value.bid_counts.len(), value.bids.len()),
+        ("ask_counts", value.ask_counts.len(), value.asks.len()),
+    ] {
+        if count != expected {
+            return Err(SbeEncodeError::InvalidGroupSize {
+                group,
+                count,
+                expected,
+            });
+        }
+    }
+
+    writer.write_u8(value.flags);
+    writer.write_u64_le(value.sequence);
+    encode_unix_nanos(writer, value.ts_event);
+    encode_unix_nanos(writer, value.ts_init);
+    encode_instrument_id(writer, &value.instrument_id)?;
+    for (group, orders, counts) in [
+        (
+            "OrderBookDepth.bids",
+            value.bids.as_slice(),
+            value.bid_counts.as_slice(),
+        ),
+        (
+            "OrderBookDepth.asks",
+            value.asks.as_slice(),
+            value.ask_counts.as_slice(),
+        ),
+    ] {
+        encode_group_header_16(writer, group, orders.len(), DEPTH_FULL_LEVEL_BLOCK_LENGTH)?;
+        for (order, count) in orders.iter().zip(counts) {
+            encode_book_order(writer, order);
+            writer.write_u32_le(*count);
+        }
+    }
+
+    Ok(())
+}
+
+pub(super) fn decode_depth_full(
+    cursor: &mut SbeCursor<'_>,
+) -> Result<OrderBookDepth, SbeDecodeError> {
+    let flags = cursor.read_u8()?;
+    let sequence = cursor.read_u64_le()?;
+    let ts_event = decode_unix_nanos(cursor)?;
+    let ts_init = decode_unix_nanos(cursor)?;
+    let instrument_id = decode_instrument_id(cursor)?;
+    let (bids, bid_counts) = decode_depth_levels(cursor)?;
+    let (asks, ask_counts) = decode_depth_levels(cursor)?;
+    OrderBookDepth::new_checked(
+        instrument_id,
+        bids,
+        asks,
+        bid_counts,
+        ask_counts,
+        flags,
+        sequence,
+        ts_event,
+        ts_init,
+    )
+    .map_err(|_| SbeDecodeError::InvalidValue {
+        field: "OrderBookDepth",
+    })
+}
+
+fn decode_depth_levels(
+    cursor: &mut SbeCursor<'_>,
+) -> Result<(Vec<BookOrder>, Vec<u32>), SbeDecodeError> {
+    let (block_length, count) = cursor.read_group_header_16()?;
+    if block_length != DEPTH_FULL_LEVEL_BLOCK_LENGTH {
+        return Err(SbeDecodeError::InvalidBlockLength {
+            expected: DEPTH_FULL_LEVEL_BLOCK_LENGTH,
+            actual: block_length,
+        });
+    }
+
+    let count = usize::from(count);
+    cursor.require(count * usize::from(DEPTH_FULL_LEVEL_BLOCK_LENGTH))?;
+    let mut orders = Vec::with_capacity(count);
+    let mut counts = Vec::with_capacity(count);
+    for _ in 0..count {
+        orders.push(decode_book_order(cursor)?);
+        counts.push(cursor.read_u32_le()?);
+    }
+
+    Ok((orders, counts))
+}
+
+fn encode_book_order(writer: &mut SbeWriter<'_>, order: &BookOrder) {
+    encode_price(writer, &order.price);
+    encode_quantity(writer, &order.size);
+    writer.write_u8(order.side.map_or(0, |side| side as u8));
+    writer.write_u64_le(order.order_id);
+}
+
+fn decode_book_order(cursor: &mut SbeCursor<'_>) -> Result<BookOrder, SbeDecodeError> {
+    let price = decode_price(cursor)?;
+    let size = decode_quantity(cursor)?;
+    let side = decode_order_side(cursor)?;
+    let order_id = cursor.read_u64_le()?;
+    Ok(BookOrder {
+        side,
+        price,
+        size,
+        order_id,
+    })
+}
+
+fn encode_order_book_delta_fields(writer: &mut SbeWriter<'_>, delta: &OrderBookDelta) {
+    writer.write_u8(delta.action as u8);
+    encode_book_order(writer, &delta.order);
+    writer.write_u8(delta.flags);
+    writer.write_u64_le(delta.sequence);
+    encode_unix_nanos(writer, delta.ts_event);
+    encode_unix_nanos(writer, delta.ts_init);
+}

@@ -1,0 +1,1297 @@
+// -------------------------------------------------------------------------------------------------
+//  Copyright (C) 2015-2026 Nautech Systems Pty Ltd. All rights reserved.
+//  https://nautechsystems.io
+//
+//  Licensed under the GNU Lesser General Public License Version 3.0 (the "License");
+//  You may not use this file except in compliance with the License.
+//  You may obtain a copy of the License at https://www.gnu.org/licenses/lgpl-3.0.en.html
+//
+//  Unless required by applicable law or agreed to in writing, software
+//  distributed under the License is distributed on an "AS IS" BASIS,
+//  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+//  See the License for the specific language governing permissions and
+//  limitations under the License.
+// -------------------------------------------------------------------------------------------------
+
+//! `sockudo-ws` backend for the transport abstraction.
+//!
+//! Mirrors the layout of the [`tungstenite`](super::tungstenite) module: provides
+//! `From`/`TryFrom` conversions between the neutral [`Message`] / [`TransportError`]
+//! and sockudo's native types, plus a [`SockudoTransport<S>`] adapter that lifts a
+//! sockudo [`WebSocketStream<S>`] into the backend-agnostic [`WsTransport`] trait.
+//!
+//! The `Message` enums are structurally identical: both carry payloads as `bytes::Bytes`
+//! across all five variants, so conversions are zero-copy and infallible.
+//!
+//! Request bytes come from sockudo's header-aware builder; the response loop stays
+//! local so upgrade rejections map to [`TransportError::UpgradeRejected`] with
+//! host-context logging instead of collapsing into a handshake failure.
+
+use std::{
+    pin::Pin,
+    task::{Context, Poll},
+};
+
+use bytes::{Bytes, BytesMut};
+use futures_util::{Sink, Stream, StreamExt};
+use sockudo_ws::{
+    HandshakeResult,
+    error::{CloseReason as SockudoCloseReason, Error as SockudoError},
+    handshake,
+    protocol::Message as SockudoMessage,
+    stream::{SplitWriter, WebSocketStream},
+};
+use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+use tokio_util::sync::ReusableBoxFuture;
+
+use super::{
+    error::{TransportError, retryable_status},
+    message::{CloseFrame, Message},
+    stream::WsTransport,
+};
+
+const MAX_HTTP_HEADER_SIZE: usize = 8192;
+
+// WebSocket upgrade headers we always set, plus body-framing headers that have
+// no place on a GET upgrade.
+const RESERVED_UPGRADE_HEADERS: &[&str] = &[
+    "host",
+    "upgrade",
+    "connection",
+    "sec-websocket-key",
+    "sec-websocket-version",
+    "sec-websocket-protocol",
+    "sec-websocket-extensions",
+    "content-length",
+    "transfer-encoding",
+    "te",
+    "trailer",
+];
+
+/// Performs the client handshake, building the upgrade request with sockudo's
+/// header-aware builder and reading the response locally.
+///
+/// The local response loop preserves the rejection status for
+/// [`TransportError::UpgradeRejected`] and the retry-aware log severity; caller
+/// pre-validates `extra_headers` via [`validate_extra_headers`].
+pub(crate) async fn client_handshake_with_headers<S>(
+    stream: &mut S,
+    host: &str,
+    path: &str,
+    extra_headers: &[(String, String)],
+) -> Result<HandshakeResult, TransportError>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let key = handshake::generate_key();
+    let request =
+        handshake::build_request_with_headers(host, path, &key, None, None, Some(extra_headers))?;
+
+    stream
+        .write_all(&request)
+        .await
+        .map_err(TransportError::from)?;
+    stream.flush().await.map_err(TransportError::from)?;
+
+    let mut buf = BytesMut::with_capacity(4096);
+    loop {
+        if buf.len() > MAX_HTTP_HEADER_SIZE {
+            return Err(SockudoError::InvalidHttp("response too large").into());
+        }
+
+        let n = stream
+            .read_buf(&mut buf)
+            .await
+            .map_err(TransportError::from)?;
+
+        if n == 0 {
+            return Err(TransportError::ConnectionClosed);
+        }
+
+        let parsed = match handshake::parse_response(&buf) {
+            Ok(parsed) => parsed,
+            Err(e) => {
+                let status = rejected_upgrade_status(&e, &buf);
+                log_handshake_response(host, &e, &buf, status);
+                return Err(
+                    status.map_or_else(|| TransportError::from(e), TransportError::UpgradeRejected)
+                );
+            }
+        };
+
+        if let Some((res, consumed)) = parsed {
+            let accept = res.accept.ok_or_else(|| {
+                let e = SockudoError::HandshakeFailed("missing Sec-WebSocket-Accept");
+                log_handshake_response(host, &e, &buf, None);
+                TransportError::from(e)
+            })?;
+
+            if !handshake::validate_accept_key(&key, accept) {
+                let e = SockudoError::HandshakeFailed("invalid Sec-WebSocket-Accept");
+                log_handshake_response(host, &e, &buf, None);
+                return Err(e.into());
+            }
+
+            let res_protocol = res.protocol.map(String::from);
+            let res_extensions = res.extensions.map(String::from);
+
+            let leftover = if consumed < buf.len() {
+                Some(buf.split_off(consumed).freeze())
+            } else {
+                None
+            };
+
+            return Ok(HandshakeResult {
+                path: path.to_string(),
+                protocol: res_protocol,
+                extensions: res_extensions,
+                leftover,
+            });
+        }
+    }
+}
+
+// Gated on the error variant rather than its message. `HandshakeFailed` means the response parsed
+// as HTTP but failed handshake validation, which is the only case where a rejection status is
+// recoverable; `InvalidHttp` stays permanent. Matching the diagnostic text would put an upstream
+// string into transport semantics, and recovering after any error would let a plausible status
+// line with malformed headers pass as a rejection.
+fn rejected_upgrade_status(err: &SockudoError, buf: &[u8]) -> Option<u16> {
+    if !matches!(err, SockudoError::HandshakeFailed(_)) {
+        return None;
+    }
+
+    let status_line_end = buf.windows(2).position(|window| window == b"\r\n")?;
+    let status_line = std::str::from_utf8(&buf[..status_line_end]).ok()?;
+    let mut parts = status_line.split_whitespace();
+    let version = parts.next()?;
+    let status = parts.next()?;
+    if !version.starts_with("HTTP/1.") || status.len() != 3 {
+        return None;
+    }
+
+    // A 101 that still failed validation is a protocol fault, not a rejection.
+    status.parse().ok().filter(|status| *status != 101)
+}
+
+// A rejection the client goes on to retry is reported at WARN: an ERROR arms the
+// `shutdown_on_error` trigger, which stops the node while the reconnect loop is still recovering.
+// Permanent rejections, malformed responses, and failed accept-key checks retain ERROR handling.
+//
+// `host` names the endpoint so a node running several connections shows which one failed. It is
+// the `Host` header built from the URL authority, so it carries no userinfo, path, or signed
+// query; the request path stays out of the message for that reason.
+fn log_handshake_response(host: &str, err: &SockudoError, buf: &BytesMut, status: Option<u16>) {
+    let response_bytes = buf.len();
+
+    match status {
+        Some(status) if retryable_status(status) => log::warn!(
+            "Sockudo handshake rejected by {host} with retryable status {status}; response bytes={response_bytes}"
+        ),
+        Some(status) => log::error!(
+            "Sockudo handshake rejected by {host} with permanent status {status}; response bytes={response_bytes}"
+        ),
+        None => log::error!(
+            "Sockudo handshake failed for {host}: {err}; response bytes={response_bytes}"
+        ),
+    }
+}
+
+pub(crate) fn validate_extra_headers(headers: &[(String, String)]) -> Result<(), SockudoError> {
+    for (name, value) in headers {
+        validate_extra_header(name, value)?;
+    }
+
+    Ok(())
+}
+
+fn validate_extra_header(name: &str, value: &str) -> Result<(), SockudoError> {
+    let parsed_name = name
+        .parse::<http::HeaderName>()
+        .map_err(|_| SockudoError::InvalidHttp("invalid header name"))?;
+
+    if RESERVED_UPGRADE_HEADERS.contains(&parsed_name.as_str()) {
+        return Err(SockudoError::InvalidHttp(
+            "reserved upgrade header not allowed in extra_headers",
+        ));
+    }
+
+    http::HeaderValue::from_str(value)
+        .map_err(|_| SockudoError::InvalidHttp("invalid header value"))?;
+    Ok(())
+}
+
+/// Replay bytes read during the handshake before forwarding to the inner IO.
+pub(crate) struct PrefixedIo<S> {
+    inner: S,
+    prefix: Bytes,
+}
+
+impl<S> PrefixedIo<S> {
+    pub(crate) const fn new(inner: S, prefix: Bytes) -> Self {
+        Self { inner, prefix }
+    }
+}
+
+impl<S> AsyncRead for PrefixedIo<S>
+where
+    S: AsyncRead + Unpin,
+{
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        if !self.prefix.is_empty() {
+            let n = self.prefix.len().min(buf.remaining());
+            let chunk = self.prefix.split_to(n);
+            buf.put_slice(&chunk);
+            return Poll::Ready(Ok(()));
+        }
+
+        Pin::new(&mut self.inner).poll_read(cx, buf)
+    }
+}
+
+impl<S> AsyncWrite for PrefixedIo<S>
+where
+    S: AsyncWrite + Unpin,
+{
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        Pin::new(&mut self.inner).poll_write(cx, buf)
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.inner).poll_shutdown(cx)
+    }
+}
+
+impl From<SockudoMessage> for Message {
+    fn from(value: SockudoMessage) -> Self {
+        match value {
+            SockudoMessage::Text(b) => Self::Text(b),
+            SockudoMessage::Binary(b) => Self::Binary(b),
+            SockudoMessage::Ping(b) => Self::Ping(b),
+            SockudoMessage::Pong(b) => Self::Pong(b),
+            SockudoMessage::Close(reason) => Self::Close(reason.map(Into::into)),
+        }
+    }
+}
+
+impl From<Message> for SockudoMessage {
+    /// Converts a neutral [`Message`] into a Sockudo [`SockudoMessage`].
+    ///
+    /// Conversion is infallible: both enums carry payloads as `bytes::Bytes` across
+    /// all variants. Sockudo validates UTF-8 on Text frames at parse time, not at
+    /// send time, so feeding it non-UTF-8 bytes via [`Self::Text`] is the caller's
+    /// responsibility.
+    fn from(value: Message) -> Self {
+        match value {
+            Message::Text(b) => Self::Text(b),
+            Message::Binary(b) => Self::Binary(b),
+            Message::Ping(b) => Self::Ping(b),
+            Message::Pong(b) => Self::Pong(b),
+            Message::Close(frame) => Self::Close(frame.map(Into::into)),
+        }
+    }
+}
+
+impl From<SockudoCloseReason> for CloseFrame {
+    fn from(value: SockudoCloseReason) -> Self {
+        Self {
+            code: value.code,
+            reason: value.reason,
+        }
+    }
+}
+
+impl From<CloseFrame> for SockudoCloseReason {
+    fn from(value: CloseFrame) -> Self {
+        Self {
+            code: value.code,
+            reason: value.reason,
+        }
+    }
+}
+
+impl From<SockudoError> for TransportError {
+    fn from(value: SockudoError) -> Self {
+        match value {
+            SockudoError::Io(e) => Self::Io(e),
+            SockudoError::ConnectionClosed => Self::ConnectionClosed,
+            SockudoError::ConnectionReset => Self::ConnectionReset,
+            SockudoError::Closed(reason) => Self::ClosedByPeer(reason.map(Into::into)),
+            SockudoError::MessageTooLarge => Self::MessageTooLarge,
+            SockudoError::FrameTooLarge => Self::FrameTooLarge,
+            SockudoError::InvalidUtf8 => Self::InvalidUtf8,
+            SockudoError::InvalidFrame(msg) | SockudoError::Protocol(msg) => {
+                Self::Protocol(msg.to_string())
+            }
+            SockudoError::InvalidHttp(msg) | SockudoError::HandshakeFailed(msg) => {
+                Self::Handshake(msg.to_string())
+            }
+
+            // Keepalive and idle deadlines are dead connections, TimedOut takes
+            // the connection-drop warn path.
+            timeout @ (SockudoError::HeartbeatTimeout | SockudoError::IdleTimeout) => Self::Io(
+                std::io::Error::new(std::io::ErrorKind::TimedOut, timeout.to_string()),
+            ),
+            other => Self::Other(other.to_string()),
+        }
+    }
+}
+
+/// Adapter that lifts a `sockudo-ws` [`WebSocketStream<S>`] into a
+/// backend-agnostic [`WsTransport`].
+///
+/// Translates messages and errors to the neutral types on the way through
+/// `Stream::poll_next` and `Sink<Message>::start_send` / `poll_*`. The
+/// underlying stream is owned and forwarded to via pin projection.
+///
+/// The underlying stream drives automatic control responses while reading.
+pub struct SockudoTransport<S> {
+    inner: WebSocketStream<S>,
+}
+
+impl<S> SockudoTransport<S> {
+    /// Wraps an established Sockudo WebSocket stream.
+    #[inline]
+    #[must_use]
+    pub const fn new(inner: WebSocketStream<S>) -> Self {
+        Self { inner }
+    }
+
+    /// Consumes the adapter and returns the underlying stream.
+    #[inline]
+    pub fn into_inner(self) -> WebSocketStream<S> {
+        self.inner
+    }
+
+    /// Borrows the underlying stream.
+    #[inline]
+    pub const fn get_ref(&self) -> &WebSocketStream<S> {
+        &self.inner
+    }
+}
+
+impl<S> std::fmt::Debug for SockudoTransport<S> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct(stringify!(SockudoTransport))
+            .finish_non_exhaustive()
+    }
+}
+
+impl<S> Stream for SockudoTransport<S>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    type Item = Result<Message, TransportError>;
+
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        match Pin::new(&mut self.inner).poll_next(cx) {
+            Poll::Ready(Some(Ok(msg))) => Poll::Ready(Some(Ok(Message::from(msg)))),
+            Poll::Ready(Some(Err(e))) => Poll::Ready(Some(Err(TransportError::from(e)))),
+            Poll::Ready(None) => Poll::Ready(None),
+            Poll::Pending => Poll::Pending,
+        }
+    }
+}
+
+impl<S> Sink<Message> for SockudoTransport<S>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    type Error = TransportError;
+
+    fn poll_ready(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        Pin::new(&mut self.inner)
+            .poll_ready(cx)
+            .map_err(TransportError::from)
+    }
+
+    fn start_send(mut self: Pin<&mut Self>, item: Message) -> Result<(), Self::Error> {
+        Pin::new(&mut self.inner)
+            .start_send(SockudoMessage::from(item))
+            .map_err(TransportError::from)
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        Pin::new(&mut self.inner)
+            .poll_flush(cx)
+            .map_err(TransportError::from)
+    }
+
+    fn poll_close(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        Pin::new(&mut self.inner)
+            .poll_close(cx)
+            .map_err(TransportError::from)
+    }
+}
+
+impl<S> SockudoTransport<S>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+    /// Returns a neutral transport backed by Sockudo's native split handles.
+    ///
+    /// Inbound data can progress independently of blocked application writes. Sockudo's
+    /// connection task drives automatic control frames and enforces connection deadlines.
+    /// Call this before sending or receiving messages. A Tokio runtime is required.
+    pub fn into_split(self) -> impl WsTransport {
+        let (reader, writer) = self.inner.split();
+
+        // Keep the decoder stationary: unfold otherwise moves the entire reader for every message
+        let read = futures_util::stream::unfold(Box::new(reader), |mut reader| async move {
+            reader.next().await.map(|message| {
+                (
+                    message.map(Message::from).map_err(TransportError::from),
+                    reader,
+                )
+            })
+        })
+        .fuse();
+
+        SockudoSplitTransport {
+            read: Box::pin(read),
+            writer: Some(writer),
+            write: ReusableBoxFuture::new(std::future::pending()),
+        }
+    }
+}
+
+struct SockudoSplitTransport<R, S> {
+    read: Pin<Box<R>>,
+    writer: Option<SplitWriter<S>>,
+    write: ReusableBoxFuture<'static, (SplitWriter<S>, Result<(), TransportError>)>,
+}
+
+impl<R, S> Stream for SockudoSplitTransport<R, S>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    R: Stream<Item = Result<Message, TransportError>>,
+{
+    type Item = Result<Message, TransportError>;
+
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        self.read.as_mut().poll_next(cx)
+    }
+}
+
+impl<R, S> Sink<Message> for SockudoSplitTransport<R, S>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    R: Stream<Item = Result<Message, TransportError>>,
+{
+    type Error = TransportError;
+
+    fn poll_ready(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        std::task::ready!(self.poll_pending_write(cx))?;
+
+        if self.writer.as_ref().is_none_or(SplitWriter::is_closed) {
+            return Poll::Ready(Err(TransportError::ConnectionClosed));
+        }
+
+        Poll::Ready(Ok(()))
+    }
+
+    fn start_send(mut self: Pin<&mut Self>, item: Message) -> Result<(), Self::Error> {
+        let writer = self.writer.take().ok_or(TransportError::ConnectionClosed)?;
+        self.write.set(write_split(writer, Some(item)));
+        Ok(())
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        if let Some(writer) = self.writer.take() {
+            self.write.set(write_split(writer, None));
+        }
+
+        self.poll_pending_write(cx)
+    }
+
+    fn poll_close(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        std::task::ready!(self.poll_pending_write(cx))?;
+
+        if self.writer.as_ref().is_none_or(SplitWriter::is_closed) {
+            return Poll::Ready(Ok(()));
+        }
+
+        self.as_mut()
+            .start_send(Message::Close(Some(CloseFrame::new(
+                CloseFrame::NORMAL,
+                "",
+            ))))?;
+        self.poll_pending_write(cx)
+    }
+}
+
+impl<R, S> SockudoSplitTransport<R, S> {
+    fn poll_pending_write(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), TransportError>> {
+        if self.writer.is_some() {
+            return Poll::Ready(Ok(()));
+        }
+
+        let (writer, result) = std::task::ready!(self.write.poll(cx));
+        self.writer = Some(writer);
+        Poll::Ready(result)
+    }
+}
+
+async fn write_split<S>(
+    mut writer: SplitWriter<S>,
+    message: Option<Message>,
+) -> (SplitWriter<S>, Result<(), TransportError>)
+where
+    S: AsyncWrite + Unpin,
+{
+    // Retain the native send future across polls: cancelling it can terminate a partial frame
+    let result = match message {
+        Some(message) => writer.send(message.into()).await,
+        None => writer.flush().await,
+    }
+    .map_err(TransportError::from);
+
+    (writer, result)
+}
+
+const _: fn() = || {
+    fn assert_ws_transport<T: WsTransport>() {}
+    assert_ws_transport::<SockudoTransport<tokio::net::TcpStream>>();
+};
+
+#[cfg(test)]
+mod tests {
+    use std::future::Future;
+
+    use bytes::Bytes;
+    use rstest::rstest;
+    #[cfg(not(feature = "turmoil"))]
+    use sockudo_ws::handshake::generate_accept_key;
+    #[cfg(not(feature = "turmoil"))]
+    use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt, duplex};
+
+    use super::*;
+
+    #[cfg(not(feature = "turmoil"))]
+    #[tokio::test]
+    async fn test_unified_read_flush_preserves_send_completion_wakeup() {
+        use futures_util::{SinkExt, StreamExt};
+
+        let (client_io, peer_io) = duplex(32);
+        let config = sockudo_ws::Config::builder()
+            .auto_ping(false)
+            .idle_timeout(0)
+            .build();
+        let transport = SockudoTransport::new(WebSocketStream::client(client_io, config.clone()));
+        let (mut writer, mut reader) = transport.split();
+        let mut peer = WebSocketStream::server(peer_io, config);
+
+        let send = tokio::spawn(async move { writer.send(Message::text("x".repeat(4096))).await });
+        tokio::task::yield_now().await;
+        peer.send(SockudoMessage::Ping(Bytes::from_static(b"probe")))
+            .await
+            .unwrap();
+        assert_eq!(
+            reader.next().await.unwrap().unwrap(),
+            Message::Ping(Bytes::from_static(b"probe"))
+        );
+
+        let read = tokio::spawn(async move { reader.next().await });
+
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            assert!(matches!(peer.next().await, Some(Ok(SockudoMessage::Text(data))) if data.len() == 4096));
+            assert!(matches!(peer.next().await, Some(Ok(SockudoMessage::Pong(data))) if data.as_ref() == b"probe"));
+            send.await.unwrap().unwrap();
+        })
+        .await
+        .expect("a completed write must wake the sender without its own timeout");
+
+        drop(peer);
+        read.await.unwrap();
+    }
+
+    #[cfg(not(feature = "turmoil"))]
+    #[tokio::test]
+    async fn test_split_reads_while_application_write_is_blocked() {
+        use futures_util::{SinkExt, StreamExt};
+
+        let (client_io, mut peer) = duplex(32);
+        let config = sockudo_ws::Config::builder()
+            .auto_ping(false)
+            .idle_timeout(0)
+            .build();
+        let transport =
+            SockudoTransport::new(WebSocketStream::client(client_io, config.clone())).into_split();
+        let (mut writer, mut reader) = transport.split();
+        let mut send = Box::pin(writer.send(Message::text("x".repeat(4096))));
+        futures_util::future::poll_fn(|cx| {
+            assert!(send.as_mut().poll(cx).is_pending());
+            Poll::Ready(())
+        })
+        .await;
+
+        peer.write_all(b"\x81\x04peer").await.unwrap();
+
+        let message = tokio::time::timeout(std::time::Duration::from_secs(1), reader.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(message, Message::text("peer"));
+    }
+
+    #[cfg(not(feature = "turmoil"))]
+    #[rstest]
+    #[case(false)]
+    #[case(true)]
+    #[tokio::test]
+    async fn test_transport_retains_send_after_outer_future_is_cancelled(#[case] native: bool) {
+        use futures_util::{SinkExt, StreamExt};
+
+        let (client_io, peer_io) = duplex(32);
+        let config = sockudo_ws::Config::builder()
+            .auto_ping(false)
+            .idle_timeout(0)
+            .build();
+        let transport = SockudoTransport::new(WebSocketStream::client(client_io, config.clone()));
+        let mut transport: Pin<Box<dyn WsTransport>> = if native {
+            Box::pin(transport.into_split())
+        } else {
+            Box::pin(transport)
+        };
+
+        let payload = Message::text("x".repeat(4096));
+        {
+            let mut send = Box::pin(transport.send(payload.clone()));
+            futures_util::future::poll_fn(|cx| {
+                assert!(send.as_mut().poll(cx).is_pending());
+                Poll::Ready(())
+            })
+            .await;
+        }
+
+        let peer_task = tokio::spawn(async move {
+            let mut peer = WebSocketStream::server(peer_io, config);
+            let first = peer.next().await.unwrap().unwrap();
+            let second = peer.next().await.unwrap().unwrap();
+            (Message::from(first), Message::from(second))
+        });
+
+        transport.flush().await.unwrap();
+        transport.send(Message::text("after")).await.unwrap();
+        let (first, second) = peer_task.await.unwrap();
+
+        assert_eq!(first, payload);
+        assert_eq!(second, Message::text("after"));
+    }
+
+    #[cfg(not(feature = "turmoil"))]
+    #[tokio::test]
+    async fn test_split_retains_partial_read_after_outer_future_is_cancelled() {
+        use futures_util::StreamExt;
+
+        let (client_io, mut peer) = duplex(64);
+        let config = sockudo_ws::Config::builder()
+            .auto_ping(false)
+            .idle_timeout(0)
+            .build();
+        let mut transport =
+            SockudoTransport::new(WebSocketStream::client(client_io, config)).into_split();
+        peer.write_all(b"\x81\x08pa").await.unwrap();
+        {
+            let mut receive = Box::pin(transport.next());
+            futures_util::future::poll_fn(|cx| {
+                assert!(receive.as_mut().poll(cx).is_pending());
+                Poll::Ready(())
+            })
+            .await;
+        }
+
+        peer.write_all(b"rtial!").await.unwrap();
+        let message = transport.next().await.unwrap().unwrap();
+
+        assert_eq!(message, Message::text("partial!"));
+    }
+
+    #[cfg(not(feature = "turmoil"))]
+    #[tokio::test]
+    async fn test_split_read_stays_ended() {
+        let (client_io, mut peer) = duplex(64);
+        let config = sockudo_ws::Config::builder()
+            .auto_ping(false)
+            .idle_timeout(0)
+            .build();
+        let mut transport =
+            SockudoTransport::new(WebSocketStream::client(client_io, config)).into_split();
+        peer.write_all(b"\x88\x02\x03\xe8").await.unwrap();
+        let close = transport.next().await.unwrap().unwrap();
+        let ended = transport.next().await;
+        let still_ended = transport.next().await;
+
+        assert_eq!(close, Message::Close(Some(CloseFrame::new(1000, ""))));
+        assert!(ended.is_none());
+        assert!(still_ended.is_none());
+    }
+
+    #[cfg(not(feature = "turmoil"))]
+    #[tokio::test]
+    async fn test_split_drives_pong_without_another_read() {
+        use futures_util::StreamExt;
+
+        let (client_io, mut peer) = duplex(64);
+        let config = sockudo_ws::Config::builder()
+            .auto_ping(false)
+            .idle_timeout(0)
+            .build();
+        let mut transport =
+            SockudoTransport::new(WebSocketStream::client(client_io, config.clone())).into_split();
+        peer.write_all(b"\x89\x04ping").await.unwrap();
+        let received = transport.next().await.unwrap().unwrap();
+        let mut peer = WebSocketStream::server(peer, config);
+        let response = tokio::time::timeout(std::time::Duration::from_secs(1), peer.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(received, Message::Ping(Bytes::from_static(b"ping")));
+        assert_eq!(
+            Message::from(response),
+            Message::Pong(Bytes::from_static(b"ping"))
+        );
+    }
+
+    #[cfg(not(feature = "turmoil"))]
+    #[tokio::test]
+    async fn test_split_close_sends_normal_status() {
+        use futures_util::{SinkExt, StreamExt};
+
+        let (client_io, peer_io) = duplex(64);
+        let config = sockudo_ws::Config::builder()
+            .auto_ping(false)
+            .idle_timeout(0)
+            .build();
+        let mut transport =
+            SockudoTransport::new(WebSocketStream::client(client_io, config.clone())).into_split();
+        transport.close().await.unwrap();
+        transport.close().await.unwrap();
+        let mut peer = WebSocketStream::server(peer_io, config);
+        let received = peer.next().await.unwrap().unwrap();
+
+        assert_eq!(
+            Message::from(received),
+            Message::Close(Some(CloseFrame::new(1000, "")))
+        );
+    }
+
+    #[cfg(not(feature = "turmoil"))]
+    #[tokio::test]
+    async fn test_split_close_after_explicit_close_preserves_reason() {
+        use futures_util::{SinkExt, StreamExt};
+
+        let (client_io, peer_io) = duplex(64);
+        let config = sockudo_ws::Config::builder()
+            .auto_ping(false)
+            .idle_timeout(0)
+            .build();
+        let mut transport =
+            SockudoTransport::new(WebSocketStream::client(client_io, config.clone())).into_split();
+
+        let close = Message::Close(Some(CloseFrame {
+            code: 3001,
+            reason: "finished".into(),
+        }));
+
+        transport.send(close.clone()).await.unwrap();
+        transport.close().await.unwrap();
+        transport.close().await.unwrap();
+        let mut peer = WebSocketStream::server(peer_io, config);
+        let received = peer.next().await.unwrap().unwrap();
+        let flush = transport.flush().await;
+
+        assert_eq!(Message::from(received), close);
+        assert!(matches!(flush, Err(TransportError::ConnectionClosed)));
+    }
+
+    #[cfg(feature = "turmoil")]
+    #[tokio::test(start_paused = true)]
+    async fn test_sockudo_idle_deadline_uses_simulated_clock() {
+        use futures_util::StreamExt;
+
+        let (client_io, _peer) = tokio::io::duplex(64);
+        let config = sockudo_ws::Config::builder()
+            .auto_ping(false)
+            .idle_timeout(1)
+            .build();
+        let mut transport =
+            SockudoTransport::new(WebSocketStream::client(client_io, config.clone())).into_split();
+        let mut receive = Box::pin(transport.next());
+        futures_util::future::poll_fn(|cx| {
+            assert!(receive.as_mut().poll(cx).is_pending());
+            Poll::Ready(())
+        })
+        .await;
+
+        tokio::time::advance(std::time::Duration::from_millis(1001)).await;
+        tokio::task::yield_now().await;
+        let result =
+            futures_util::future::poll_fn(|cx| Poll::Ready(receive.as_mut().poll(cx))).await;
+
+        let Poll::Ready(Some(Err(TransportError::Io(e)))) = result else {
+            panic!("expected simulated idle timeout, was {result:?}");
+        };
+
+        assert_eq!(e.kind(), std::io::ErrorKind::TimedOut);
+        assert_eq!(e.to_string(), SockudoError::IdleTimeout.to_string());
+    }
+
+    #[cfg(not(feature = "turmoil"))]
+    async fn read_http_request<S>(stream: &mut S) -> Vec<u8>
+    where
+        S: AsyncRead + Unpin,
+    {
+        let mut buf = Vec::new();
+        let mut chunk = [0u8; 256];
+        loop {
+            let n = stream.read(&mut chunk).await.unwrap();
+            assert!(n > 0, "HTTP request closed before headers completed");
+            buf.extend_from_slice(&chunk[..n]);
+            if buf.windows(4).any(|window| window == b"\r\n\r\n") {
+                return buf;
+            }
+        }
+    }
+
+    #[cfg(not(feature = "turmoil"))]
+    fn build_test_response(sec_websocket_key: &str, extra_bytes: &[u8]) -> Vec<u8> {
+        let accept = generate_accept_key(sec_websocket_key);
+        let mut response = format!(
+            concat!(
+                "HTTP/1.1 101 Switching Protocols\r\n",
+                "Upgrade: websocket\r\n",
+                "Connection: Upgrade\r\n",
+                "Sec-WebSocket-Accept: {}\r\n",
+                "\r\n",
+            ),
+            accept
+        )
+        .into_bytes();
+        response.extend_from_slice(extra_bytes);
+        response
+    }
+
+    #[cfg(not(feature = "turmoil"))]
+    fn extract_header<'a>(request: &'a str, name: &str) -> Option<&'a str> {
+        request.lines().find_map(|line| {
+            let (header_name, header_value) = line.split_once(':')?;
+            if header_name.eq_ignore_ascii_case(name) {
+                Some(header_value.trim())
+            } else {
+                None
+            }
+        })
+    }
+
+    #[rstest]
+    #[tokio::test]
+    #[cfg(not(feature = "turmoil"))]
+    async fn handshake_rejects_eof_before_response() {
+        let (mut client, mut server) = duplex(4096);
+        let peer = tokio::spawn(async move {
+            read_http_request(&mut server).await;
+        });
+
+        let error = client_handshake_with_headers(&mut client, "localhost", "/", &[])
+            .await
+            .unwrap_err();
+        peer.await.unwrap();
+
+        assert!(matches!(error, TransportError::ConnectionClosed));
+    }
+
+    #[rstest]
+    #[case::at_limit(MAX_HTTP_HEADER_SIZE, "connection closed")]
+    #[case::above_limit(MAX_HTTP_HEADER_SIZE + 1, "handshake failed: response too large")]
+    #[tokio::test]
+    #[cfg(not(feature = "turmoil"))]
+    async fn handshake_rejects_incomplete_headers_at_size_boundary(
+        #[case] response_size: usize,
+        #[case] expected: &str,
+    ) {
+        let (mut client, mut server) = duplex(MAX_HTTP_HEADER_SIZE * 2);
+        let peer = tokio::spawn(async move {
+            read_http_request(&mut server).await;
+            let mut response = b"HTTP/1.1 101 Switching Protocols\r\nX-Padding: ".to_vec();
+            response.resize(response_size, b'x');
+            server.write_all(&response).await.unwrap();
+        });
+
+        let error = client_handshake_with_headers(&mut client, "localhost", "/", &[])
+            .await
+            .unwrap_err();
+        peer.await.unwrap();
+
+        assert_eq!(error.to_string(), expected);
+    }
+
+    #[tokio::test]
+    #[cfg(not(feature = "turmoil"))]
+    async fn client_handshake_with_headers_sends_custom_headers() {
+        let (mut client, mut server) = duplex(4096);
+        let headers = vec![
+            ("ok-access-key".to_string(), "key-1".to_string()),
+            ("ok-access-passphrase".to_string(), "pass-1".to_string()),
+        ];
+
+        let server_task = tokio::spawn(async move {
+            let request = read_http_request(&mut server).await;
+            let request = String::from_utf8(request).unwrap();
+
+            assert!(request.starts_with("GET /ws/v5/public-sbe?instId=BTC-USDT HTTP/1.1\r\n"));
+            assert_eq!(extract_header(&request, "Host"), Some("ws.okx.com:8443"));
+            assert_eq!(extract_header(&request, "ok-access-key"), Some("key-1"));
+            assert_eq!(
+                extract_header(&request, "ok-access-passphrase"),
+                Some("pass-1")
+            );
+
+            let sec_websocket_key = extract_header(&request, "Sec-WebSocket-Key").unwrap();
+            let response = build_test_response(sec_websocket_key, &[]);
+            server.write_all(&response).await.unwrap();
+        });
+
+        let handshake = client_handshake_with_headers(
+            &mut client,
+            "ws.okx.com:8443",
+            "/ws/v5/public-sbe?instId=BTC-USDT",
+            &headers,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(handshake.path, "/ws/v5/public-sbe?instId=BTC-USDT");
+        assert!(handshake.leftover.is_none());
+        server_task.await.unwrap();
+    }
+
+    #[rstest]
+    #[cfg(not(feature = "turmoil"))]
+    #[case::host("Host")]
+    #[case::upgrade("Upgrade")]
+    #[case::connection("Connection")]
+    #[case::sec_websocket_key("Sec-WebSocket-Key")]
+    #[case::sec_websocket_version("Sec-WebSocket-Version")]
+    #[case::sec_websocket_protocol("Sec-WebSocket-Protocol")]
+    #[case::sec_websocket_extensions("Sec-WebSocket-Extensions")]
+    #[case::content_length("Content-Length")]
+    #[case::transfer_encoding("Transfer-Encoding")]
+    #[case::te("TE")]
+    #[case::trailer("Trailer")]
+    fn validate_extra_header_rejects_reserved_upgrade_headers(#[case] name: &str) {
+        let err = validate_extra_header(name, "value").unwrap_err();
+
+        assert!(matches!(
+            err,
+            SockudoError::InvalidHttp("reserved upgrade header not allowed in extra_headers")
+        ));
+    }
+
+    #[tokio::test]
+    #[cfg(not(feature = "turmoil"))]
+    async fn client_handshake_with_headers_rejects_missing_accept() {
+        let (mut client, mut server) = duplex(4096);
+        let server_task = tokio::spawn(async move {
+            let _request = read_http_request(&mut server).await;
+            server
+                .write_all(
+                    b"HTTP/1.1 101 Switching Protocols\r\n\
+                      Upgrade: websocket\r\n\
+                      Connection: Upgrade\r\n\
+                      \r\n",
+                )
+                .await
+                .unwrap();
+        });
+
+        let err = client_handshake_with_headers(&mut client, "example.com", "/ws", &[])
+            .await
+            .unwrap_err();
+
+        assert!(matches!(
+            err,
+            TransportError::Handshake(ref msg) if msg == "missing Sec-WebSocket-Accept"
+        ));
+        server_task.await.unwrap();
+    }
+
+    #[tokio::test]
+    #[cfg(not(feature = "turmoil"))]
+    async fn client_handshake_with_headers_preserves_rejected_status() {
+        let (mut client, mut server) = duplex(4096);
+        let server_task = tokio::spawn(async move {
+            let _request = read_http_request(&mut server).await;
+            server.write_all(b"HTTP/1.1 429\r\n\r\n").await.unwrap();
+        });
+
+        let err = client_handshake_with_headers(&mut client, "example.com", "/ws", &[])
+            .await
+            .unwrap_err();
+
+        assert!(matches!(err, TransportError::UpgradeRejected(429)));
+        server_task.await.unwrap();
+    }
+
+    #[tokio::test]
+    #[cfg(not(feature = "turmoil"))]
+    async fn client_handshake_with_headers_returns_leftover_bytes() {
+        let (mut client, mut server) = duplex(4096);
+        let extra = b"\x81\x05hello";
+
+        let server_task = tokio::spawn(async move {
+            let request = read_http_request(&mut server).await;
+            let request = String::from_utf8(request).unwrap();
+            let sec_websocket_key = extract_header(&request, "Sec-WebSocket-Key").unwrap();
+            let response = build_test_response(sec_websocket_key, extra);
+            server.write_all(&response).await.unwrap();
+        });
+
+        let handshake = client_handshake_with_headers(&mut client, "example.com", "/ws", &[])
+            .await
+            .unwrap();
+
+        assert_eq!(handshake.leftover.as_deref(), Some(extra.as_slice()));
+        server_task.await.unwrap();
+    }
+
+    #[tokio::test]
+    #[cfg(not(feature = "turmoil"))]
+    async fn prefixed_io_replays_leftover_before_socket() {
+        let (client, mut server) = duplex(4096);
+        let mut prefixed = PrefixedIo::new(client, Bytes::from_static(b"abc"));
+
+        let server_task = tokio::spawn(async move {
+            server.write_all(b"def").await.unwrap();
+        });
+
+        let mut buf = [0u8; 6];
+        prefixed.read_exact(&mut buf).await.unwrap();
+
+        assert_eq!(&buf, b"abcdef");
+        server_task.await.unwrap();
+    }
+
+    #[rstest]
+    fn round_trip_text() {
+        let original = SockudoMessage::Text(Bytes::from_static(b"hello"));
+        let neutral: Message = original.into();
+        assert!(neutral.is_text());
+        assert_eq!(neutral.as_bytes(), b"hello");
+
+        let back: SockudoMessage = neutral.into();
+        match back {
+            SockudoMessage::Text(b) => assert_eq!(&b[..], b"hello"),
+            other => panic!("expected text, was {other:?}"),
+        }
+    }
+
+    #[rstest]
+    fn round_trip_binary() {
+        let original = SockudoMessage::Binary(Bytes::from_static(&[1, 2, 3]));
+        let neutral: Message = original.into();
+        assert_eq!(neutral.as_bytes(), &[1, 2, 3]);
+
+        let back: SockudoMessage = neutral.into();
+        match back {
+            SockudoMessage::Binary(b) => assert_eq!(&b[..], &[1, 2, 3]),
+            other => panic!("expected binary, was {other:?}"),
+        }
+    }
+
+    #[rstest]
+    fn round_trip_ping_pong() {
+        let neutral: Message = SockudoMessage::Ping(Bytes::from_static(b"p")).into();
+        assert!(neutral.is_ping());
+
+        let neutral: Message = SockudoMessage::Pong(Bytes::from_static(b"q")).into();
+        assert!(neutral.is_pong());
+    }
+
+    #[rstest]
+    fn close_frame_round_trip() {
+        let original = SockudoMessage::Close(Some(SockudoCloseReason {
+            code: 1000,
+            reason: "bye".into(),
+        }));
+
+        let neutral: Message = original.into();
+
+        let Message::Close(Some(frame)) = &neutral else {
+            panic!("expected close frame");
+        };
+
+        assert_eq!(frame.code, 1000);
+        assert_eq!(frame.reason, "bye");
+
+        let back: SockudoMessage = neutral.into();
+
+        let SockudoMessage::Close(Some(reason)) = back else {
+            panic!("expected close frame");
+        };
+
+        assert_eq!(reason.code, 1000);
+        assert_eq!(reason.reason, "bye");
+    }
+
+    #[rstest]
+    fn error_translation_closed() {
+        let err: TransportError = SockudoError::ConnectionClosed.into();
+        assert!(matches!(err, TransportError::ConnectionClosed));
+    }
+
+    #[rstest]
+    fn error_translation_utf8() {
+        let err: TransportError = SockudoError::InvalidUtf8.into();
+        assert!(matches!(err, TransportError::InvalidUtf8));
+    }
+
+    #[rstest]
+    fn error_translation_handshake() {
+        let err: TransportError = SockudoError::HandshakeFailed("bad").into();
+        assert!(matches!(err, TransportError::Handshake(_)));
+    }
+
+    #[rstest]
+    #[case(SockudoError::HeartbeatTimeout, "WebSocket Pong deadline expired")]
+    #[case(SockudoError::IdleTimeout, "WebSocket inbound idle deadline expired")]
+    fn error_translation_timeouts_are_timed_out_io(
+        #[case] sockudo: SockudoError,
+        #[case] message: &str,
+    ) {
+        let err: TransportError = sockudo.into();
+
+        let TransportError::Io(io_err) = &err else {
+            panic!("expected I/O timeout, was: {err:?}");
+        };
+
+        assert_eq!(io_err.kind(), std::io::ErrorKind::TimedOut);
+        assert_eq!(io_err.to_string(), message);
+        assert_eq!(err.to_string(), format!("I/O error: {message}"));
+    }
+
+    // The log-capture harness is Linux-only for CI stability.
+    #[cfg(not(feature = "turmoil"))]
+    #[cfg(target_os = "linux")]
+    #[cfg(not(all(feature = "simulation", madsim)))]
+    mod handshake_logging {
+        use log::Level;
+        use rstest::rstest;
+        use tokio::io::{AsyncWriteExt, duplex};
+
+        use super::read_http_request;
+        use crate::{
+            logging::tests::capture_logs_for,
+            transport::{error::TransportError, sockudo::client_handshake_with_headers},
+        };
+
+        const LOG_TARGETS: &[&str] = &["nautilus_network::transport::sockudo"];
+        const HOST: &str = "ws.example.com:8443";
+        const PATH_SECRET: &str = "handshake-path-secret";
+
+        #[rstest]
+        #[case::retryable_bad_gateway("HTTP/1.1 502 Bad Gateway\r\n\r\n", Level::Warn, Some(502))]
+        #[case::retryable_rate_limited(
+            "HTTP/1.1 429 Too Many Requests\r\n\r\n",
+            Level::Warn,
+            Some(429)
+        )]
+        #[case::permanent_unauthorized(
+            "HTTP/1.1 401 Unauthorized\r\n\r\n",
+            Level::Error,
+            Some(401)
+        )]
+        #[case::permanent_not_found("HTTP/1.1 404 Not Found\r\n\r\n", Level::Error, Some(404))]
+        #[case::malformed_status_line("NOT-HTTP 502 Bad Gateway\r\n\r\n", Level::Error, None)]
+        #[case::missing_accept_key(
+            "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n",
+            Level::Error,
+            None
+        )]
+        #[case::invalid_accept_key(
+            "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\
+             Sec-WebSocket-Accept: AAAAAAAAAAAAAAAAAAAAAAAAAAA=\r\n\r\n",
+            Level::Error,
+            None
+        )]
+        #[tokio::test]
+        async fn handshake_failure_log_level_follows_retry_policy(
+            #[case] response: &'static str,
+            #[case] expected_level: Level,
+            #[case] expected_status: Option<u16>,
+        ) {
+            let capture = capture_logs_for(LOG_TARGETS).await;
+            let (mut client, mut server) = duplex(4096);
+            let server_task = tokio::spawn(async move {
+                let _request = read_http_request(&mut server).await;
+                server.write_all(response.as_bytes()).await.unwrap();
+                server.flush().await.unwrap();
+            });
+
+            let err = client_handshake_with_headers(
+                &mut client,
+                HOST,
+                &format!("/ws?token={PATH_SECRET}"),
+                &[],
+            )
+            .await
+            .expect_err("handshake should fail");
+            server_task.await.unwrap();
+
+            match expected_status {
+                Some(status) => assert!(
+                    matches!(err, TransportError::UpgradeRejected(actual) if actual == status),
+                    "expected upgrade rejection {status}, was: {err:?}"
+                ),
+                None => assert!(
+                    matches!(err, TransportError::Handshake(_)),
+                    "expected a permanent handshake failure, was: {err:?}"
+                ),
+            }
+
+            let messages = capture.messages();
+            assert_eq!(
+                messages.len(),
+                1,
+                "expected exactly one handshake log, was: {messages:?}"
+            );
+
+            let (level, message) = &messages[0];
+            assert_eq!(*level, expected_level, "unexpected level for: {message}");
+            assert!(
+                message.contains(HOST),
+                "log should name the endpoint, was: {message}"
+            );
+
+            if let Some(status) = expected_status {
+                assert!(
+                    message.contains(&status.to_string()),
+                    "log should name the rejection status, was: {message}"
+                );
+            }
+
+            assert!(
+                !message.contains(PATH_SECRET),
+                "log must not carry the request path, was: {message}"
+            );
+        }
+    }
+}

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -------------------------------------------------------------------------------------------------
-#  Copyright (C) 2015-2021 Nautech Systems Pty Ltd. All rights reserved.
+#  Copyright (C) 2015-2026 Nautech Systems Pty Ltd. All rights reserved.
 #  https://nautechsystems.io
 #
 #  Licensed under the GNU Lesser General Public License Version 3.0 (the "License");
@@ -13,97 +13,79 @@
 #  See the License for the specific language governing permissions and
 #  limitations under the License.
 # -------------------------------------------------------------------------------------------------
+"""
+Example of fx market maker gbpusd bars.
+"""
 
-from datetime import datetime
 from decimal import Decimal
 
 import pandas as pd
 
-from nautilus_trader.backtest.data.providers import TestDataProvider
-from nautilus_trader.backtest.data.providers import TestInstrumentProvider
-from nautilus_trader.backtest.data.wranglers import QuoteTickDataWrangler
-from nautilus_trader.backtest.engine import BacktestEngine
-from nautilus_trader.backtest.engine import BacktestEngineConfig
-from nautilus_trader.backtest.models import FillModel
-from nautilus_trader.backtest.modules import FXRolloverInterestModule
-from nautilus_trader.examples.strategies.volatility_market_maker import VolatilityMarketMaker
-from nautilus_trader.examples.strategies.volatility_market_maker import VolatilityMarketMakerConfig
-from nautilus_trader.model.currencies import USD
-from nautilus_trader.model.enums import AccountType
-from nautilus_trader.model.enums import OMSType
-from nautilus_trader.model.enums import VenueType
-from nautilus_trader.model.identifiers import Venue
-from nautilus_trader.model.objects import Money
+from nautilus_trader.backtest import BacktestEngine
+from nautilus_trader.config import BacktestEngineConfig
+from nautilus_trader.execution import MakerTakerFeeModel
+from nautilus_trader.execution import ProbabilisticFillModel
+from nautilus_trader.model import AccountType
+from nautilus_trader.model import Currency
+from nautilus_trader.model import Money
+from nautilus_trader.model import OmsType
+from nautilus_trader.model import Quantity
+from nautilus_trader.model import TraderId
+from nautilus_trader.model import Venue
+from nautilus_trader.testkit.providers import TestDataProvider
+from nautilus_trader.testkit.providers import TestInstrumentProvider
+from nautilus_trader.trading import GridMarketMakerConfig
 
 
 if __name__ == "__main__":
-    # Configure backtest engine
-    config = BacktestEngineConfig(
-        trader_id="BACKTESTER-001",
-        use_data_cache=True,  # Pre-cache data for increased performance on repeated runs
+    engine = BacktestEngine(
+        BacktestEngineConfig(trader_id=TraderId.from_str("BACKTESTER-001")),
     )
-    # Build the backtest engine
-    engine = BacktestEngine(config=config)
 
-    # Setup trading instruments
     SIM = Venue("SIM")
-    GBPUSD_SIM = TestInstrumentProvider.default_fx_ccy("GBP/USD", SIM)
-
-    # Setup data
-    provider = TestDataProvider()
-    wrangler = QuoteTickDataWrangler(GBPUSD_SIM)
-    ticks = wrangler.process_bar_data(
-        bid_data=provider.read_csv_bars("fxcm-gbpusd-m1-bid-2012.csv"),
-        ask_data=provider.read_csv_bars("fxcm-gbpusd-m1-ask-2012.csv"),
-    )
-    engine.add_instrument(GBPUSD_SIM)
-    engine.add_ticks(ticks)
-
-    # Create a fill model (optional)
-    fill_model = FillModel(
-        prob_fill_on_limit=0.2,
-        prob_fill_on_stop=0.95,
-        prob_slippage=0.5,
-        random_seed=42,
-    )
-
-    # Optional plug in module to simulate rollover interest,
-    # the data is coming from packaged test data.
-    interest_rate_data = provider.read_csv("short-term-interest.csv")
-    fx_rollover_interest = FXRolloverInterestModule(rate_data=interest_rate_data)
-
-    # Add a trading venue (multiple venues possible)
-    # Add starting balances for single-currency or multi-currency accounts
+    USD = Currency.from_str("USD")
     engine.add_venue(
         venue=SIM,
-        venue_type=VenueType.ECN,
-        oms_type=OMSType.NETTING,
+        oms_type=OmsType.NETTING,
         account_type=AccountType.MARGIN,
-        base_currency=USD,  # Standard single-currency account
+        base_currency=USD,
         starting_balances=[Money(10_000_000, USD)],
-        fill_model=fill_model,
-        modules=[fx_rollover_interest],
+        fill_model=ProbabilisticFillModel(
+            prob_fill_on_limit=0.2,
+            prob_slippage=0.5,
+            random_seed=42,
+        ),
+        fee_model=MakerTakerFeeModel(
+            maker_rate=Decimal("0.00002"),
+            taker_rate=Decimal("0.00002"),
+        ),
     )
 
-    # Configure your strategy
-    config = VolatilityMarketMakerConfig(
-        instrument_id=str(GBPUSD_SIM.id),
-        bar_type="GBP/USD.SIM-5-MINUTE-BID-INTERNAL",
-        atr_period=20,
-        atr_multiple=3.0,
-        trade_size=Decimal(500_000),
-        order_id_tag="001",
+    GBPUSD_SIM = TestInstrumentProvider.default_fx_ccy("GBP/USD", SIM)
+    engine.add_instrument(GBPUSD_SIM)
+
+    quotes = TestDataProvider.quotes_from_fxcm_bars(
+        instrument=GBPUSD_SIM,
+        bid_csv="fxcm/gbpusd-m1-bid-2012.csv",
+        ask_csv="fxcm/gbpusd-m1-ask-2012.csv",
+        max_rows=10_000,
     )
-    # Instantiate and add your strategy
-    strategy = VolatilityMarketMaker(config=config)
-    engine.add_strategy(strategy=strategy)
+    engine.add_data(quotes)
 
-    input("Press Enter to continue...")  # noqa (always Python 3)
+    engine.add_builtin_strategy(
+        "GridMarketMaker",
+        GridMarketMakerConfig(
+            instrument_id=GBPUSD_SIM.id,
+            max_position=Quantity.from_int(1_500_000),
+            trade_size=Quantity.from_int(500_000),
+            num_levels=3,
+            grid_step_bps=5,
+            skew_factor=0.5,
+            requote_threshold_bps=2,
+        ),
+    )
+    engine.run()
 
-    # Run the engine (from start to end of data)
-    engine.run(end=datetime(2012, 2, 10))
-
-    # Optionally view reports
     with pd.option_context(
         "display.max_rows",
         100,
@@ -112,12 +94,9 @@ if __name__ == "__main__":
         "display.width",
         300,
     ):
-        print(engine.trader.generate_account_report(SIM))
-        print(engine.trader.generate_order_fills_report())
-        print(engine.trader.generate_positions_report())
+        print(engine.generate_account_report(SIM))
+        print(engine.generate_order_fills_report())
+        print(engine.generate_positions_report())
 
-    # For repeated backtest runs make sure to reset the engine
     engine.reset()
-
-    # Good practice to dispose of the object when done
     engine.dispose()

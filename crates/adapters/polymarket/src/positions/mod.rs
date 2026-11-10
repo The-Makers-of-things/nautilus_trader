@@ -1,0 +1,739 @@
+// -------------------------------------------------------------------------------------------------
+//  Copyright (C) 2015-2026 Nautech Systems Pty Ltd. All rights reserved.
+//  https://nautechsystems.io
+//
+//  Licensed under the GNU Lesser General Public License Version 3.0 (the "License");
+//  You may not use this file except in compliance with the License.
+//  You may obtain a copy of the License at https://www.gnu.org/licenses/lgpl-3.0.en.html
+//
+//  Unless required by applicable law or agreed to in writing, software
+//  distributed under the License is distributed on an "AS IS" BASIS,
+//  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+//  See the License for the specific language governing permissions and
+//  limitations under the License.
+// -------------------------------------------------------------------------------------------------
+
+//! Deposit Wallet split, merge, and redeem operations for Polymarket positions.
+
+pub mod amounts;
+pub mod calldata;
+
+mod wallet;
+
+use std::{
+    collections::HashMap,
+    sync::{Arc, LazyLock},
+    time::{Duration, Instant},
+};
+
+use alloy_primitives::{Address, U256};
+use nautilus_core::time::{AtomicTime, get_atomic_clock_realtime};
+use nautilus_network::websocket::proxy::ProxyUrl;
+use parking_lot::Mutex;
+use rust_decimal::Decimal;
+
+use self::{
+    amounts::pusd_to_base_units,
+    calldata::{
+        PositionCall, encode_approval, encode_merge_positions, encode_merge_positions_v2,
+        encode_redeem_position_v2, encode_redeem_positions, encode_split_position,
+        encode_split_position_v2, parse_condition_id_v2,
+    },
+};
+use crate::{
+    common::{
+        consts::MARKET_VERSION_V2,
+        credential::{EvmPrivateKey, RelayerApiKey},
+        parse::{validate_data_market_version, validate_outcome_ids, validate_outcomes},
+    },
+    http::{
+        clob::PolymarketClobPublicClient,
+        error::{Error, Result},
+        relayer::{
+            PolymarketRelayerHttpClient, RelayerTransaction, RelayerTransactionState,
+            RelayerWalletSubmit,
+        },
+    },
+    signing::eip712::{
+        DepositWalletCall, OrderSigner, approval_plan_v2, parse_address, parse_bytes32,
+    },
+};
+
+const DEFAULT_HTTP_TIMEOUT_SECS: u64 = 60;
+const DEFAULT_DEADLINE_SECS: u64 = 1_800;
+const DEFAULT_WAIT_TIMEOUT_SECS: u64 = 120;
+const DEFAULT_POLL_INTERVAL_MS: u64 = 1_000;
+
+static WALLET_SUBMISSIONS: LazyLock<Mutex<HashMap<Address, Arc<WalletSubmissionState>>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// Terminal result of a Polymarket position operation.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum PolymarketPositionOutcome {
+    /// Relayer reported `STATE_CONFIRMED`.
+    Confirmed {
+        /// Relayer transaction identifier.
+        transaction_id: String,
+        /// On-chain transaction hash when the Relayer supplied one.
+        transaction_hash: Option<String>,
+    },
+    /// Relayer reported `STATE_FAILED`.
+    Failed {
+        /// Relayer transaction identifier.
+        transaction_id: String,
+        /// On-chain transaction hash when the Relayer supplied one.
+        transaction_hash: Option<String>,
+        /// Relayer error detail when present.
+        error_msg: Option<String>,
+    },
+    /// Relayer reported `STATE_INVALID`.
+    Invalid {
+        /// Relayer transaction identifier.
+        transaction_id: String,
+        /// Relayer error detail when present.
+        error_msg: Option<String>,
+    },
+}
+
+/// Submitted position operation that can be polled to a terminal Relayer state.
+#[derive(Debug)]
+pub struct PolymarketPositionTransaction {
+    relayer: PolymarketRelayerHttpClient,
+    transaction_id: String,
+    wait_timeout: Duration,
+    poll_interval: Duration,
+}
+
+impl PolymarketPositionTransaction {
+    /// Relayer transaction identifier returned at submit time.
+    #[must_use]
+    pub fn transaction_id(&self) -> &str {
+        &self.transaction_id
+    }
+
+    /// Polls the Relayer until the transaction is confirmed, failed, or invalid.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if polling fails with a non-retryable status or the wait
+    /// times out before a terminal state. A timeout leaves the on-chain outcome
+    /// unknown.
+    pub async fn wait(self) -> Result<PolymarketPositionOutcome> {
+        let deadline = Instant::now() + self.wait_timeout;
+
+        loop {
+            match self.relayer.get_transaction(&self.transaction_id).await {
+                Ok(tx) => {
+                    if tx.state.is_terminal() {
+                        return outcome_from_transaction(tx);
+                    }
+                }
+                Err(e) if e.is_retryable() => {
+                    log::warn!(
+                        "Relayer transaction {} poll failed: {e}; retrying",
+                        self.transaction_id
+                    );
+                }
+                Err(e) => return Err(e),
+            }
+
+            if Instant::now() >= deadline {
+                return Err(Error::exchange(format!(
+                    "Relayer transaction {} wait timed out; terminal state is unknown",
+                    self.transaction_id
+                )));
+            }
+
+            tokio::time::sleep(self.poll_interval).await;
+        }
+    }
+}
+
+/// Deposit Wallet client for split, merge, and redeem position operations.
+#[derive(Debug)]
+pub struct PolymarketPositionClient {
+    signer: OrderSigner,
+    deposit_wallet: Address,
+    relayer: PolymarketRelayerHttpClient,
+    clob: PolymarketClobPublicClient,
+    clock: &'static AtomicTime,
+    deadline_secs: u64,
+    wait_timeout: Duration,
+    poll_interval: Duration,
+    wallet: wallet::WalletVerifier,
+    submission: Arc<WalletSubmissionState>,
+}
+
+impl PolymarketPositionClient {
+    /// Creates a Deposit Wallet position client.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if credentials are invalid, the deposit wallet is not
+    /// distinct from the signer, or an HTTP client cannot be created.
+    pub fn new(
+        private_key: &EvmPrivateKey,
+        deposit_wallet: &str,
+        relayer_api_key: RelayerApiKey,
+        base_url_relayer: Option<String>,
+        base_url_clob: Option<String>,
+        timeout_secs: Option<u64>,
+        proxy_url: Option<ProxyUrl>,
+    ) -> Result<Self> {
+        let timeout_secs = timeout_secs.unwrap_or(DEFAULT_HTTP_TIMEOUT_SECS);
+        let signer = OrderSigner::new(private_key)?;
+        let deposit_wallet = parse_address(deposit_wallet, "deposit_wallet")?;
+        if deposit_wallet == signer.address() {
+            return Err(Error::bad_request(
+                "Deposit Wallet operations require a funder distinct from the signing address",
+            ));
+        }
+
+        let relayer = PolymarketRelayerHttpClient::new_with_proxy(
+            relayer_api_key,
+            base_url_relayer,
+            timeout_secs,
+            proxy_url.clone(),
+        )
+        .map_err(Error::from_http_client)?;
+        let wallet = wallet::WalletVerifier::new(timeout_secs, proxy_url.clone())?;
+        let clob =
+            PolymarketClobPublicClient::new_with_proxy(base_url_clob, timeout_secs, proxy_url)
+                .map_err(Error::from_http_client)?;
+
+        Ok(Self {
+            signer,
+            deposit_wallet,
+            relayer,
+            clob,
+            clock: get_atomic_clock_realtime(),
+            deadline_secs: DEFAULT_DEADLINE_SECS,
+            wait_timeout: Duration::from_secs(DEFAULT_WAIT_TIMEOUT_SECS),
+            poll_interval: Duration::from_millis(DEFAULT_POLL_INTERVAL_MS),
+            wallet,
+            submission: wallet_submission(deposit_wallet),
+        })
+    }
+
+    /// Sets the Polygon RPC URL used to verify the Deposit Wallet before signing.
+    #[must_use]
+    pub fn with_rpc_url(mut self, rpc_url: String) -> Self {
+        self.wallet.set_rpc_url(rpc_url);
+        self
+    }
+
+    /// Sets the signed-batch deadline in seconds from now.
+    ///
+    /// Defaults to 1,800 seconds; values below one second are raised to one.
+    /// Longer deadlines extend the period in which a signed batch can execute and
+    /// delay expiry-based recovery of an unknown submission. The wait timeout does
+    /// not shorten this deadline or cancel the signed batch.
+    #[must_use]
+    pub fn with_deadline_secs(mut self, deadline_secs: u64) -> Self {
+        self.deadline_secs = deadline_secs.max(1);
+        self
+    }
+
+    /// Sets how long [`PolymarketPositionTransaction::wait`] polls before timing out.
+    #[must_use]
+    pub fn with_wait_timeout(mut self, wait_timeout: Duration) -> Self {
+        self.wait_timeout = wait_timeout;
+        self
+    }
+
+    /// Sets the Relayer poll interval used by [`PolymarketPositionTransaction::wait`].
+    #[must_use]
+    pub fn with_poll_interval(mut self, poll_interval: Duration) -> Self {
+        self.poll_interval = poll_interval;
+        self
+    }
+
+    /// Splits `amount` pUSD into a complete set of outcome tokens.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if market metadata or encoding is invalid, V2 balance or Router permission
+    /// checks fail, or Relayer submission is rejected or ambiguous.
+    pub async fn split_position(
+        &self,
+        condition_id: &str,
+        amount: Decimal,
+    ) -> Result<PolymarketPositionTransaction> {
+        let base_amount = pusd_to_base_units(amount)?;
+
+        let call = match self.market(condition_id).await? {
+            PositionMarket::Ctf { neg_risk } => {
+                encode_split_position(condition_id, amount, neg_risk)?
+            }
+            PositionMarket::V2 { .. } => {
+                let call = encode_split_position_v2(condition_id, amount)?;
+                self.wallet
+                    .verify_v2_split(self.deposit_wallet, base_amount)
+                    .await?;
+                call
+            }
+        };
+
+        self.submit_call(call, "Split position").await
+    }
+
+    /// Merges `amount` complete sets of outcome tokens back into pUSD.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if market metadata or encoding is invalid, V2 balance or Router permission
+    /// checks fail, or Relayer submission is rejected or ambiguous.
+    pub async fn merge_positions(
+        &self,
+        condition_id: &str,
+        amount: Decimal,
+    ) -> Result<PolymarketPositionTransaction> {
+        let base_amount = pusd_to_base_units(amount)?;
+
+        let call = match self.market(condition_id).await? {
+            PositionMarket::Ctf { neg_risk } => {
+                encode_merge_positions(condition_id, amount, neg_risk)?
+            }
+            PositionMarket::V2 { position_ids } => {
+                let call = encode_merge_positions_v2(condition_id, amount)?;
+                self.wallet
+                    .verify_v2_positions(self.deposit_wallet, &position_ids, base_amount)
+                    .await?;
+                call
+            }
+        };
+
+        self.submit_call(call, "Merge positions").await
+    }
+
+    /// Redeems both CTF binary outcome balances for a resolved market.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the market is V2, metadata or encoding is invalid, or Relayer submission
+    /// is rejected or ambiguous.
+    pub async fn redeem_positions(
+        &self,
+        condition_id: &str,
+    ) -> Result<PolymarketPositionTransaction> {
+        let PositionMarket::Ctf { neg_risk } = self.market(condition_id).await? else {
+            return Err(Error::bad_request(
+                "redeem_positions supports only v1 CTF markets; use redeem_position for V2",
+            ));
+        };
+
+        let call = encode_redeem_positions(condition_id, neg_risk)?;
+        self.submit_call(call, "Redeem positions").await
+    }
+
+    /// Redeems an explicit amount of V2 outcome index `0` or `1`.
+    ///
+    /// The index is the position ID's final byte, independent of CLOB token-array order.
+    /// Amounts are exact six-decimal share quantities. A zero losing payout is redeemable;
+    /// a reverted or unavailable payout read fails before submission.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if metadata is unsupported, amounts or outcomes are invalid, Router permissions
+    /// are missing, balances are insufficient, payout reads fail, or submission is rejected or ambiguous.
+    pub async fn redeem_position(
+        &self,
+        condition_id: &str,
+        outcome_index: u8,
+        amount: Decimal,
+    ) -> Result<PolymarketPositionTransaction> {
+        let call = encode_redeem_position_v2(condition_id, outcome_index, amount)?;
+        let base_amount = pusd_to_base_units(amount)?;
+
+        let PositionMarket::V2 { position_ids, .. } = self.market(condition_id).await? else {
+            return Err(Error::bad_request(
+                "redeem_position requires a V2 market; use redeem_positions for CTF",
+            ));
+        };
+
+        let position_id = position_ids[usize::from(outcome_index)];
+        self.wallet
+            .verify_v2_positions(self.deposit_wallet, &[position_id], base_amount)
+            .await?;
+        self.wallet.payout(position_id, base_amount).await?;
+        self.submit_call(call, "Redeem V2 position").await
+    }
+
+    /// Approves ExchangeV3 trading from the Deposit Wallet holding the assets.
+    ///
+    /// `collateral_limit` is an explicit pUSD limit covering BUY spend plus fees. The same batch
+    /// enables ExchangeV3 to transfer V2 positions for SELL orders. It does not redeem positions.
+    /// The Relayer requires unlimited ExchangeV3 approvals and rejects this bounded request.
+    /// V2 trading from a Deposit Wallet therefore requires existing approvals.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the limit is invalid, wallet verification fails, or Relayer submission
+    /// is rejected or ambiguous. A pending wallet submission must be reconciled before retrying.
+    pub async fn approve_v2_trading(
+        &self,
+        collateral_limit: Decimal,
+    ) -> Result<PolymarketPositionTransaction> {
+        let amount = pusd_to_base_units(collateral_limit)?;
+        let calls = approval_plan_v2(amount)
+            .into_iter()
+            .map(encode_approval)
+            .collect::<Vec<_>>();
+        self.submit_calls(&calls, "Approve V2 trading").await
+    }
+
+    async fn market(&self, condition_id: &str) -> Result<PositionMarket> {
+        let query = if condition_id.len() == 64 {
+            let native = parse_condition_id_v2(condition_id)?;
+            format!("{native:#x}00")
+        } else {
+            condition_id.to_string()
+        };
+
+        let market = self.clob.get_market(&query).await?;
+        let version = validate_data_market_version(market.version.as_deref())
+            .map_err(|e| Error::bad_request(e.to_string()))?;
+
+        let neg_risk = market.neg_risk.ok_or_else(|| {
+            Error::bad_request(format!(
+                "market metadata for {condition_id} is missing neg_risk"
+            ))
+        })?;
+
+        if version != MARKET_VERSION_V2 {
+            if parse_bytes32(&market.condition_id, "market condition_id")?
+                != parse_bytes32(&query, "condition_id")?
+            {
+                return Err(Error::bad_request(
+                    "Market condition ID does not match the requested condition",
+                ));
+            }
+
+            return Ok(PositionMarket::Ctf { neg_risk });
+        }
+
+        let requested = parse_condition_id_v2(condition_id)?;
+        if parse_condition_id_v2(&market.condition_id)? != requested {
+            return Err(Error::bad_request(
+                "Market condition ID does not match the requested V2 condition",
+            ));
+        }
+
+        if (requested[0] == 2) != neg_risk {
+            return Err(Error::bad_request(
+                "V2 module and neg_risk metadata disagree",
+            ));
+        }
+
+        let ids: Vec<_> = market
+            .tokens
+            .iter()
+            .map(|token| token.token_id.clone())
+            .collect();
+        let outcomes: Vec<_> = market
+            .tokens
+            .iter()
+            .map(|token| token.outcome.clone())
+            .collect();
+        validate_outcome_ids(&ids)
+            .and_then(|()| validate_outcomes(&outcomes))
+            .map_err(|e| Error::bad_request(e.to_string()))?;
+        let yes_id = U256::from_be_slice(requested.as_slice()) << 8;
+        let position_ids = [yes_id, yes_id + U256::from(1u8)];
+
+        for id in ids {
+            let id =
+                U256::from_str_radix(&id, 10).map_err(|e| Error::bad_request(e.to_string()))?;
+            if !position_ids.contains(&id) {
+                return Err(Error::bad_request(
+                    "V2 position IDs do not match the requested condition and outcomes",
+                ));
+            }
+        }
+
+        Ok(PositionMarket::V2 { position_ids })
+    }
+
+    async fn submit_call(
+        &self,
+        call: PositionCall,
+        metadata: &str,
+    ) -> Result<PolymarketPositionTransaction> {
+        self.submit_calls(std::slice::from_ref(&call), metadata)
+            .await
+    }
+
+    async fn submit_calls(
+        &self,
+        calls: &[PositionCall],
+        metadata: &str,
+    ) -> Result<PolymarketPositionTransaction> {
+        let mut submission = self.submission.lock().await;
+        if let Some(previous) = submission.as_ref() {
+            let Some(transaction_id) = previous.transaction_id.as_deref() else {
+                return Err(Error::exchange(
+                    "Previous Deposit Wallet submit outcome is unknown; reconcile it before further operations",
+                ));
+            };
+
+            let transaction = self.relayer.get_transaction(transaction_id).await?;
+            if !transaction.state.is_terminal() {
+                return Err(Error::exchange(format!(
+                    "Deposit Wallet transaction {transaction_id} is still pending"
+                )));
+            }
+        }
+
+        let nonce = self
+            .wallet
+            .verify(self.signer.address(), self.deposit_wallet)
+            .await?;
+        let now = U256::from(self.clock.get_time_ns().as_u64() / 1_000_000_000);
+
+        if let Some(previous) = submission.as_ref()
+            && nonce <= previous.nonce
+        {
+            return Err(Error::exchange(
+                "Deposit Wallet nonce has not advanced; reconcile the previous submission before further operations",
+            ));
+        }
+
+        let deadline = now.saturating_add(U256::from(self.deadline_secs));
+
+        let wallet_calls: Vec<_> = calls
+            .iter()
+            .map(|call| DepositWalletCall {
+                target: call.target,
+                value: U256::ZERO,
+                data: call.data.clone(),
+            })
+            .collect();
+
+        let signature = self.signer.sign_deposit_wallet_batch(
+            self.deposit_wallet,
+            nonce,
+            deadline,
+            &wallet_calls,
+        )?;
+        *submission = Some(WalletSubmission {
+            nonce,
+            transaction_id: None,
+        });
+
+        for wallet_call in &wallet_calls {
+            log::info!(
+                "Deposit Wallet submission: wallet={:#x}, nonce={nonce}, deadline={deadline}, operation={metadata}, target={:#x}, value={}, data={}",
+                self.deposit_wallet,
+                wallet_call.target,
+                wallet_call.value,
+                wallet_call.data,
+            );
+        }
+
+        let submitted = self
+            .relayer
+            .submit_wallet_batch(RelayerWalletSubmit {
+                signer: self.signer.address(),
+                deposit_wallet: self.deposit_wallet,
+                nonce,
+                deadline,
+                signature: &signature,
+                metadata,
+                calls: &wallet_calls,
+            })
+            .await?;
+
+        let Some(transaction_id) = submitted.transaction_id else {
+            return Err(Error::decode(
+                "Relayer submit response omitted transaction_id; transaction outcome is unknown",
+            ));
+        };
+
+        *submission = Some(WalletSubmission {
+            nonce,
+            transaction_id: Some(transaction_id.clone()),
+        });
+
+        Ok(PolymarketPositionTransaction {
+            relayer: self.relayer.clone(),
+            transaction_id,
+            wait_timeout: self.wait_timeout,
+            poll_interval: self.poll_interval,
+        })
+    }
+}
+
+enum PositionMarket {
+    Ctf { neg_risk: bool },
+    V2 { position_ids: [U256; 2] },
+}
+
+#[derive(Debug)]
+struct WalletSubmission {
+    nonce: U256,
+    transaction_id: Option<String>,
+}
+
+type WalletSubmissionState = tokio::sync::Mutex<Option<WalletSubmission>>;
+
+fn wallet_submission(wallet: Address) -> Arc<WalletSubmissionState> {
+    let mut submissions = WALLET_SUBMISSIONS.lock();
+    submissions.retain(|_, state| {
+        Arc::strong_count(state) > 1 || state.try_lock().map_or(true, |state| state.is_some())
+    });
+
+    submissions.entry(wallet).or_default().clone()
+}
+
+fn outcome_from_transaction(tx: RelayerTransaction) -> Result<PolymarketPositionOutcome> {
+    let transaction_id = tx.transaction_id.clone().ok_or_else(|| {
+        Error::decode(
+            "Relayer terminal response omitted transaction_id; transaction outcome is unknown",
+        )
+    })?;
+
+    match tx.state {
+        RelayerTransactionState::Confirmed => Ok(PolymarketPositionOutcome::Confirmed {
+            transaction_id,
+            transaction_hash: tx.transaction_hash,
+        }),
+        RelayerTransactionState::Failed => Ok(PolymarketPositionOutcome::Failed {
+            transaction_id,
+            transaction_hash: tx.transaction_hash,
+            error_msg: tx.error_msg,
+        }),
+        RelayerTransactionState::Invalid => Ok(PolymarketPositionOutcome::Invalid {
+            transaction_id,
+            error_msg: tx.error_msg,
+        }),
+        RelayerTransactionState::New | RelayerTransactionState::Other(_) => {
+            Err(Error::decode(format!(
+                "Relayer transaction {transaction_id} is not terminal, state was {}",
+                tx.state.as_str()
+            )))
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use nautilus_network::retry::RetryConfig;
+    use rstest::rstest;
+
+    use super::*;
+
+    #[tokio::test]
+    #[ignore = "requires read-only access to live Polymarket Gamma and CLOB APIs"]
+    async fn test_live_market_protocol_selection() {
+        let key = EvmPrivateKey::new(
+            "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80",
+        )
+        .unwrap();
+        let relayer_key = RelayerApiKey::new(
+            "unused".into(),
+            "0xf39fd6e51aad88f6f4ce6ab8827279cfffb92266",
+        )
+        .unwrap();
+        let client = PolymarketPositionClient::new(
+            &key,
+            "0x1111111111111111111111111111111111111111",
+            relayer_key,
+            Some("http://127.0.0.1:1".into()),
+            None,
+            Some(20),
+            None,
+        )
+        .unwrap();
+        let gamma =
+            crate::http::gamma::PolymarketGammaHttpClient::new(None, 20, RetryConfig::default())
+                .unwrap();
+
+        for (market_id, protocol) in [("1557558", "v1"), ("5931597", "v2")] {
+            let markets = vec![gamma.inner().get_gamma_market(market_id).await.unwrap()];
+            let market = &markets[0];
+            assert_eq!(market.version.as_deref(), Some(protocol));
+            let (instruments, transient) =
+                crate::http::gamma::parse_markets_with_transient(&markets, 1.into());
+            assert_eq!(instruments.len(), 2);
+            assert_eq!(transient, Vec::<String>::new());
+            let result = client.market(&market.condition_id).await.unwrap();
+
+            if protocol == "v1" {
+                assert!(
+                    matches!(result, PositionMarket::Ctf { neg_risk } if neg_risk == market.neg_risk.unwrap())
+                );
+            } else {
+                assert!(matches!(result, PositionMarket::V2 { .. }));
+            }
+        }
+    }
+
+    #[rstest]
+    fn test_outcome_from_confirmed_transaction() {
+        let outcome = outcome_from_transaction(RelayerTransaction {
+            transaction_id: Some("tx-1".into()),
+            transaction_hash: Some("0xabc".into()),
+            state: RelayerTransactionState::Confirmed,
+            error_msg: None,
+        })
+        .unwrap();
+
+        assert_eq!(
+            outcome,
+            PolymarketPositionOutcome::Confirmed {
+                transaction_id: "tx-1".into(),
+                transaction_hash: Some("0xabc".into()),
+            }
+        );
+    }
+
+    #[rstest]
+    fn test_outcome_from_failed_and_invalid_transactions() {
+        let failed = outcome_from_transaction(RelayerTransaction {
+            transaction_id: Some("tx-2".into()),
+            transaction_hash: None,
+            state: RelayerTransactionState::Failed,
+            error_msg: Some("reverted".into()),
+        })
+        .unwrap();
+
+        assert_eq!(
+            failed,
+            PolymarketPositionOutcome::Failed {
+                transaction_id: "tx-2".into(),
+                transaction_hash: None,
+                error_msg: Some("reverted".into()),
+            }
+        );
+
+        let invalid = outcome_from_transaction(RelayerTransaction {
+            transaction_id: Some("tx-3".into()),
+            transaction_hash: None,
+            state: RelayerTransactionState::Invalid,
+            error_msg: Some("bad nonce".into()),
+        })
+        .unwrap();
+
+        assert_eq!(
+            invalid,
+            PolymarketPositionOutcome::Invalid {
+                transaction_id: "tx-3".into(),
+                error_msg: Some("bad nonce".into()),
+            }
+        );
+    }
+
+    #[rstest]
+    fn test_outcome_from_non_terminal_is_error() {
+        let err = outcome_from_transaction(RelayerTransaction {
+            transaction_id: Some("tx-4".into()),
+            transaction_hash: None,
+            state: RelayerTransactionState::New,
+            error_msg: None,
+        })
+        .unwrap_err();
+
+        assert!(err.to_string().contains("is not terminal"));
+        assert!(err.to_string().contains("state was STATE_NEW"));
+    }
+}

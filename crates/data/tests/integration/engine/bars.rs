@@ -1,0 +1,1434 @@
+// -------------------------------------------------------------------------------------------------
+//  Copyright (C) 2015-2026 Nautech Systems Pty Ltd. All rights reserved.
+//  https://nautechsystems.io
+//
+//  Licensed under the GNU Lesser General Public License Version 3.0 (the "License");
+//  You may not use this file except in compliance with the License.
+//  You may obtain a copy of the License at https://www.gnu.org/licenses/lgpl-3.0.en.html
+//
+//  Unless required by applicable law or agreed to in writing, software
+//  distributed under the License is distributed on an "AS IS" BASIS,
+//  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+//  See the License for the specific language governing permissions and
+//  limitations under the License.
+// -------------------------------------------------------------------------------------------------
+
+use ahash::AHashSet;
+use nautilus_common::timer::TimeEventCallback;
+use nautilus_model::enums::BarIntervalType;
+
+use super::*;
+
+#[rstest]
+#[case::five_to_fifteen(&["5-MINUTE-LAST-INTERNAL", "15-MINUTE-LAST-INTERNAL@5-MINUTE-INTERNAL"], 300, 3)]
+#[case::minute_to_hour(&["1-MINUTE-LAST-INTERNAL", "1-HOUR-LAST-INTERNAL@1-MINUTE-INTERNAL"], 60, 60)]
+#[case::minute_to_five(&["1-MINUTE-LAST-INTERNAL", "5-MINUTE-LAST-INTERNAL@1-MINUTE-INTERNAL"], 60, 5)]
+#[case::three_levels(&["1-MINUTE-LAST-INTERNAL", "5-MINUTE-LAST-INTERNAL@1-MINUTE-INTERNAL", "15-MINUTE-LAST-INTERNAL@5-MINUTE-INTERNAL"], 60, 15)]
+#[case::three_levels_pull(&["5-MINUTE-LAST-INTERNAL", "15-MINUTE-LAST-INTERNAL@5-MINUTE-INTERNAL", "1-HOUR-LAST-INTERNAL@15-MINUTE-INTERNAL"], 300, 12)]
+fn test_composite_time_bars_include_closing_source_bar(
+    #[case] chain: &[&str],
+    #[case] source_seconds: u64,
+    #[case] count: u64,
+    #[values(false, true)] composite_first: bool,
+    #[values(BarIntervalType::LeftOpen, BarIntervalType::RightOpen)] interval: BarIntervalType,
+    #[values(true, false)] timestamp_on_close: bool,
+    #[values(false, true)] batch_trades: bool,
+) {
+    let _ = stub_msgbus();
+    let audusd_sim = audusd_sim();
+    let clock = clock();
+    let cache = cache();
+    let client_id = client_id();
+    let venue = venue();
+    let start_ns = 3_600 * NANOSECONDS_IN_SECOND;
+    clock.borrow_mut().set_time(UnixNanos::from(start_ns + 1));
+    let instrument_id = audusd_sim.id;
+    cache
+        .borrow_mut()
+        .add_instrument(InstrumentAny::CurrencyPair(audusd_sim))
+        .unwrap();
+
+    let config = DataEngineConfig {
+        time_bars_interval_type: interval,
+        time_bars_timestamp_on_close: timestamp_on_close,
+        ..DataEngineConfig::default()
+    };
+
+    let mut engine = DataEngine::new(
+        Rc::clone(&clock) as Rc<RefCell<dyn Clock>>,
+        Rc::clone(&cache),
+        Some(config),
+    );
+    let recorder = Rc::new(RefCell::new(Vec::new()));
+    register_mock_client(
+        Rc::clone(&clock),
+        Rc::clone(&cache),
+        client_id,
+        venue,
+        None,
+        &recorder,
+        &mut engine,
+    );
+    let mut bar_types: Vec<_> = chain
+        .iter()
+        .map(|suffix| BarType::from(format!("{instrument_id}-{suffix}").as_str()))
+        .collect();
+    let source_type = bar_types[0];
+    let target_type = *bar_types.last().unwrap();
+    if composite_first {
+        bar_types.reverse();
+    }
+
+    for bar_type in bar_types {
+        engine
+            .execute_subscribe(SubscribeCommand::Bars(SubscribeBars::new(
+                bar_type,
+                Some(client_id),
+                Some(venue),
+                UUID4::new(),
+                UnixNanos::from(start_ns + 1),
+                None,
+                None,
+            )))
+            .unwrap();
+    }
+
+    let (handler, saver) = get_typed_message_saving_handler::<Bar>(None);
+    let topic = switchboard::get_bars_topic(target_type.standard());
+    msgbus::subscribe_bars(topic.into(), handler, None);
+    let (handler, source_saver) = get_typed_message_saving_handler::<Bar>(None);
+    let topic = switchboard::get_bars_topic(source_type);
+    msgbus::subscribe_bars(topic.into(), handler, None);
+    let engine = Rc::new(RefCell::new(engine));
+
+    for i in 0..2 * count {
+        let ts = start_ns + (i * source_seconds + 1) * NANOSECONDS_IN_SECOND;
+        let trade = make_trade(
+            instrument_id,
+            &format!("{}.00000", i + 1),
+            1,
+            &i.to_string(),
+            ts,
+        );
+
+        if batch_trades {
+            let engine = Rc::clone(&engine);
+            let callback = TimeEventCallback::RustLocal(Rc::new(move |_| {
+                engine.borrow_mut().process_data(Data::Trade(trade));
+            }));
+
+            clock
+                .borrow_mut()
+                .set_time_alert_ns(&format!("TRADE_{i}"), ts.into(), Some(callback), None)
+                .unwrap();
+        } else {
+            let advance_ns = ts - clock.borrow().timestamp_ns().as_u64();
+            advance_clock_and_dispatch(&clock, advance_ns);
+            engine.borrow_mut().process_data(Data::Trade(trade));
+        }
+    }
+
+    let end_ns = start_ns + 2 * count * source_seconds * NANOSECONDS_IN_SECOND;
+    let advance_ns = end_ns - clock.borrow().timestamp_ns().as_u64();
+    advance_clock_and_dispatch(&clock, advance_ns);
+
+    advance_clock_and_dispatch(&clock, 2 * count * source_seconds * NANOSECONDS_IN_SECOND);
+
+    let expected: Vec<_> = (0..4)
+        .map(|i| {
+            let (open, close, volume) = if i < 2 {
+                (
+                    Price::from(format!("{}.00000", i * count + 1).as_str()),
+                    Price::from(format!("{}.00000", (i + 1) * count).as_str()),
+                    Quantity::from(count),
+                )
+            } else {
+                let close = Price::from(format!("{}.00000", 2 * count).as_str());
+                (close, close, Quantity::from(0))
+            };
+
+            let open_ns = start_ns + i * count * source_seconds * NANOSECONDS_IN_SECOND;
+            let close_ns = start_ns + (i + 1) * count * source_seconds * NANOSECONDS_IN_SECOND;
+            let ts_event = if interval == BarIntervalType::LeftOpen && timestamp_on_close {
+                close_ns
+            } else {
+                open_ns
+            };
+
+            Bar::new(
+                target_type.standard(),
+                open,
+                close,
+                open,
+                close,
+                volume,
+                UnixNanos::from(ts_event),
+                UnixNanos::from(close_ns),
+            )
+        })
+        .collect();
+
+    assert_eq!(saver.get_messages(), expected);
+    assert_eq!(source_saver.get_messages().len(), (4 * count) as usize);
+    assert_eq!(
+        cache.borrow().bars(&target_type.standard()).unwrap(),
+        expected.iter().rev().copied().collect::<Vec<_>>(),
+    );
+}
+
+#[rstest]
+#[case::ts_event_regression(2_000, 2_000, 1_000, 1_000, false)]
+#[case::ts_init_only_regression(2_000, 2_000, 2_000, 1_000, false)]
+#[case::strictly_forward(1_000, 1_000, 2_000, 2_000, true)]
+fn test_validate_data_sequence_drops_out_of_order_bar(
+    stub_msgbus: Rc<RefCell<MessageBus>>,
+    #[case] first_ts_event: u64,
+    #[case] first_ts_init: u64,
+    #[case] second_ts_event: u64,
+    #[case] second_ts_init: u64,
+    #[case] expect_overwrite: bool,
+) {
+    let _ = stub_msgbus;
+    let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(VirtualClock::new()));
+    let cache: Rc<RefCell<Cache>> = Rc::new(RefCell::new(Cache::default()));
+
+    let config = DataEngineConfig {
+        validate_data_sequence: true,
+        ..DataEngineConfig::default()
+    };
+
+    let mut data_engine = DataEngine::new(clock, Rc::clone(&cache), Some(config));
+
+    let bar_template = Bar::default();
+    let bar_type = bar_template.bar_type;
+
+    let make_bar = |ts_event: u64, ts_init: u64| {
+        Bar::new(
+            bar_type,
+            bar_template.open,
+            bar_template.high,
+            bar_template.low,
+            bar_template.close,
+            bar_template.volume,
+            UnixNanos::from(ts_event),
+            UnixNanos::from(ts_init),
+        )
+    };
+
+    let first = make_bar(first_ts_event, first_ts_init);
+    let second = make_bar(second_ts_event, second_ts_init);
+
+    data_engine.process_data(Data::Bar(first));
+    data_engine.process_data(Data::Bar(second));
+
+    let stored = cache.borrow().bar(&bar_type).copied();
+
+    let expected = if expect_overwrite { second } else { first };
+    assert_eq!(stored, Some(expected));
+}
+
+#[rstest]
+fn test_aggregator_emitted_bar_drops_out_of_sequence(
+    audusd_sim: CurrencyPair,
+    stub_msgbus: Rc<RefCell<MessageBus>>,
+    client_id: ClientId,
+    venue: Venue,
+) {
+    let _ = stub_msgbus;
+    let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(VirtualClock::new()));
+    let cache: Rc<RefCell<Cache>> = Rc::new(RefCell::new(Cache::default()));
+
+    let instrument_id = audusd_sim.id;
+    cache
+        .borrow_mut()
+        .add_instrument(InstrumentAny::CurrencyPair(audusd_sim))
+        .unwrap();
+
+    let config = DataEngineConfig {
+        validate_data_sequence: true,
+        ..DataEngineConfig::default()
+    };
+
+    let mut data_engine = DataEngine::new(Rc::clone(&clock), Rc::clone(&cache), Some(config));
+
+    let test_clock: Rc<RefCell<VirtualClock>> = Rc::new(RefCell::new(VirtualClock::new()));
+    let recorder: Rc<RefCell<Vec<DataCommand>>> = Rc::new(RefCell::new(Vec::new()));
+    register_mock_client(
+        test_clock,
+        Rc::clone(&cache),
+        client_id,
+        venue,
+        None,
+        &recorder,
+        &mut data_engine,
+    );
+
+    let bar_type = BarType::from(format!("{instrument_id}-1-TICK-LAST-INTERNAL").as_str());
+
+    let sub = DataCommand::Subscribe(SubscribeCommand::Bars(SubscribeBars::new(
+        bar_type,
+        Some(client_id),
+        Some(venue),
+        UUID4::new(),
+        UnixNanos::default(),
+        None,
+        None,
+    )));
+    data_engine.execute(sub);
+
+    let make_trade = |ts: u64, trade_id: &str| {
+        TradeTick::new(
+            instrument_id,
+            Price::from("0.65000"),
+            Quantity::from("1000"),
+            AggressorSide::Buy,
+            TradeId::new(trade_id),
+            UnixNanos::from(ts),
+            UnixNanos::from(ts),
+        )
+    };
+
+    // First trade emits a bar at ts=2_000
+    data_engine.process_data(Data::Trade(make_trade(2_000, "t1")));
+    let first_bar = cache
+        .borrow()
+        .bar(&bar_type)
+        .copied()
+        .expect("first bar must be cached");
+    assert_eq!(first_bar.ts_event, UnixNanos::from(2_000));
+
+    // Earlier ts_event: aggregator would emit a regressed bar
+    data_engine.process_data(Data::Trade(make_trade(1_000, "t2")));
+
+    let cached = cache
+        .borrow()
+        .bar(&bar_type)
+        .copied()
+        .expect("cache should still hold the first bar");
+    assert_eq!(
+        cached.ts_event, first_bar.ts_event,
+        "out-of-order aggregator-emitted bar must not overwrite the cached bar",
+    );
+}
+
+#[rstest]
+#[case::validation_disabled(false)]
+#[case::validation_enabled(true)]
+fn test_request_scoped_bar_aggregator_older_history_inserted_before_newer_live_bar(
+    audusd_sim: CurrencyPair,
+    stub_msgbus: Rc<RefCell<MessageBus>>,
+    client_id: ClientId,
+    venue: Venue,
+    #[case] validate_sequence: bool,
+) {
+    let _ = stub_msgbus;
+    let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(VirtualClock::new()));
+    let cache: Rc<RefCell<Cache>> = Rc::new(RefCell::new(Cache::default()));
+
+    let instrument_id = audusd_sim.id;
+    cache
+        .borrow_mut()
+        .add_instrument(InstrumentAny::CurrencyPair(audusd_sim))
+        .unwrap();
+
+    let config = DataEngineConfig {
+        validate_data_sequence: validate_sequence,
+        ..DataEngineConfig::default()
+    };
+
+    let mut data_engine = DataEngine::new(clock, Rc::clone(&cache), Some(config));
+    let test_clock: Rc<RefCell<VirtualClock>> = Rc::new(RefCell::new(VirtualClock::new()));
+    let recorder: Rc<RefCell<Vec<DataCommand>>> = Rc::new(RefCell::new(Vec::new()));
+    register_mock_client(
+        test_clock,
+        Rc::clone(&cache),
+        client_id,
+        venue,
+        None,
+        &recorder,
+        &mut data_engine,
+    );
+
+    let bar_type = BarType::from(format!("{instrument_id}-1-TICK-LAST-INTERNAL").as_str());
+    let live_subscribe = DataCommand::Subscribe(SubscribeCommand::Bars(SubscribeBars::new(
+        bar_type,
+        Some(client_id),
+        Some(venue),
+        UUID4::new(),
+        UnixNanos::default(),
+        None,
+        None,
+    )));
+    data_engine.execute(live_subscribe);
+
+    let make_trade = |ts: u64, trade_id: &str| {
+        TradeTick::new(
+            instrument_id,
+            Price::from("0.65000"),
+            Quantity::from("1000"),
+            AggressorSide::Buy,
+            TradeId::new(trade_id),
+            UnixNanos::from(ts),
+            UnixNanos::from(ts),
+        )
+    };
+
+    // a live bar is cached before the requested history
+    data_engine.process_data(Data::Trade(make_trade(2_000, "live-1")));
+    assert_eq!(
+        cache.borrow().bar(&bar_type).map(|bar| bar.ts_event),
+        Some(UnixNanos::from(2_000)),
+    );
+
+    let request_id = UUID4::new();
+    let params: Params = serde_json::from_value(json!({
+        "bar_types": [bar_type.to_string()],
+        "update_subscriptions": false,
+    }))
+    .unwrap();
+
+    let request = RequestTrades::new(
+        instrument_id,
+        None,
+        None,
+        None,
+        Some(client_id),
+        request_id,
+        UnixNanos::default(),
+        Some(params.clone()),
+    );
+    data_engine.execute(DataCommand::Request(RequestCommand::Trades(request)));
+
+    data_engine.response(DataResponse::Trades(TradesResponse::new(
+        request_id,
+        client_id,
+        instrument_id,
+        vec![make_trade(1_000, "historical-1")],
+        None,
+        None,
+        UnixNanos::from(1_000),
+        Some(params),
+    )));
+
+    // the older requested aggregate is cached behind the newer live bar
+    let stamps: Vec<_> = cache
+        .borrow()
+        .bars(&bar_type)
+        .map(|bars| bars.iter().map(|bar| bar.ts_event).collect())
+        .unwrap_or_default();
+    assert_eq!(stamps, vec![UnixNanos::from(2_000), UnixNanos::from(1_000)]);
+
+    // the live path continues to extend the series
+    data_engine.process_data(Data::Trade(make_trade(3_000, "live-2")));
+
+    let stamps: Vec<_> = cache
+        .borrow()
+        .bars(&bar_type)
+        .map(|bars| bars.iter().map(|bar| bar.ts_event).collect())
+        .unwrap_or_default();
+    assert_eq!(
+        stamps,
+        vec![
+            UnixNanos::from(3_000),
+            UnixNanos::from(2_000),
+            UnixNanos::from(1_000),
+        ],
+    );
+}
+
+#[rstest]
+fn test_shared_internal_bars_retry_failed_source(
+    audusd_sim: CurrencyPair,
+    data_engine: Rc<RefCell<DataEngine>>,
+    clock: Rc<RefCell<VirtualClock>>,
+    cache: Rc<RefCell<Cache>>,
+    client_id: ClientId,
+    venue: Venue,
+) {
+    let mut data_engine = data_engine.borrow_mut();
+    let recorder = Rc::new(RefCell::new(Vec::new()));
+    register_failing_subscribe_client(
+        clock,
+        cache,
+        client_id,
+        venue,
+        &recorder,
+        MockSubscribeFailure::Trades,
+        &mut data_engine,
+    );
+    data_engine.process(&InstrumentAny::CurrencyPair(audusd_sim.clone()) as &dyn Any);
+    let bar_type = BarType::from("AUD/USD.SIM-1-MINUTE-LAST-INTERNAL");
+    let first_command_id = UUID4::new();
+
+    let subscribe = |command_id| {
+        DataCommand::Subscribe(SubscribeCommand::Bars(SubscribeBars::new(
+            bar_type,
+            Some(client_id),
+            Some(venue),
+            command_id,
+            UnixNanos::from(1),
+            None,
+            None,
+        )))
+    };
+
+    data_engine.execute(subscribe(first_command_id));
+    assert!(recorder.borrow().is_empty());
+
+    data_engine.execute(subscribe(UUID4::new()));
+
+    let recorded = recorder.borrow();
+    assert_eq!(recorded.len(), 1);
+
+    let DataCommand::Subscribe(SubscribeCommand::Trades(command)) = &recorded[0] else {
+        panic!("expected a trade source subscription");
+    };
+
+    assert_eq!(command.single_instrument_id().unwrap(), audusd_sim.id);
+    assert_eq!(command.client_id, Some(client_id));
+    assert_eq!(command.venue, Some(venue));
+    assert_eq!(command.ts_init, UnixNanos::from(1));
+    assert_eq!(command.correlation_id, Some(first_command_id));
+    #[cfg(feature = "streaming")]
+    let expected_params = Some(client_subscription_params(Params::empty()));
+    #[cfg(not(feature = "streaming"))]
+    let expected_params = None;
+    assert_eq!(command.params, expected_params);
+}
+
+#[rstest]
+#[case::two_levels(&[
+    "AUD/USD.SIM-5-MINUTE-BID-INTERNAL@1-MINUTE-EXTERNAL",
+    "AUD/USD.SIM-15-MINUTE-BID-INTERNAL@5-MINUTE-INTERNAL",
+])]
+#[case::three_levels(&[
+    "AUD/USD.SIM-5-MINUTE-BID-INTERNAL@1-MINUTE-EXTERNAL",
+    "AUD/USD.SIM-15-MINUTE-BID-INTERNAL@5-MINUTE-INTERNAL",
+    "AUD/USD.SIM-1-HOUR-BID-INTERNAL@15-MINUTE-INTERNAL",
+])]
+fn test_unsubscribe_chained_composite_bars_releases_retained_source(
+    audusd_sim: CurrencyPair,
+    data_engine: Rc<RefCell<DataEngine>>,
+    clock: Rc<RefCell<VirtualClock>>,
+    cache: Rc<RefCell<Cache>>,
+    client_id: ClientId,
+    venue: Venue,
+    #[case] chain: &[&str],
+) {
+    // Releasing the top of the chain must walk down to the 5-minute source and free its
+    // external 1-minute feed, not the quote feed another owner holds.
+    let mut data_engine = data_engine.borrow_mut();
+    let recorder: Rc<RefCell<Vec<DataCommand>>> = Rc::new(RefCell::new(Vec::new()));
+    register_mock_client(
+        clock,
+        cache,
+        client_id,
+        venue,
+        None,
+        &recorder,
+        &mut data_engine,
+    );
+
+    let instrument_id = audusd_sim.id;
+    let inst_any = InstrumentAny::CurrencyPair(audusd_sim);
+    data_engine.process(&inst_any as &dyn Any);
+
+    data_engine.execute(DataCommand::Subscribe(SubscribeCommand::Quotes(
+        SubscribeQuotes::new(
+            instrument_id,
+            Some(client_id),
+            Some(venue),
+            UUID4::new(),
+            UnixNanos::default(),
+            None,
+            None,
+        ),
+    )));
+
+    let bar_types: Vec<BarType> = chain
+        .iter()
+        .map(|bar_type| BarType::from(*bar_type))
+        .collect();
+
+    for bar_type in bar_types.iter().copied() {
+        data_engine.execute(DataCommand::Subscribe(SubscribeCommand::Bars(
+            SubscribeBars::new(
+                bar_type,
+                Some(client_id),
+                Some(venue),
+                UUID4::new(),
+                UnixNanos::default(),
+                None,
+                None,
+            ),
+        )));
+    }
+
+    recorder.borrow_mut().clear();
+
+    // Each lower release defers while the next aggregator up the chain still consumes its topic
+    for bar_type in bar_types.iter().copied() {
+        data_engine.execute(DataCommand::Unsubscribe(UnsubscribeCommand::Bars(
+            UnsubscribeBars::new(
+                bar_type,
+                Some(client_id),
+                Some(venue),
+                UUID4::new(),
+                UnixNanos::default(),
+                None,
+                None,
+            ),
+        )));
+    }
+
+    let recorded = recorder.borrow();
+    assert_eq!(recorded.len(), 1);
+
+    let DataCommand::Unsubscribe(UnsubscribeCommand::Bars(command)) = &recorded[0] else {
+        panic!(
+            "expected external source bars unsubscribe, was {:?}",
+            recorded[0]
+        );
+    };
+
+    assert_eq!(
+        command.single_bar_type().unwrap(),
+        BarType::from("AUD/USD.SIM-1-MINUTE-BID-EXTERNAL")
+    );
+    assert_eq!(command.client_id, Some(client_id));
+    assert_eq!(data_engine.subscribed_quotes(), vec![instrument_id]);
+    assert!(data_engine.subscribed_bars().is_empty());
+}
+
+#[rstest]
+#[case::owned(false)]
+#[case::borrowed(true)]
+fn test_process_bar(
+    #[case] borrowed: bool,
+    data_engine: Rc<RefCell<DataEngine>>,
+    data_client: DataClientAdapter,
+) {
+    let client_id = data_client.client_id;
+    let venue = data_client.venue;
+    data_engine.borrow_mut().register_client(data_client, None);
+
+    let bar = Bar::default();
+
+    let sub = SubscribeBars::new(
+        bar.bar_type,
+        Some(client_id),
+        venue,
+        UUID4::new(),
+        UnixNanos::default(),
+        None,
+        None,
+    );
+    let cmd = DataCommand::Subscribe(SubscribeCommand::Bars(sub));
+
+    data_engine.borrow_mut().execute(cmd);
+
+    let (handler, saver) = get_typed_message_saving_handler::<Bar>(None);
+    let topic = switchboard::get_bars_topic(bar.bar_type);
+    msgbus::subscribe_bars(topic.into(), handler, None);
+
+    let mut data_engine = data_engine.borrow_mut();
+    dispatch_data(&mut data_engine, Data::Bar(bar), borrowed);
+    let cache = &data_engine.cache().borrow();
+    let messages = saver.get_messages();
+
+    assert_eq!(cache.bar(&bar.bar_type), Some(bar).as_ref());
+    assert_eq!(messages.len(), 1);
+    assert!(messages.contains(&bar));
+}
+
+#[rstest]
+fn test_trim_to_bounds_trims_bars(audusd_sim: CurrencyPair) {
+    let instrument_id = audusd_sim.id;
+    let bar_type = BarType::from(format!("{instrument_id}-1-MINUTE-LAST-INTERNAL").as_str());
+
+    let make_bar = |ts: u64| {
+        Bar::new(
+            bar_type,
+            Price::from("1.00000"),
+            Price::from("1.00010"),
+            Price::from("0.99990"),
+            Price::from("1.00005"),
+            Quantity::from("1"),
+            UnixNanos::from(ts),
+            UnixNanos::from(ts),
+        )
+    };
+
+    let mut resp = DataResponse::Bars(BarsResponse::new(
+        UUID4::new(),
+        ClientId::test_default(),
+        bar_type,
+        vec![make_bar(1_000), make_bar(2_000), make_bar(3_000)],
+        Some(UnixNanos::from(2_000)),
+        Some(UnixNanos::from(3_000)),
+        UnixNanos::default(),
+        None,
+    ));
+
+    resp.trim_to_bounds();
+
+    let DataResponse::Bars(bars) = resp else {
+        panic!("expected Bars variant");
+    };
+
+    let ts_inits: Vec<u64> = bars.data.iter().map(|b| b.ts_init.as_u64()).collect();
+    assert_eq!(ts_inits, vec![2_000, 3_000]);
+}
+
+#[rstest]
+fn test_external_bars_release_after_final_owner(
+    audusd_sim: CurrencyPair,
+    data_engine: Rc<RefCell<DataEngine>>,
+    clock: Rc<RefCell<VirtualClock>>,
+    cache: Rc<RefCell<Cache>>,
+    client_id: ClientId,
+    venue: Venue,
+) {
+    let mut data_engine = data_engine.borrow_mut();
+    let recorder: Rc<RefCell<Vec<DataCommand>>> = Rc::new(RefCell::new(Vec::new()));
+    register_mock_client(
+        clock,
+        cache,
+        client_id,
+        venue,
+        None,
+        &recorder,
+        &mut data_engine,
+    );
+
+    let inst_any = InstrumentAny::CurrencyPair(audusd_sim);
+    data_engine.process(&inst_any as &dyn Any);
+
+    let bar_type = BarType::from("AUD/USD.SIM-1-MINUTE-LAST-EXTERNAL");
+    let first_subscribe = DataCommand::Subscribe(SubscribeCommand::Bars(SubscribeBars::new(
+        bar_type,
+        Some(client_id),
+        Some(venue),
+        UUID4::new(),
+        UnixNanos::default(),
+        None,
+        None,
+    )));
+    let second_subscribe = DataCommand::Subscribe(SubscribeCommand::Bars(SubscribeBars::new(
+        bar_type,
+        Some(client_id),
+        Some(venue),
+        UUID4::new(),
+        UnixNanos::default(),
+        None,
+        None,
+    )));
+    data_engine.execute(first_subscribe);
+    data_engine.execute(second_subscribe);
+    assert_eq!(recorder.borrow().len(), 1);
+
+    data_engine.execute(DataCommand::Unsubscribe(UnsubscribeCommand::Bars(
+        UnsubscribeBars::new(
+            bar_type,
+            Some(client_id),
+            Some(venue),
+            UUID4::new(),
+            UnixNanos::default(),
+            None,
+            None,
+        ),
+    )));
+    assert_eq!(recorder.borrow().len(), 1);
+
+    data_engine.execute(DataCommand::Unsubscribe(UnsubscribeCommand::Bars(
+        UnsubscribeBars::new(
+            bar_type,
+            Some(client_id),
+            Some(venue),
+            UUID4::new(),
+            UnixNanos::default(),
+            None,
+            None,
+        ),
+    )));
+
+    let recorded = recorder.borrow();
+    assert_eq!(recorded.len(), 2);
+    assert!(matches!(
+        &recorded[1],
+        DataCommand::Unsubscribe(UnsubscribeCommand::Bars(_))
+    ));
+}
+
+#[rstest]
+fn test_bar_list_mixes_aggregation_modes_and_releases_shared_sources(
+    audusd_sim: CurrencyPair,
+    data_engine: Rc<RefCell<DataEngine>>,
+    clock: Rc<RefCell<VirtualClock>>,
+    cache: Rc<RefCell<Cache>>,
+    client_id: ClientId,
+    venue: Venue,
+) {
+    let mut engine = data_engine.borrow_mut();
+    let recorder = Rc::new(RefCell::new(Vec::new()));
+    register_mock_client(
+        Rc::clone(&clock),
+        Rc::clone(&cache),
+        client_id,
+        venue,
+        None,
+        &recorder,
+        &mut engine,
+    );
+    let instrument_id = audusd_sim.id;
+    engine.process(&InstrumentAny::CurrencyPair(audusd_sim) as &dyn Any);
+    let external = BarType::from("AUD/USD.SIM-1-MINUTE-LAST-EXTERNAL");
+    let trade = BarType::from("AUD/USD.SIM-1-MINUTE-LAST-INTERNAL");
+    let quote = BarType::from("AUD/USD.SIM-2-MINUTE-BID-INTERNAL");
+    let composite = BarType::from("AUD/USD.SIM-5-MINUTE-LAST-INTERNAL@1-MINUTE-EXTERNAL");
+    let types = [external, trade, quote, composite];
+
+    let command = SubscribeBars::new(
+        types,
+        Some(client_id),
+        Some(venue),
+        UUID4::new(),
+        UnixNanos::from(23),
+        None,
+        None,
+    );
+    engine
+        .execute_subscribe(SubscribeCommand::Bars(command))
+        .unwrap();
+    assert_eq!(
+        engine.subscribed_bars(),
+        vec![external, trade, quote, composite.standard()]
+    );
+    assert_eq!(engine.subscribed_trades(), vec![instrument_id]);
+    assert_eq!(engine.subscribed_quotes(), vec![instrument_id]);
+    assert_eq!(engine.clock().borrow().timer_count(), 3);
+
+    let release = UnsubscribeBars::new(
+        types,
+        Some(client_id),
+        Some(venue),
+        UUID4::new(),
+        UnixNanos::from(31),
+        None,
+        None,
+    );
+    engine
+        .execute_unsubscribe(&UnsubscribeCommand::Bars(release))
+        .unwrap();
+    assert_eq!(engine.subscribed_bars(), Vec::<BarType>::new());
+    assert_eq!(engine.subscribed_trades(), Vec::<InstrumentId>::new());
+    assert_eq!(engine.subscribed_quotes(), Vec::<InstrumentId>::new());
+    assert_eq!(engine.clock().borrow().timer_count(), 0);
+    assert_eq!(
+        msgbus::exact_subscriber_count_bars(switchboard::get_bars_topic(external)),
+        0
+    );
+    assert_eq!(
+        msgbus::exact_subscriber_count_trades(switchboard::get_trades_topic(instrument_id)),
+        0
+    );
+    assert_eq!(
+        msgbus::exact_subscriber_count_quotes(switchboard::get_quotes_topic(instrument_id)),
+        0
+    );
+}
+
+#[rstest]
+fn test_bar_list_native_failure_continues_independent_members(
+    data_engine: Rc<RefCell<DataEngine>>,
+    clock: Rc<RefCell<VirtualClock>>,
+    cache: Rc<RefCell<Cache>>,
+    client_id: ClientId,
+    venue: Venue,
+) {
+    let mut engine = data_engine.borrow_mut();
+    let recorder = Rc::new(RefCell::new(Vec::new()));
+    register_mock_client(clock, cache, client_id, venue, None, &recorder, &mut engine);
+    let first = BarType::from("AUD/USD.SIM-1-MINUTE-LAST-EXTERNAL");
+    let invalid = BarType::from("SYNTH.SYNTH-1-MINUTE-LAST-EXTERNAL");
+    let last = BarType::from("AUD/USD.SIM-5-MINUTE-LAST-EXTERNAL");
+
+    let command = SubscribeBars::new(
+        [first, invalid, last],
+        Some(client_id),
+        Some(venue),
+        UUID4::new(),
+        UnixNanos::from(53),
+        Some(UUID4::new()),
+        Some(params_from_json(json!({"start_ns": 91}))),
+    );
+    let error = engine
+        .execute_subscribe(SubscribeCommand::Bars(command.clone()))
+        .unwrap_err();
+    assert_eq!(
+        error.to_string(),
+        "Cannot subscribe for externally aggregated synthetic instrument bar data"
+    );
+    assert_eq!(
+        AHashSet::from_iter(engine.subscribed_bars()),
+        AHashSet::from_iter([first, last])
+    );
+    let recorded = recorder.borrow();
+
+    let [DataCommand::Subscribe(SubscribeCommand::Bars(actual))] = recorded.as_slice() else {
+        panic!("expected both valid bar members, was {recorded:?}");
+    };
+
+    assert_eq!(
+        serde_json::to_value(actual).unwrap(),
+        serde_json::to_value(command.with_bar_types([first, last])).unwrap()
+    );
+    drop(recorded);
+    engine
+        .execute_unsubscribe(&UnsubscribeCommand::Bars(UnsubscribeBars::new(
+            command.bar_types,
+            command.client_id,
+            command.venue,
+            UUID4::new(),
+            UnixNanos::from(61),
+            None,
+            command.params,
+        )))
+        .unwrap();
+    assert_eq!(engine.subscribed_bars(), Vec::<BarType>::new());
+    let recorded = recorder.borrow();
+
+    let DataCommand::Unsubscribe(UnsubscribeCommand::Bars(release)) = &recorded[1] else {
+        panic!("expected valid members to release");
+    };
+
+    assert_eq!(release.bar_types, vec![first, last]);
+}
+
+#[rstest]
+fn test_skipped_bar_release_preserves_other_owner(
+    #[values(false, true)] continuous_future: bool,
+    #[values(false, true)] scalar: bool,
+    data_engine: Rc<RefCell<DataEngine>>,
+    clock: Rc<RefCell<VirtualClock>>,
+    cache: Rc<RefCell<Cache>>,
+    client_id: ClientId,
+    venue: Venue,
+) {
+    let mut engine = data_engine.borrow_mut();
+    let recorder = Rc::new(RefCell::new(Vec::new()));
+    register_mock_client(clock, cache, client_id, venue, None, &recorder, &mut engine);
+    let owned = BarType::from("AUD/USD.SIM-1-MINUTE-LAST-EXTERNAL");
+    let invalid = BarType::from("SYNTH.SYNTH-1-MINUTE-LAST-EXTERNAL");
+    let topic = switchboard::get_bars_topic(owned);
+    let handler = TypedHandler::from(|_: &Bar| {});
+    msgbus::subscribe_bars(topic.into(), handler.clone(), None);
+    engine
+        .execute_subscribe(SubscribeCommand::Bars(SubscribeBars::new(
+            owned,
+            Some(client_id),
+            Some(venue),
+            UUID4::new(),
+            UnixNanos::from(17),
+            None,
+            None,
+        )))
+        .unwrap();
+    assert_eq!(engine.subscribed_bars(), vec![owned]);
+    assert_eq!(recorder.borrow().len(), 1);
+
+    let types = if scalar {
+        vec![owned]
+    } else {
+        vec![invalid, owned]
+    };
+
+    let params = if continuous_future || scalar {
+        Some(params_from_json(
+            json!({"continuous_future_transitions": []}),
+        ))
+    } else {
+        None
+    };
+
+    let error = engine
+        .execute_subscribe(SubscribeCommand::Bars(SubscribeBars::new(
+            types.clone(),
+            Some(client_id),
+            None,
+            UUID4::new(),
+            UnixNanos::from(23),
+            None,
+            params,
+        )))
+        .unwrap_err();
+    assert_eq!(
+        error.to_string(),
+        if continuous_future || scalar {
+            format!(
+                "Continuous future bar subscriptions require an internally aggregated target, was {}",
+                types[0]
+            )
+        } else {
+            "Cannot subscribe for externally aggregated synthetic instrument bar data".to_string()
+        }
+    );
+    assert_eq!(engine.subscribed_bars(), vec![owned]);
+    assert_eq!(recorder.borrow().len(), 1);
+    engine
+        .execute_unsubscribe(&UnsubscribeCommand::Bars(UnsubscribeBars::new(
+            types,
+            Some(client_id),
+            None,
+            UUID4::new(),
+            UnixNanos::from(31),
+            None,
+            None,
+        )))
+        .unwrap();
+    assert_eq!(msgbus::exact_subscriber_count_bars(topic), 1);
+    assert_eq!(engine.subscribed_bars(), vec![owned]);
+    assert_eq!(recorder.borrow().len(), 1);
+
+    msgbus::unsubscribe_bars(topic.into(), &handler);
+    engine
+        .execute_unsubscribe(&UnsubscribeCommand::Bars(UnsubscribeBars::new(
+            owned,
+            Some(client_id),
+            Some(venue),
+            UUID4::new(),
+            UnixNanos::from(37),
+            None,
+            None,
+        )))
+        .unwrap();
+
+    assert_eq!(msgbus::exact_subscriber_count_bars(topic), 0);
+    assert_eq!(engine.subscribed_bars(), Vec::<BarType>::new());
+    assert_eq!(recorder.borrow().len(), 2);
+}
+
+#[rstest]
+#[case::quotes(PriceType::Bid)]
+#[case::trades(PriceType::Last)]
+fn test_request_time_bar_boundary_assignment(
+    audusd_sim: CurrencyPair,
+    stub_msgbus: Rc<RefCell<MessageBus>>,
+    venue: Venue,
+    #[case] price_type: PriceType,
+    #[values(BarIntervalType::RightOpen, BarIntervalType::LeftOpen)] interval: BarIntervalType,
+    #[values(0, 2, 3)] split_at: usize,
+    #[values(false, true)] advance: bool,
+) {
+    let _ = stub_msgbus;
+    let client_id = client_id();
+    let instrument_id = audusd_sim.id;
+    let clock = Rc::new(RefCell::new(VirtualClock::new()));
+    let cache = Rc::new(RefCell::new(Cache::default()));
+    cache
+        .borrow_mut()
+        .add_instrument(InstrumentAny::CurrencyPair(audusd_sim))
+        .unwrap();
+
+    let config = DataEngineConfig {
+        time_bars_interval_type: interval,
+        ..DataEngineConfig::default()
+    };
+
+    let mut engine = DataEngine::new(
+        Rc::clone(&clock) as Rc<RefCell<dyn Clock>>,
+        Rc::clone(&cache),
+        Some(config),
+    );
+    let recorder = Rc::new(RefCell::new(Vec::new()));
+    register_mock_client(
+        clock,
+        Rc::clone(&cache),
+        client_id,
+        venue,
+        None,
+        &recorder,
+        &mut engine,
+    );
+    let bar_type =
+        BarType::from(format!("{instrument_id}-1-SECOND-{price_type}-INTERNAL").as_str());
+    let request_id = UUID4::new();
+    let params: Params = serde_json::from_value(json!({
+        "bar_types": [bar_type.to_string()],
+        "update_subscriptions": false,
+    }))
+    .unwrap();
+
+    let request = if price_type == PriceType::Last {
+        RequestCommand::Trades(RequestTrades::new(
+            instrument_id,
+            None,
+            None,
+            None,
+            Some(client_id),
+            request_id,
+            UnixNanos::from(12_000_000_000),
+            Some(params),
+        ))
+    } else {
+        RequestCommand::Quotes(RequestQuotes::new(
+            instrument_id,
+            None,
+            None,
+            None,
+            Some(client_id),
+            request_id,
+            UnixNanos::from(12_000_000_000),
+            Some(params),
+        ))
+    };
+
+    engine.execute_request(request).unwrap();
+    let mut samples = vec![
+        (10_500_000_000_u64, "100.00000"),
+        (11_000_000_000, "101.00000"),
+        (11_000_000_000, "102.00000"),
+    ];
+
+    if advance {
+        samples.push((11_500_000_000, "103.00000"));
+    }
+
+    let chunks = if split_at == 0 {
+        vec![samples.as_slice()]
+    } else {
+        vec![&samples[..split_at], &samples[split_at..]]
+    };
+
+    for (index, chunk) in chunks.iter().enumerate() {
+        let response = if price_type == PriceType::Last {
+            let trades: Vec<_> = chunk
+                .iter()
+                .enumerate()
+                .map(|(i, (ts, price))| {
+                    let trade_id = TradeId::new(format!("{index}-{i}"));
+
+                    TradeTick::new(
+                        instrument_id,
+                        Price::from(*price),
+                        Quantity::from(1),
+                        AggressorSide::Buy,
+                        trade_id,
+                        UnixNanos::from(*ts),
+                        UnixNanos::from(*ts),
+                    )
+                })
+                .collect();
+
+            DataResponse::Trades(TradesResponse::new(
+                request_id,
+                client_id,
+                instrument_id,
+                trades,
+                None,
+                None,
+                UnixNanos::from(12_000_000_000),
+                None,
+            ))
+        } else {
+            let quotes: Vec<_> = chunk
+                .iter()
+                .map(|(ts, price)| {
+                    QuoteTick::new(
+                        instrument_id,
+                        Price::from(*price),
+                        Price::from("200.00000"),
+                        Quantity::from(1),
+                        Quantity::from(7),
+                        UnixNanos::from(*ts),
+                        UnixNanos::from(*ts),
+                    )
+                })
+                .collect();
+
+            DataResponse::Quotes(QuotesResponse::new(
+                request_id,
+                client_id,
+                instrument_id,
+                quotes,
+                None,
+                None,
+                UnixNanos::from(12_000_000_000),
+                None,
+            ))
+        };
+
+        let completed = index + 1 == chunks.len();
+        engine.response_envelope(DataResponseEnvelope::new(response, completed, None));
+        if !completed && interval == BarIntervalType::LeftOpen {
+            assert_eq!(cache.borrow().bar(&bar_type), None);
+        }
+    }
+
+    let (close, volume, ts_event) = if interval == BarIntervalType::LeftOpen {
+        ("102.00000", 3, 11_000_000_000)
+    } else {
+        ("100.00000", 1, 10_000_000_000)
+    };
+
+    let expected = Bar::new(
+        bar_type,
+        Price::from("100.00000"),
+        Price::from(close),
+        Price::from("100.00000"),
+        Price::from(close),
+        Quantity::from(volume),
+        UnixNanos::from(ts_event),
+        UnixNanos::from(11_000_000_000),
+    );
+    let bars: Vec<_> = cache.borrow().bars(&bar_type).unwrap();
+    assert_eq!(bars, vec![expected]);
+}
+
+#[rstest]
+#[case::right_open(BarIntervalType::RightOpen, ("102.00000", 3, 10_000_000_000))]
+#[case::left_open(BarIntervalType::LeftOpen, ("103.00000", 4, 12_000_000_000))]
+fn test_request_time_bar_boundary_finalizes_sources_before_dependents(
+    audusd_sim: CurrencyPair,
+    stub_msgbus: Rc<RefCell<MessageBus>>,
+    client_id: ClientId,
+    venue: Venue,
+    #[case] interval: BarIntervalType,
+    #[case] expected: (&str, u64, u64),
+) {
+    let _ = stub_msgbus;
+    let instrument_id = audusd_sim.id;
+    let clock = Rc::new(RefCell::new(VirtualClock::new()));
+    let cache = Rc::new(RefCell::new(Cache::default()));
+    cache
+        .borrow_mut()
+        .add_instrument(InstrumentAny::CurrencyPair(audusd_sim))
+        .unwrap();
+
+    let config = DataEngineConfig {
+        time_bars_interval_type: interval,
+        ..DataEngineConfig::default()
+    };
+
+    let mut engine = DataEngine::new(
+        Rc::clone(&clock) as Rc<RefCell<dyn Clock>>,
+        Rc::clone(&cache),
+        Some(config),
+    );
+    let recorder = Rc::new(RefCell::new(Vec::new()));
+    register_mock_client(
+        clock,
+        Rc::clone(&cache),
+        client_id,
+        venue,
+        None,
+        &recorder,
+        &mut engine,
+    );
+    let source = BarType::from(format!("{instrument_id}-1-SECOND-LAST-INTERNAL").as_str());
+    let target =
+        BarType::from(format!("{instrument_id}-2-SECOND-LAST-INTERNAL@1-SECOND-INTERNAL").as_str());
+    let request_id = UUID4::new();
+    let params: Params = serde_json::from_value(json!({
+        "bar_types": [target.to_string(), source.to_string()],
+        "update_subscriptions": false,
+    }))
+    .unwrap();
+
+    let request = RequestTrades::new(
+        instrument_id,
+        None,
+        None,
+        None,
+        Some(client_id),
+        request_id,
+        UnixNanos::from(12_000_000_000),
+        Some(params),
+    );
+    engine
+        .execute_request(RequestCommand::Trades(request))
+        .unwrap();
+
+    let trades: Vec<_> = [
+        (10_500_000_000_u64, "100.00000"),
+        (11_000_000_000, "101.00000"),
+        (11_500_000_000, "102.00000"),
+        (12_000_000_000, "103.00000"),
+    ]
+    .into_iter()
+    .enumerate()
+    .map(|(i, (ts, price))| {
+        let trade_id = TradeId::new(format!("trade-{i}"));
+
+        TradeTick::new(
+            instrument_id,
+            Price::from(price),
+            Quantity::from(1),
+            AggressorSide::Buy,
+            trade_id,
+            UnixNanos::from(ts),
+            UnixNanos::from(ts),
+        )
+    })
+    .collect();
+
+    engine.response(DataResponse::Trades(TradesResponse::new(
+        request_id,
+        client_id,
+        instrument_id,
+        trades,
+        None,
+        None,
+        UnixNanos::from(12_000_000_000),
+        None,
+    )));
+
+    let (close, volume, ts_event) = expected;
+
+    let expected = Bar::new(
+        target.standard(),
+        Price::from("100.00000"),
+        Price::from(close),
+        Price::from("100.00000"),
+        Price::from(close),
+        Quantity::from(volume),
+        UnixNanos::from(ts_event),
+        UnixNanos::from(12_000_000_000),
+    );
+    let bars: Vec<_> = cache.borrow().bars(&target.standard()).unwrap();
+    assert_eq!(bars, vec![expected]);
+}
+
+#[rstest]
+#[case::right_open(BarIntervalType::RightOpen, ("100.00000", 1, 10_000_000_000), ("101.00000", 3, 11_000_000_000))]
+#[case::left_open(BarIntervalType::LeftOpen, ("102.00000", 3, 11_000_000_000), ("103.00000", 1, 12_000_000_000))]
+fn test_request_time_bar_boundary_replays_warmup_before_final_close(
+    audusd_sim: CurrencyPair,
+    stub_msgbus: Rc<RefCell<MessageBus>>,
+    client_id: ClientId,
+    venue: Venue,
+    #[case] interval: BarIntervalType,
+    #[case] historical_fields: (&str, u64, u64),
+    #[case] live_fields: (&str, u64, u64),
+) {
+    let _ = stub_msgbus;
+    let instrument_id = audusd_sim.id;
+    let clock = Rc::new(RefCell::new(VirtualClock::new()));
+    clock.borrow_mut().set_time(UnixNanos::from(11_500_000_000));
+    let cache = Rc::new(RefCell::new(Cache::default()));
+    cache
+        .borrow_mut()
+        .add_instrument(InstrumentAny::CurrencyPair(audusd_sim))
+        .unwrap();
+
+    let config = DataEngineConfig {
+        time_bars_interval_type: interval,
+        ..DataEngineConfig::default()
+    };
+
+    let mut engine = DataEngine::new(
+        Rc::clone(&clock) as Rc<RefCell<dyn Clock>>,
+        Rc::clone(&cache),
+        Some(config),
+    );
+    let recorder = Rc::new(RefCell::new(Vec::new()));
+    register_mock_client(
+        Rc::clone(&clock),
+        Rc::clone(&cache),
+        client_id,
+        venue,
+        None,
+        &recorder,
+        &mut engine,
+    );
+    let bar_type = BarType::from(format!("{instrument_id}-1-SECOND-LAST-INTERNAL").as_str());
+    let request_id = UUID4::new();
+    let params: Params = serde_json::from_value(
+        json!({"bar_types": [bar_type.to_string()], "update_subscriptions": true}),
+    )
+    .unwrap();
+
+    let request = RequestTrades::new(
+        instrument_id,
+        None,
+        None,
+        None,
+        Some(client_id),
+        request_id,
+        UnixNanos::from(11_500_000_000),
+        Some(params),
+    );
+    engine
+        .execute_request(RequestCommand::Trades(request))
+        .unwrap();
+
+    let subscribe = SubscribeBars::new(
+        bar_type,
+        Some(client_id),
+        Some(venue),
+        UUID4::new(),
+        UnixNanos::from(11_500_000_000),
+        None,
+        None,
+    );
+    engine.execute(DataCommand::Subscribe(SubscribeCommand::Bars(subscribe)));
+    let (handler, saver) = get_typed_message_saving_handler::<Bar>(None);
+    let topic = switchboard::get_bars_topic(bar_type);
+    msgbus::subscribe_bars(topic.into(), handler, None);
+
+    let warmup = make_trade(instrument_id, "102.00000", 1, "warmup", 11_000_000_000);
+    engine.process_data(Data::Trade(warmup));
+    let first = make_trade(instrument_id, "100.00000", 1, "first", 10_500_000_000);
+    let boundary = make_trade(instrument_id, "101.00000", 1, "boundary", 11_000_000_000);
+    engine.response(DataResponse::Trades(TradesResponse::new(
+        request_id,
+        client_id,
+        instrument_id,
+        vec![first, boundary],
+        None,
+        None,
+        UnixNanos::from(11_500_000_000),
+        None,
+    )));
+
+    let (historical_close, historical_volume, historical_ts) = historical_fields;
+
+    let historical = Bar::new(
+        bar_type,
+        Price::from("100.00000"),
+        Price::from(historical_close),
+        Price::from("100.00000"),
+        Price::from(historical_close),
+        Quantity::from(historical_volume),
+        UnixNanos::from(historical_ts),
+        UnixNanos::from(11_000_000_000),
+    );
+    assert_eq!(cache.borrow().bar(&bar_type), Some(&historical));
+    assert_eq!(saver.get_messages(), Vec::<Bar>::new());
+
+    let live = make_trade(instrument_id, "103.00000", 1, "live", 11_750_000_000);
+    engine.process_data(Data::Trade(live));
+    let events = clock
+        .borrow_mut()
+        .advance_time(UnixNanos::from(12_000_000_000), true);
+    let handlers = clock.borrow().match_handlers(events);
+    for handler in handlers {
+        handler.callback.call(handler.event);
+    }
+
+    let (live_open, live_volume, live_ts) = live_fields;
+
+    let expected = Bar::new(
+        bar_type,
+        Price::from(live_open),
+        Price::from("103.00000"),
+        Price::from(live_open),
+        Price::from("103.00000"),
+        Quantity::from(live_volume),
+        UnixNanos::from(live_ts),
+        UnixNanos::from(12_000_000_000),
+    );
+    let bars: Vec<_> = cache.borrow().bars(&bar_type).unwrap();
+    assert_eq!(bars, vec![expected, historical]);
+    assert_eq!(saver.get_messages(), vec![expected]);
+}
