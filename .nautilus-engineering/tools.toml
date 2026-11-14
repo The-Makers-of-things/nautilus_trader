@@ -1,0 +1,214 @@
+# Shared version pins for Nautilus engineering tools
+#
+# Consumers vendor this catalog to .nautilus-engineering/tools.toml. The pin checker also verifies
+# shared hook fragments and this repository's pre-commit pins against these versions. Each entry
+# names its upstream release source in `releases` so `make outdated` can report newer releases.
+
+[prek]
+kind = "tool"
+version = "0.5.10"
+ci = true
+releases = "pypi:prek"
+
+[pre-commit-hooks]
+kind = "python"
+version = "6.0.0"
+releases = "github:pre-commit/pre-commit-hooks"
+pre-commit-repository = "https://github.com/pre-commit/pre-commit-hooks"
+pre-commit-revision = "v{version}"
+
+[ruff]
+kind = "tool"
+version = "0.17.4"
+ci = true
+releases = "pypi:ruff"
+pre-commit-repository = "https://github.com/astral-sh/ruff-pre-commit"
+pre-commit-revision = "v{version}"
+
+[shfmt]
+kind = "tool"
+version = "3.14.1"
+ci = true
+releases = "github:mvdan/sh"
+pre-commit-repository = "https://github.com/scop/pre-commit-shfmt"
+pre-commit-revision = "v{version}-1"
+pre-commit-fragment = "pre-commit/shell.yaml"
+
+[shellcheck]
+kind = "tool"
+version = "0.11.0.1"
+ci = true
+releases = "pypi:shellcheck-py"
+pre-commit-repository = "https://github.com/shellcheck-py/shellcheck-py"
+pre-commit-revision = "v{version}-1"
+pre-commit-fragment = "pre-commit/shell.yaml"
+
+[yamllint]
+kind = "python"
+version = "1.38.0"
+ci = true
+releases = "pypi:yamllint"
+pre-commit-repository = "https://github.com/adrienverge/yamllint"
+pre-commit-revision = "v{version}"
+pre-commit-fragment = "pre-commit/yaml.yaml"
+
+[taplo]
+kind = "tool"
+version = "0.10.0"
+ci = true
+releases = "crates:taplo-cli"
+pre-commit-dependency = "cli:taplo-cli:{version}"
+pre-commit-hooks = ["taplo-format", "taplo-lint"]
+pre-commit-fragment = "pre-commit/toml.yaml"
+
+[markdownlint-cli2]
+kind = "tool"
+version = "0.24.0"
+ci = true
+releases = "npm:markdownlint-cli2"
+pre-commit-repository = "https://github.com/DavidAnson/markdownlint-cli2"
+pre-commit-revision = "v{version}"
+pre-commit-fragment = "pre-commit/markdown.yaml"
+
+[actionlint]
+kind = "tool"
+version = "1.7.12"
+releases = "github:rhysd/actionlint"
+pre-commit-repository = "https://github.com/rhysd/actionlint"
+pre-commit-revision = "v{version}"
+
+[cargo-audit]
+kind = "tool"
+version = "0.22.2"
+releases = "crates:cargo-audit"
+
+[cargo-binstall]
+kind = "tool"
+version = "1.26.2"
+releases = "crates:cargo-binstall"
+
+[cargo-deny]
+kind = "tool"
+version = "0.20.2"
+releases = "crates:cargo-deny"
+
+[cargo-edit]
+kind = "tool"
+version = "0.13.14"
+releases = "crates:cargo-edit"
+
+[cargo-fuzz]
+kind = "tool"
+version = "0.13.2"
+releases = "crates:cargo-fuzz"
+
+[cargo-hack]
+kind = "tool"
+version = "0.6.46"
+releases = "crates:cargo-hack"
+
+[cargo-hawk]
+kind = "tool"
+version = "0.1.17"
+releases = "crates:cargo-hawk"
+
+[cargo-llvm-cov]
+kind = "tool"
+version = "0.9.1"
+releases = "crates:cargo-llvm-cov"
+
+[cargo-machete]
+kind = "tool"
+version = "0.9.2"
+releases = "crates:cargo-machete"
+
+[cargo-nextest]
+kind = "tool"
+version = "0.9.151"
+releases = "crates:cargo-nextest"
+
+[cargo-vet]
+kind = "tool"
+version = "0.10.3"
+releases = "crates:cargo-vet"
+
+[rust-code-analysis-cli]
+kind = "tool"
+version = "0.0.25"
+releases = "crates:rust-code-analysis-cli"
+
+[uv]
+kind = "tool"
+version = "0.13.7"
+releases = "pypi:uv"
+
+[pip-audit]
+kind = "python"
+version = "2.10.1"
+releases = "pypi:pip-audit"
+
+[osv-scanner]
+kind = "tool"
+version = "2.7.0"
+releases = "github:google/osv-scanner"
+
+[capnp]
+kind = "tool"
+version = "1.5.0"
+releases = "github-tags:capnproto/capnproto"
+
+[codespell]
+kind = "python"
+version = "2.4.3"
+releases = "pypi:codespell"
+pre-commit-repository = "https://github.com/codespell-project/codespell"
+pre-commit-revision = "v{version}"
+pre-commit-fragment = "pre-commit/codespell.yaml"
+
+[gitleaks]
+kind = "tool"
+version = "8.30.1"
+releases = "github:gitleaks/gitleaks"
+pre-commit-repository = "https://github.com/gitleaks/gitleaks"
+pre-commit-revision = "v{version}"
+pre-commit-fragment = "pre-commit/gitleaks.yaml"
+
+[gitlint]
+kind = "python"
+version = "0.19.1"
+releases = "pypi:gitlint"
+pre-commit-repository = "https://github.com/jorisroovers/gitlint"
+pre-commit-revision = "v{version}"
+pre-commit-fragment = "pre-commit/gitlint.yaml"
+
+[hadolint]
+kind = "tool"
+version = "2.15.1"
+releases = "github:hadolint/hadolint"
+pre-commit-repository = "https://github.com/AleksaC/hadolint-py"
+pre-commit-revision = "v{version}"
+pre-commit-fragment = "pre-commit/docker.yaml"
+
+[mermaid-lint]
+kind = "tool"
+version = "0.53.1"
+releases = "npm:@mermaid-lint/cli"
+pre-commit-dependency = "@mermaid-lint/cli@{version}"
+pre-commit-hooks = ["mermaid-lint"]
+pre-commit-fragment = "pre-commit/mermaid.yaml"
+
+[typos]
+kind = "tool"
+version = "1.52.0"
+releases = "github:crate-ci/typos"
+pre-commit-repository = "https://github.com/crate-ci/typos"
+pre-commit-revision = "v{version}"
+pre-commit-fragment = "pre-commit/typos.yaml"
+
+[zizmor]
+kind = "tool"
+version = "1.32.0"
+releases = "pypi:zizmor"
+pre-commit-repository = "https://github.com/zizmorcore/zizmor-pre-commit"
+pre-commit-revision = "v{version}"
+pre-commit-fragment = "pre-commit/zizmor.yaml"

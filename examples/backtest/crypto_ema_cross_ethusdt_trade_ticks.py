@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -------------------------------------------------------------------------------------------------
-#  Copyright (C) 2015-2021 Nautech Systems Pty Ltd. All rights reserved.
+#  Copyright (C) 2015-2026 Nautech Systems Pty Ltd. All rights reserved.
 #  https://nautechsystems.io
 #
 #  Licensed under the GNU Lesser General Public License Version 3.0 (the "License");
@@ -13,96 +13,92 @@
 #  See the License for the specific language governing permissions and
 #  limitations under the License.
 # -------------------------------------------------------------------------------------------------
+"""
+Example of crypto ema cross ethusdt trade ticks.
+"""
 
+import sys
 from decimal import Decimal
+from pathlib import Path
 
-import ccxt
 import pandas as pd
 
-from examples.strategies.ema_cross_simple import EMACross
-from nautilus_trader.adapters.ccxt.providers import CCXTInstrumentProvider
-from nautilus_trader.backtest.data_container import BacktestDataContainer
-from nautilus_trader.backtest.engine import BacktestEngine
-from nautilus_trader.backtest.models import FillModel
-from nautilus_trader.model.bar import BarSpecification
-from nautilus_trader.model.currencies import BTC
-from nautilus_trader.model.currencies import USDT
-from nautilus_trader.model.enums import BarAggregation
-from nautilus_trader.model.enums import OMSType
-from nautilus_trader.model.enums import PriceType
-from nautilus_trader.model.identifiers import Symbol
-from nautilus_trader.model.identifiers import Venue
-from nautilus_trader.model.objects import Money
-from tests.test_kit.providers import TestDataProvider
+from nautilus_trader.adapters.binance import BINANCE_VENUE
+from nautilus_trader.backtest import BacktestEngine
+from nautilus_trader.config import BacktestEngineConfig
+from nautilus_trader.config import RiskEngineConfig
+from nautilus_trader.execution import MakerTakerFeeModel
+from nautilus_trader.model import AccountType
+from nautilus_trader.model import BarType
+from nautilus_trader.model import Currency
+from nautilus_trader.model import Money
+from nautilus_trader.model import OmsType
+from nautilus_trader.model import TraderId
+from nautilus_trader.testkit.providers import TestDataProvider
+from nautilus_trader.testkit.providers import TestInstrumentProvider
+
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "docs" / "tutorials"))
+
+from ema_cross import EMACross
+from ema_cross import EMACrossConfig
 
 
 if __name__ == "__main__":
-    # Setup trading instruments
-    # Requires an internet connection for the instrument loader
-    # Alternatively use the TestInstrumentProvider in the test kit
-    print("Loading instruments...")
-    instruments = CCXTInstrumentProvider(client=ccxt.binance(), load_all=True)
-
-    BINANCE = Venue("BINANCE")
-    ETHUSDT_BINANCE = instruments.get(Symbol("ETH/USDT", BINANCE))
-
-    # Setup data container
-    data = BacktestDataContainer()
-    data.add_instrument(ETHUSDT_BINANCE)
-    data.add_trade_ticks(ETHUSDT_BINANCE.symbol, TestDataProvider.ethusdt_trades())
-
-    # Instantiate your strategy
-    strategy = EMACross(
-        symbol=ETHUSDT_BINANCE.symbol,
-        bar_spec=BarSpecification(250, BarAggregation.TICK, PriceType.LAST),
-        fast_ema_period=10,
-        slow_ema_period=20,
-        trade_size=Decimal(100),
-        order_id_tag="001",
-    )
-
-    # Build the backtest engine
     engine = BacktestEngine(
-        data=data,
-        strategies=[strategy],  # List of 'any' number of strategies
-        use_tick_cache=True,    # Pre-cache ticks for increased performance on repeated runs
-        # exec_db_type="redis",
-        # bypass_logging=True
+        BacktestEngineConfig(
+            trader_id=TraderId.from_str("BACKTESTER-001"),
+            risk_engine=RiskEngineConfig(bypass=True),
+        ),
     )
 
-    # Create a fill model (optional)
-    fill_model = FillModel(
-        prob_fill_at_limit=0.2,
-        prob_fill_at_stop=0.95,
-        prob_slippage=0.5,
-        random_seed=42,
+    ETH = Currency.from_str("ETH")
+    USDT = Currency.from_str("USDT")
+    engine.add_venue(
+        venue=BINANCE_VENUE,
+        oms_type=OmsType.NETTING,
+        account_type=AccountType.CASH,
+        base_currency=None,
+        starting_balances=[Money(1_000_000, USDT), Money(10, ETH)],
+        fee_model=MakerTakerFeeModel(
+            maker_rate=Decimal("0.0001"),
+            taker_rate=Decimal("0.0001"),
+        ),
     )
 
-    # Add an exchange (multiple exchanges possible)
-    # Add starting balances for single-asset or multi-asset accounts
-    engine.add_exchange(
-        venue=BINANCE,
-        oms_type=OMSType.NETTING,
-        generate_position_ids=False,
-        starting_balances=[Money(1_000_000, USDT), Money(1, BTC)],
-        fill_model=fill_model,
+    ETHUSDT_BINANCE = TestInstrumentProvider.ethusdt_binance()
+    engine.add_instrument(ETHUSDT_BINANCE)
+
+    ticks = TestDataProvider.trades_from_binance_csv(
+        instrument=ETHUSDT_BINANCE,
+        csv_name="binance/ethusdt-trades.csv",
+    )
+    engine.add_data(ticks)
+
+    strategy = EMACross(
+        EMACrossConfig(
+            instrument_id=ETHUSDT_BINANCE.id,
+            bar_type=BarType.from_str("ETHUSDT.BINANCE-250-TICK-LAST-INTERNAL"),
+            trade_size=Decimal("0.10"),
+            fast_ema_period=10,
+            slow_ema_period=20,
+        ),
     )
 
-    input("Press Enter to continue...")  # noqa (always Python 3)
-
-    # Run the engine (from start to end of data)
+    engine.add_strategy(strategy)
     engine.run()
 
-    # Optionally view reports
     with pd.option_context(
-            "display.max_rows",
-            100,
-            "display.max_columns",
-            None,
-            "display.width", 300):
-        print(engine.trader.generate_account_report(BINANCE))
-        print(engine.trader.generate_order_fills_report())
-        print(engine.trader.generate_positions_report())
+        "display.max_rows",
+        100,
+        "display.max_columns",
+        None,
+        "display.width",
+        300,
+    ):
+        print(engine.generate_account_report(BINANCE_VENUE))
+        print(engine.generate_order_fills_report())
+        print(engine.generate_positions_report())
 
-    # Good practice to dispose of the object
+    engine.reset()
     engine.dispose()

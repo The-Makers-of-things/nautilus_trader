@@ -1,0 +1,2782 @@
+// -------------------------------------------------------------------------------------------------
+//  Copyright (C) 2015-2026 Nautech Systems Pty Ltd. All rights reserved.
+//  https://nautechsystems.io
+//
+//  Licensed under the GNU Lesser General Public License Version 3.0 (the "License");
+//  You may not use this file except in compliance with the License.
+//  You may obtain a copy of the License at https://www.gnu.org/licenses/lgpl-3.0.en.html
+//
+//  Unless required by applicable law or agreed to in writing, software
+//  distributed under the License is distributed on an "AS IS" BASIS,
+//  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+//  See the License for the specific language governing permissions and
+//  limitations under the License.
+// -------------------------------------------------------------------------------------------------
+
+use std::any::Any;
+
+use ahash::AHashMap;
+use nautilus_common::signal::Signal;
+#[cfg(feature = "defi")]
+use nautilus_common::{cache::CacheSnapshotRef, defi::cache::InstrumentMigration};
+use nautilus_model::{
+    accounts::AccountAny,
+    data::{
+        Bar, CustomData, DataType, HasTsInit, InstrumentClose, QuoteTick, TradeTick,
+        greeks::{GreeksData, YieldCurve},
+    },
+    events::{
+        AccountState, OrderEvent, OrderEventAny, OrderFilled, OrderInitialized, OrderSnapshot,
+        position::snapshot::PositionSnapshot,
+    },
+    identifiers::{AccountId, ClientId, ClientOrderId, InstrumentId, PositionId, TraderId},
+    instruments::{CryptoOption, Instrument, InstrumentAny, OptionContract, SyntheticInstrument},
+    orders::OrderAny,
+    position::Position,
+    types::Currency,
+};
+#[cfg(feature = "defi")]
+use nautilus_model::{
+    defi::{
+        Blockchain,
+        currency::{self, TokenCurrency},
+    },
+    enums::OrderStatus,
+    orders::Order,
+};
+use sqlx::{FromRow, PgPool, Postgres, Row, Transaction};
+#[cfg(feature = "defi")]
+use ustr::Ustr;
+
+use super::models::{orders::OrderSnapshotRow, positions::PositionSnapshotRow, types::SignalRow};
+#[cfg(feature = "defi")]
+use crate::defi::{contract_conflict, currency_references, integrity_error, validate_marker};
+use crate::sql::models::{
+    accounts::AccountEventRow,
+    data::{BarRow, InstrumentCloseRow, QuoteTickRow, TradeTickRow},
+    enums::{
+        AggregationSourcePg, AggressorSidePg, AssetClassPg, BarAggregationPg, CurrencyTypePg,
+        PriceTypePg, TrailingOffsetTypePg,
+    },
+    general::{GeneralRow, OrderEventOrderClientIdCombination, OrderPositionIndexRow},
+    instruments::InstrumentAnyRow,
+    orders::{OrderEventAnyRow, OrderFilledRow},
+    types::CurrencyRow,
+};
+
+pub(super) const CACHE_DATABASE_KEY_PREFIX: &str = "cache-database:";
+
+#[derive(Debug)]
+pub struct DatabaseQueries;
+
+impl DatabaseQueries {
+    /// Truncates all tables in the cache database via the provided Postgres `pool`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the TRUNCATE operation fails.
+    pub async fn truncate(pool: &PgPool) -> anyhow::Result<()> {
+        sqlx::query("SELECT truncate_all_tables()")
+            .execute(pool)
+            .await
+            .map(|_| ())
+            .map_err(|e| anyhow::anyhow!("Failed to truncate tables: {e}"))
+    }
+
+    /// Deletes the order, position and account rows of `trader_id` via the provided `pool`.
+    ///
+    /// Shared reference data (currencies, instruments, instrument closes), market data, the
+    /// user general entries, signals, custom data, and blockchain tables are left untouched.
+    /// This trader's saved component state and heartbeat are removed; shared synthetics remain.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if any DELETE operation fails. Any error rolls back the complete flush.
+    pub async fn delete_trader(pool: &PgPool, trader_id: &TraderId) -> anyhow::Result<()> {
+        let mut transaction = pool.begin().await?;
+
+        let statements = [
+            r#"DELETE FROM "order_position_index" WHERE trader_id = $1"#,
+            r#"DELETE FROM "order_event" WHERE trader_id = $1"#,
+            r#"DELETE FROM "order" WHERE trader_id = $1"#,
+            r#"DELETE FROM "position_event" WHERE trader_id = $1"#,
+            r#"DELETE FROM "position" WHERE trader_id = $1"#,
+            r#"DELETE FROM "account_event" WHERE trader_id = $1"#,
+        ];
+
+        for statement in statements {
+            sqlx::query(statement)
+                .bind(trader_id.to_string())
+                .execute(&mut *transaction)
+                .await
+                .map_err(|e| anyhow::anyhow!("Failed to delete rows for {trader_id}: {e}"))?;
+        }
+
+        sqlx::query("DELETE FROM general WHERE starts_with(id, $1)")
+            .bind(trader_key_prefix(*trader_id))
+            .execute(&mut *transaction)
+            .await?;
+
+        transaction
+            .commit()
+            .await
+            .map_err(|e| anyhow::anyhow!("Failed to commit delete for {trader_id}: {e}"))
+    }
+
+    /// Inserts or replaces a raw key-value entry in the `general` table via the provided `pool`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the INSERT or UPDATE operation fails.
+    pub async fn add(pool: &PgPool, key: String, value: Vec<u8>) -> anyhow::Result<()> {
+        sqlx::query(
+            "INSERT INTO general (id, value) VALUES ($1, $2) \
+             ON CONFLICT (id) DO UPDATE SET value = EXCLUDED.value",
+        )
+        .bind(key)
+        .bind(value)
+        .execute(pool)
+        .await
+        .map(|_| ())
+        .map_err(|e| anyhow::anyhow!("Failed to insert into general table: {e}"))
+    }
+
+    /// Deletes a raw key-value entry.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the database operation fails.
+    pub async fn delete(pool: &PgPool, key: &str) -> anyhow::Result<()> {
+        sqlx::query("DELETE FROM general WHERE id = $1")
+            .bind(key)
+            .execute(pool)
+            .await?;
+        Ok(())
+    }
+
+    /// Deletes an order's events, snapshot, and order-position mapping for one trader.
+    /// Position fill histories remain available independently of the order.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if any database operation fails. A failure rolls back the deletion.
+    pub async fn delete_order(
+        pool: &PgPool,
+        trader_id: TraderId,
+        client_order_id: ClientOrderId,
+    ) -> anyhow::Result<()> {
+        let mut transaction = pool.begin().await?;
+
+        for statement in [
+            "DELETE FROM order_position_index WHERE trader_id = $1 AND client_order_id = $2",
+            "DELETE FROM order_event WHERE trader_id = $1 AND client_order_id = $2",
+            "DELETE FROM \"order\" WHERE trader_id = $1 AND id = $2",
+        ] {
+            sqlx::query(statement)
+                .bind(trader_id.to_string())
+                .bind(client_order_id.to_string())
+                .execute(&mut *transaction)
+                .await?;
+        }
+
+        transaction.commit().await?;
+        Ok(())
+    }
+
+    /// Deletes a position's fill history, snapshot, and order-position mappings for one trader.
+    /// Order event histories remain available independently of the position.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if any database operation fails. A failure rolls back the deletion.
+    pub async fn delete_position(
+        pool: &PgPool,
+        trader_id: TraderId,
+        position_id: PositionId,
+    ) -> anyhow::Result<()> {
+        let mut transaction = pool.begin().await?;
+
+        for statement in [
+            "DELETE FROM order_position_index WHERE trader_id = $1 AND position_id = $2",
+            "DELETE FROM position_event WHERE trader_id = $1 AND position_id = $2",
+            "DELETE FROM position WHERE trader_id = $1 AND id = $2",
+        ] {
+            sqlx::query(statement)
+                .bind(trader_id.to_string())
+                .bind(position_id.to_string())
+                .execute(&mut *transaction)
+                .await?;
+        }
+
+        transaction.commit().await?;
+        Ok(())
+    }
+
+    pub(super) async fn load_synthetic(
+        pool: &PgPool,
+        instrument_id: &InstrumentId,
+    ) -> anyhow::Result<Option<SyntheticInstrument>> {
+        let key = format!("{CACHE_DATABASE_KEY_PREFIX}synthetic:{instrument_id}");
+        let value = Self::load_value(pool, &key).await?;
+        value
+            .map(|value| serde_json::from_slice(&value).map_err(Into::into))
+            .transpose()
+    }
+
+    pub(super) async fn load_value(pool: &PgPool, key: &str) -> anyhow::Result<Option<Vec<u8>>> {
+        Ok(
+            sqlx::query_scalar("SELECT value FROM general WHERE id = $1")
+                .bind(key)
+                .fetch_optional(pool)
+                .await?,
+        )
+    }
+
+    /// Loads all entries from the `general` table via the provided `pool`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the SELECT operation fails.
+    pub async fn load(pool: &PgPool) -> anyhow::Result<AHashMap<String, Vec<u8>>> {
+        sqlx::query_as::<_, GeneralRow>("SELECT * FROM general")
+            .fetch_all(pool)
+            .await
+            .map(|rows| {
+                let mut cache: AHashMap<String, Vec<u8>> = AHashMap::new();
+                for row in rows {
+                    cache.insert(row.id, row.value);
+                }
+                cache
+            })
+            .map_err(|e| anyhow::anyhow!("Failed to load general table: {e}"))
+    }
+
+    /// Inserts or ignores a `Currency` row via the provided `pool`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the INSERT operation fails.
+    pub async fn add_currency(pool: &PgPool, currency: Currency) -> anyhow::Result<()> {
+        #[cfg(feature = "defi")]
+        if currency::check(currency)
+            .map_err(integrity_error)?
+            .is_some()
+        {
+            let mut transaction = pool.begin().await?;
+            Self::write_token_currency(&mut transaction, currency).await?;
+            transaction.commit().await?;
+            return Ok(());
+        }
+
+        #[cfg(feature = "defi")]
+        if currency.code.contains('@') {
+            let mut transaction = pool.begin().await?;
+            Self::insert_currency(&mut *transaction, currency).await?;
+            let tagged: bool = sqlx::query_scalar(
+                "SELECT EXISTS (SELECT 1 FROM defi_currency WHERE currency_id = $1)",
+            )
+            .bind(currency.code.as_str())
+            .fetch_one(&mut *transaction)
+            .await?;
+
+            if tagged {
+                return Err(integrity_error(format!(
+                    "Missing token metadata for {}",
+                    currency.code
+                )));
+            }
+
+            transaction.commit().await?;
+            return Ok(());
+        }
+
+        Self::insert_currency(pool, currency).await.map(|_| ())
+    }
+
+    async fn insert_currency<'e>(
+        executor: impl sqlx::Executor<'e, Database = Postgres>,
+        currency: Currency,
+    ) -> anyhow::Result<u64> {
+        sqlx::query(
+            "INSERT INTO currency (id, precision, iso4217, name, currency_type) VALUES ($1, $2, $3, $4, $5::currency_type) ON CONFLICT (id) DO NOTHING"
+        )
+            .bind(currency.code.as_str())
+            .bind(i32::from(currency.precision))
+            .bind(i32::from(currency.iso4217))
+            .bind(currency.name.as_str())
+            .bind(CurrencyTypePg(currency.currency_type))
+            .execute(executor)
+            .await
+            .map(|result| result.rows_affected())
+            .map_err(|e| anyhow::anyhow!("Failed to insert into currency table: {e}"))
+    }
+
+    /// Loads all `Currency` entries via the provided `pool`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the SELECT operation fails.
+    pub async fn load_currencies(pool: &PgPool) -> anyhow::Result<Vec<Currency>> {
+        let currencies = sqlx::query_as::<_, CurrencyRow>("SELECT * FROM currency ORDER BY id ASC")
+            .fetch_all(pool)
+            .await
+            .map_err(|e| anyhow::anyhow!("Failed to load currencies: {e}"))?;
+        #[cfg(feature = "defi")]
+        let mut metadata = Self::load_token_metadata(pool, None).await?;
+        currencies
+            .into_iter()
+            .map(|row| {
+                #[cfg(feature = "defi")]
+                return Self::restore_token_currency(row.0, metadata.remove(&row.0.code));
+                #[cfg(not(feature = "defi"))]
+                Ok(row.0)
+            })
+            .collect()
+    }
+
+    /// Loads a single `Currency` entry by `code` via the provided `pool`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the SELECT operation fails.
+    pub async fn load_currency(pool: &PgPool, code: &str) -> anyhow::Result<Option<Currency>> {
+        let currency = sqlx::query_as::<_, CurrencyRow>("SELECT * FROM currency WHERE id = $1")
+            .bind(code)
+            .fetch_optional(pool)
+            .await
+            .map_err(|e| anyhow::anyhow!("Failed to load currency: {e}"))?;
+
+        #[cfg(feature = "defi")]
+        if let Some(row) = currency {
+            let metadata = Self::load_token_metadata(pool, Some(code))
+                .await?
+                .remove(&row.0.code);
+            Self::restore_token_currency(row.0, metadata).map(Some)
+        } else {
+            Ok(None)
+        }
+
+        #[cfg(not(feature = "defi"))]
+        Ok(currency.map(|row| row.0))
+    }
+
+    /// Inserts or updates an `InstrumentAny` entry via the provided `pool`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the INSERT or UPDATE operation fails.
+    pub async fn add_instrument(
+        pool: &PgPool,
+        kind: &str,
+        instrument: Box<dyn Instrument>,
+    ) -> anyhow::Result<()> {
+        #[cfg(feature = "defi")]
+        {
+            let codes = currency::instrument_codes(instrument.as_ref()).map_err(integrity_error)?;
+            return Self::write_token_instrument(pool, kind, instrument, &codes, None).await;
+        }
+
+        #[cfg(not(feature = "defi"))]
+        Self::write_instrument(pool, kind, instrument).await
+    }
+
+    async fn write_instrument<'e>(
+        executor: impl sqlx::Executor<'e, Database = Postgres>,
+        kind: &str,
+        instrument: Box<dyn Instrument>,
+    ) -> anyhow::Result<()> {
+        let instrument_any = instrument.as_ref() as &dyn Any;
+        let instrument_any: &dyn Any = match instrument_any.downcast_ref::<InstrumentAny>() {
+            Some(InstrumentAny::OptionContract(option)) => option,
+            Some(InstrumentAny::CryptoOption(option)) => option,
+            _ => instrument_any,
+        };
+
+        let (underlying_instrument_id, settlement_type) =
+            if let Some(option) = instrument_any.downcast_ref::<OptionContract>() {
+                (option.underlying_instrument_id, option.settlement_type)
+            } else if let Some(option) = instrument_any.downcast_ref::<CryptoOption>() {
+                (option.underlying_instrument_id, option.settlement_type)
+            } else {
+                (None, None)
+            };
+
+        sqlx::query(r#"
+            INSERT INTO "instrument" (
+                id, kind, raw_symbol, base_currency, underlying, quote_currency, settlement_currency, isin, asset_class, exchange,
+                strategy_type, multiplier, option_kind, is_inverse, strike_price, activation_ns, expiration_ns, price_precision, size_precision,
+                price_increment, size_increment, margin_init, margin_maint, lot_size, max_quantity, min_quantity, max_notional,
+                min_notional, max_price, min_price, ts_init, ts_event, info, underlying_instrument_id, settlement_type, created_at, updated_at
+            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9::asset_class, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30, $31, $32, $33::json, $34, $35, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+            ON CONFLICT (id)
+            DO UPDATE
+            SET
+                kind = $2, raw_symbol = $3, base_currency= $4, underlying = $5, quote_currency = $6, settlement_currency = $7, isin = $8, asset_class = $9, exchange = $10,
+                 strategy_type = $11, multiplier = $12, option_kind = $13, is_inverse = $14, strike_price = $15, activation_ns = $16, expiration_ns = $17 , price_precision = $18, size_precision = $19,
+                 price_increment = $20, size_increment = $21, margin_init = $22, margin_maint = $23, lot_size = $24, max_quantity = $25,
+                 min_quantity = $26, max_notional = $27, min_notional = $28, max_price = $29, min_price = $30, ts_init = $31,  ts_event = $32, info = $33::json, underlying_instrument_id = $34, settlement_type = $35, updated_at = CURRENT_TIMESTAMP
+            "#)
+            .bind(instrument.id().to_string())
+            .bind(kind)
+            .bind(instrument.raw_symbol().to_string())
+            .bind(instrument.base_currency().map(|x| x.code.as_str()))
+            .bind(instrument.underlying().map(|x| x.to_string()))
+            .bind(instrument.quote_currency().code.as_str())
+            .bind(instrument.settlement_currency().code.as_str())
+            .bind(instrument.isin().map(|x| x.to_string()))
+            .bind(AssetClassPg(instrument.asset_class()))
+            .bind(instrument.exchange().map(|x| x.to_string()))
+            .bind(instrument.strategy_type().map(|x| x.to_string()))
+            .bind(instrument.multiplier().to_string())
+            .bind(instrument.option_kind().map(|x| x.to_string()))
+            .bind(instrument.is_inverse())
+            .bind(instrument.strike_price().map(|x| x.to_string()))
+            .bind(instrument.activation_ns().map(|x| x.to_string()))
+            .bind(instrument.expiration_ns().map(|x| x.to_string()))
+            .bind(i32::from(instrument.price_precision()))
+            .bind(i32::from(instrument.size_precision()))
+            .bind(instrument.price_increment().to_string())
+            .bind(instrument.size_increment().to_string())
+            .bind(instrument.margin_init().to_string())
+            .bind(instrument.margin_maint().to_string())
+            .bind(instrument.lot_size().map(|x| x.to_string()))
+            .bind(instrument.max_quantity().map(|x| x.to_string()))
+            .bind(instrument.min_quantity().map(|x| x.to_string()))
+            .bind(instrument.max_notional().map(|x| x.to_string()))
+            .bind(instrument.min_notional().map(|x| x.to_string()))
+            .bind(instrument.max_price().map(|x| x.to_string()))
+            .bind(instrument.min_price().map(|x| x.to_string()))
+            .bind(instrument.ts_init().to_string())
+            .bind(instrument.ts_event().to_string())
+            .bind(instrument.info().map(serde_json::to_string).transpose()?)
+            .bind(underlying_instrument_id.map(|id| id.to_string()))
+            .bind(settlement_type.map(|kind| kind.to_string()))
+            .execute(executor)
+            .await
+            .map(|_| ())
+            .map_err(|e| anyhow::anyhow!("Failed to insert item {} into instrument table: {:?}", instrument.id(), e))
+    }
+
+    #[cfg(feature = "defi")]
+    async fn load_token_metadata(
+        pool: &PgPool,
+        code: Option<&str>,
+    ) -> anyhow::Result<AHashMap<Ustr, TokenCurrency>> {
+        let exists: bool = sqlx::query_scalar("SELECT to_regclass('defi_currency') IS NOT NULL")
+            .fetch_one(pool)
+            .await
+            .map_err(integrity_error)?;
+
+        if !exists {
+            return Ok(AHashMap::new());
+        }
+
+        let rows =
+            sqlx::query("SELECT * FROM defi_currency WHERE ($1::TEXT IS NULL OR currency_id = $1)")
+                .bind(code)
+                .fetch_all(pool)
+                .await
+                .map_err(integrity_error)?;
+        rows.iter()
+            .map(|row| {
+                let code: String = row.try_get("currency_id").map_err(integrity_error)?;
+                Ok((Ustr::from(&code), Self::token_metadata(row)?))
+            })
+            .collect()
+    }
+
+    #[cfg(feature = "defi")]
+    fn token_metadata(row: &sqlx::postgres::PgRow) -> anyhow::Result<TokenCurrency> {
+        let chain_id: i64 = row.try_get("chain_id").map_err(integrity_error)?;
+        let name: String = row.try_get("chain_name").map_err(integrity_error)?;
+        Ok(TokenCurrency {
+            chain_id: u32::try_from(chain_id).map_err(integrity_error)?,
+            address: row.try_get("address").map_err(integrity_error)?,
+            symbol: row.try_get("symbol").map_err(integrity_error)?,
+            chain_name: name.parse::<Blockchain>().map_err(integrity_error)?,
+        })
+    }
+
+    #[cfg(feature = "defi")]
+    fn restore_token_currency(
+        currency: Currency,
+        metadata: Option<TokenCurrency>,
+    ) -> anyhow::Result<Currency> {
+        if let Some(metadata) = metadata {
+            return currency::register(currency, metadata).map_err(integrity_error);
+        }
+
+        if currency::lookup(currency.code).is_some() {
+            return Err(integrity_error(format!(
+                "Missing token metadata for {}",
+                currency.code
+            )));
+        }
+
+        Ok(currency)
+    }
+
+    #[cfg(feature = "defi")]
+    fn instrument_marker(row: &sqlx::postgres::PgRow) -> anyhow::Result<Vec<String>> {
+        match row.try_get::<Option<Vec<String>>, _>("defi_currency_codes") {
+            Ok(Some(codes)) if codes.is_empty() => {
+                Err(integrity_error("Empty DeFi instrument dependency marker"))
+            }
+            Ok(codes) => Ok(codes.unwrap_or_default()),
+            Err(sqlx::Error::ColumnNotFound(_)) => Ok(Vec::new()),
+            Err(e) => Err(integrity_error(e)),
+        }
+    }
+
+    #[cfg(feature = "defi")]
+    async fn restore_instrument_dependencies(
+        pool: &PgPool,
+        row: &sqlx::postgres::PgRow,
+        metadata: &AHashMap<Ustr, TokenCurrency>,
+    ) -> anyhow::Result<()> {
+        let codes = Self::instrument_marker(row)?;
+        let mut expected = Vec::new();
+        let mut references = Vec::new();
+
+        for field in ["base_currency", "quote_currency", "settlement_currency"] {
+            if let Some(code) = row
+                .try_get::<Option<String>, _>(field)
+                .map_err(integrity_error)?
+            {
+                if metadata.contains_key(&Ustr::from(&code))
+                    || currency::lookup(Ustr::from(&code)).is_some()
+                {
+                    expected.push(code.clone());
+                }
+
+                references.push(code);
+            }
+        }
+
+        expected.sort_unstable();
+        expected.dedup();
+        if expected != codes {
+            return Err(integrity_error(
+                "Instrument token dependencies differ from its marker",
+            ));
+        }
+
+        for code in &codes {
+            let currency = Self::load_currency(pool, code)
+                .await
+                .map_err(integrity_error)?
+                .ok_or_else(|| integrity_error(format!("Missing token currency {code}")))?;
+
+            if currency::lookup(currency.code).is_none() {
+                return Err(integrity_error(format!(
+                    "Missing token metadata for {code}"
+                )));
+            }
+        }
+
+        if !codes.is_empty()
+            && references
+                .iter()
+                .any(|code| Currency::try_from_str(code).is_none())
+        {
+            return Err(integrity_error(
+                "A marked instrument has an unresolved currency",
+            ));
+        }
+
+        Ok(())
+    }
+
+    #[cfg(feature = "defi")]
+    async fn write_token_currency(
+        transaction: &mut Transaction<'_, Postgres>,
+        currency: Currency,
+    ) -> anyhow::Result<()> {
+        let metadata = currency::check(currency)
+            .map_err(integrity_error)?
+            .ok_or_else(|| {
+                integrity_error(format!("Missing token definition for {}", currency.code))
+            })?;
+
+        let inserted = Self::insert_currency(&mut **transaction, currency).await?;
+        let row = sqlx::query("SELECT * FROM currency WHERE id = $1 FOR UPDATE")
+            .bind(currency.code.as_str())
+            .fetch_one(&mut **transaction)
+            .await?;
+        let row = CurrencyRow::from_row(&row).map_err(integrity_error)?;
+
+        if inserted == 1 {
+            sqlx::query("INSERT INTO defi_currency (currency_id, chain_id, address, symbol, chain_name) VALUES ($1,$2,$3,$4,$5) ON CONFLICT (chain_id, address) DO NOTHING")
+                .bind(currency.code.as_str()).bind(i64::from(metadata.chain_id)).bind(&metadata.address)
+                .bind(&metadata.symbol).bind(metadata.chain_name.to_string())
+                .execute(&mut **transaction).await?;
+        }
+
+        let bound_code: Option<String> = sqlx::query_scalar(
+            "SELECT currency_id FROM defi_currency WHERE chain_id = $1 AND address = $2",
+        )
+        .bind(i64::from(metadata.chain_id))
+        .bind(&metadata.address)
+        .fetch_optional(&mut **transaction)
+        .await?;
+
+        if let Some(code) = bound_code
+            && code != currency.code.as_str()
+        {
+            return Err(contract_conflict(&code));
+        }
+
+        let tag = sqlx::query("SELECT * FROM defi_currency WHERE currency_id = $1")
+            .bind(currency.code.as_str())
+            .fetch_optional(&mut **transaction)
+            .await?
+            .ok_or_else(|| {
+                integrity_error(format!(
+                    "Legacy currency or missing metadata for {}",
+                    currency.code
+                ))
+            })?;
+
+        let stored_metadata = Self::token_metadata(&tag)?;
+        currency::register(row.0, stored_metadata).map_err(integrity_error)?;
+        Ok(())
+    }
+
+    #[cfg(feature = "defi")]
+    pub(crate) async fn add_defi_instrument(
+        pool: &PgPool,
+        instrument: InstrumentAny,
+        migration: Option<InstrumentMigration>,
+    ) -> anyhow::Result<()> {
+        let codes = currency::instrument_codes(&instrument).map_err(integrity_error)?;
+        if codes.is_empty() {
+            return Self::add_instrument_any(pool, instrument).await;
+        }
+
+        match instrument {
+            InstrumentAny::CurrencyPair(pair) => {
+                Self::write_token_instrument(
+                    pool,
+                    "CURRENCY_PAIR",
+                    Box::new(pair),
+                    &codes,
+                    migration.as_ref(),
+                )
+                .await
+            }
+            _ => Err(integrity_error("DeFi persistence supports currency pairs")),
+        }
+    }
+
+    pub(crate) async fn add_instrument_any(
+        pool: &PgPool,
+        instrument_any: InstrumentAny,
+    ) -> anyhow::Result<()> {
+        match instrument_any {
+            InstrumentAny::Betting(instrument) => {
+                Self::add_instrument(pool, "BETTING", Box::new(instrument)).await
+            }
+            InstrumentAny::BinaryOption(instrument) => {
+                Self::add_instrument(pool, "BINARY_OPTION", Box::new(instrument)).await
+            }
+            InstrumentAny::CryptoFuture(instrument) => {
+                Self::add_instrument(pool, "CRYPTO_FUTURE", Box::new(instrument)).await
+            }
+            InstrumentAny::CryptoFuturesSpread(instrument) => {
+                Self::add_instrument(pool, "CRYPTO_FUTURES_SPREAD", Box::new(instrument)).await
+            }
+            InstrumentAny::CryptoOption(instrument) => {
+                Self::add_instrument(pool, "CRYPTO_OPTION", Box::new(instrument)).await
+            }
+            InstrumentAny::CryptoOptionSpread(instrument) => {
+                Self::add_instrument(pool, "CRYPTO_OPTION_SPREAD", Box::new(instrument)).await
+            }
+            InstrumentAny::CryptoPerpetual(instrument) => {
+                Self::add_instrument(pool, "CRYPTO_PERPETUAL", Box::new(instrument)).await
+            }
+            InstrumentAny::CurrencyPair(instrument) => {
+                Self::add_instrument(pool, "CURRENCY_PAIR", Box::new(instrument)).await
+            }
+            InstrumentAny::Equity(equity) => {
+                Self::add_instrument(pool, "EQUITY", Box::new(equity)).await
+            }
+            InstrumentAny::FuturesContract(instrument) => {
+                Self::add_instrument(pool, "FUTURES_CONTRACT", Box::new(instrument)).await
+            }
+            InstrumentAny::FuturesSpread(instrument) => {
+                Self::add_instrument(pool, "FUTURES_SPREAD", Box::new(instrument)).await
+            }
+            InstrumentAny::OptionContract(instrument) => {
+                Self::add_instrument(pool, "OPTION_CONTRACT", Box::new(instrument)).await
+            }
+            InstrumentAny::Commodity(instrument) => {
+                Self::add_instrument(pool, "COMMODITY", Box::new(instrument)).await
+            }
+            InstrumentAny::IndexInstrument(instrument) => {
+                Self::add_instrument(pool, "INDEX_INSTRUMENT", Box::new(instrument)).await
+            }
+            InstrumentAny::Cfd(instrument) => {
+                Self::add_instrument(pool, "CFD", Box::new(instrument)).await
+            }
+            InstrumentAny::OptionSpread(instrument) => {
+                Self::add_instrument(pool, "OPTION_SPREAD", Box::new(instrument)).await
+            }
+            InstrumentAny::PerpetualContract(instrument) => {
+                Self::add_instrument(pool, "PERPETUAL_CONTRACT", Box::new(instrument)).await
+            }
+            InstrumentAny::TokenizedAsset(instrument) => {
+                Self::add_instrument(pool, "TOKENIZED_ASSET", Box::new(instrument)).await
+            }
+        }
+    }
+
+    #[cfg(feature = "defi")]
+    async fn check_legacy_replacement(
+        transaction: &mut Transaction<'_, Postgres>,
+        id: &str,
+    ) -> anyhow::Result<()> {
+        let history: bool = sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM position WHERE instrument_id = $1 UNION ALL SELECT 1 FROM position_event WHERE instrument_id = $1)")
+            .bind(id).fetch_one(&mut **transaction).await?;
+
+        let archives: Vec<Vec<u8>> =
+            sqlx::query_scalar("SELECT value FROM general WHERE id LIKE $1")
+                .bind(format!("{}%", CacheSnapshotRef::POSITION_PREFIX))
+                .fetch_all(&mut **transaction)
+                .await?;
+        let mut history = history;
+        for blob in archives {
+            history |= CacheSnapshotRef::position_instrument_id(&blob)
+                .map_err(integrity_error)?
+                .to_string()
+                == id;
+        }
+
+        if history {
+            return Err(integrity_error(format!(
+                "Instrument {id} has position history; retain its legacy currencies"
+            )));
+        }
+
+        let rows = sqlx::query("SELECT * FROM order_event WHERE instrument_id = $1 ORDER BY trader_id, client_order_id, created_at ASC")
+            .bind(id).fetch_all(&mut **transaction).await?;
+        let mut events: AHashMap<(String, String), Vec<OrderEventAny>> = AHashMap::new();
+
+        for row in rows {
+            let trader = row.try_get("trader_id").map_err(integrity_error)?;
+            let order = row.try_get("client_order_id").map_err(integrity_error)?;
+            events
+                .entry((trader, order))
+                .or_default()
+                .push(OrderEventAnyRow::from_row(&row).map_err(integrity_error)?.0);
+        }
+
+        for events in events.values() {
+            let order = OrderAny::from_events(events.clone()).map_err(integrity_error)?;
+            if !order.is_closed() {
+                return Err(integrity_error(format!(
+                    "Instrument {id} has nonterminal orders"
+                )));
+            }
+        }
+
+        let snapshots =
+            sqlx::query(r#"SELECT trader_id, id, status FROM "order" WHERE instrument_id = $1"#)
+                .bind(id)
+                .fetch_all(&mut **transaction)
+                .await?;
+
+        for row in snapshots {
+            let key = (
+                row.try_get::<String, _>("trader_id")
+                    .map_err(integrity_error)?,
+                row.try_get::<String, _>("id").map_err(integrity_error)?,
+            );
+
+            if !events.contains_key(&key) {
+                let status: String = row.try_get("status").map_err(integrity_error)?;
+                if !status
+                    .parse::<OrderStatus>()
+                    .map_err(integrity_error)?
+                    .is_closed()
+                {
+                    return Err(integrity_error(format!(
+                        "Instrument {id} has nonterminal orders"
+                    )));
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    #[cfg(feature = "defi")]
+    async fn write_token_instrument(
+        pool: &PgPool,
+        kind: &str,
+        instrument: Box<dyn Instrument>,
+        codes: &[String],
+        migration: Option<&InstrumentMigration>,
+    ) -> anyhow::Result<()> {
+        let references = currency_references(instrument.as_ref());
+        let id = instrument.id().to_string();
+        let mut transaction = pool.begin().await?;
+        // Serialize changes to one instrument before checking its previous currency identities
+        sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
+            .bind(&id)
+            .execute(&mut *transaction)
+            .await?;
+        let previous = sqlx::query("SELECT * FROM instrument WHERE id = $1 FOR UPDATE")
+            .bind(&id)
+            .fetch_optional(&mut *transaction)
+            .await?;
+
+        if let Some(row) = previous {
+            let previous_codes = Self::instrument_marker(&row)?;
+            if previous_codes.is_empty() {
+                if !codes.is_empty() {
+                    migration
+                        .ok_or_else(|| {
+                            integrity_error(
+                                "Historical replacement requires the cache migration check",
+                            )
+                        })?
+                        .validate()
+                        .map_err(integrity_error)?;
+
+                    Self::check_legacy_replacement(&mut transaction, &id).await?;
+                }
+            } else if previous_codes != codes {
+                return Err(integrity_error(
+                    "Cannot change a persisted token instrument's currency identities",
+                ));
+            } else {
+                let base: Option<String> = row.try_get("base_currency").map_err(integrity_error)?;
+                let quote: String = row.try_get("quote_currency").map_err(integrity_error)?;
+                let settlement: Option<String> = row
+                    .try_get("settlement_currency")
+                    .map_err(integrity_error)?;
+
+                if base
+                    != instrument
+                        .base_currency()
+                        .map(|currency| currency.code.to_string())
+                    || quote != instrument.quote_currency().code.as_str()
+                    || settlement != Some(instrument.settlement_currency().code.to_string())
+                {
+                    return Err(integrity_error(
+                        "Cannot change a persisted token instrument's currency identities",
+                    ));
+                }
+            }
+        }
+
+        for code in codes {
+            let (currency, _) = currency::lookup(Ustr::from(code))
+                .ok_or_else(|| integrity_error(format!("Missing token definition for {code}")))?;
+            Self::write_token_currency(&mut transaction, currency).await?;
+        }
+
+        Self::write_instrument(&mut *transaction, kind, instrument).await?;
+        let mut persisted: Vec<String> =
+            sqlx::query_scalar("SELECT currency_id FROM defi_currency WHERE currency_id = ANY($1)")
+                .bind(&references)
+                .fetch_all(&mut *transaction)
+                .await?;
+
+        persisted.sort_unstable();
+        if persisted != codes {
+            return Err(integrity_error(
+                "Instrument token dependencies differ from persisted currency definitions",
+            ));
+        }
+
+        sqlx::query("UPDATE instrument SET defi_currency_codes = $2 WHERE id = $1")
+            .bind(id)
+            .bind((!codes.is_empty()).then_some(codes))
+            .execute(&mut *transaction)
+            .await?;
+        transaction.commit().await?;
+        Ok(())
+    }
+
+    /// Loads a single `InstrumentAny` entry by `instrument_id` via the provided `pool`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the SELECT operation fails.
+    pub async fn load_instrument(
+        pool: &PgPool,
+        instrument_id: &InstrumentId,
+    ) -> anyhow::Result<Option<InstrumentAny>> {
+        let row = sqlx::query("SELECT * FROM instrument WHERE id = $1")
+            .bind(instrument_id.to_string())
+            .fetch_optional(pool)
+            .await?;
+
+        let Some(row) = row else {
+            return Ok(None);
+        };
+
+        #[cfg(feature = "defi")]
+        {
+            let metadata = Self::load_token_metadata(pool, None).await?;
+            Self::restore_instrument_dependencies(pool, &row, &metadata).await?;
+        }
+
+        let instrument = InstrumentAnyRow::from_row(&row)?.0;
+        #[cfg(feature = "defi")]
+        validate_marker(&instrument, &Self::instrument_marker(&row)?)?;
+        Ok(Some(instrument))
+    }
+
+    /// Loads all `InstrumentAny` entries via the provided `pool`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the SELECT operation fails.
+    pub async fn load_instruments(pool: &PgPool) -> anyhow::Result<Vec<InstrumentAny>> {
+        let rows = sqlx::query("SELECT * FROM instrument")
+            .fetch_all(pool)
+            .await?;
+        let mut instruments = Vec::with_capacity(rows.len());
+        #[cfg(feature = "defi")]
+        let metadata = Self::load_token_metadata(pool, None).await?;
+
+        for row in rows {
+            #[cfg(feature = "defi")]
+            Self::restore_instrument_dependencies(pool, &row, &metadata).await?;
+            let instrument = InstrumentAnyRow::from_row(&row)?.0;
+            #[cfg(feature = "defi")]
+            validate_marker(&instrument, &Self::instrument_marker(&row)?)?;
+            instruments.push(instrument);
+        }
+
+        Ok(instruments)
+    }
+
+    /// Inserts or replaces an `InstrumentClose`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the SQL INSERT or UPDATE fails.
+    pub async fn add_instrument_close(
+        pool: &PgPool,
+        close: &InstrumentClose,
+    ) -> anyhow::Result<()> {
+        sqlx::query(
+            r#"
+            INSERT INTO "instrument_close" (
+                instrument_id, close_price, close_type, ts_event, ts_init, created_at
+            ) VALUES ($1, $2, $3, $4, $5, CURRENT_TIMESTAMP)
+            ON CONFLICT (instrument_id) DO UPDATE
+            SET close_price = EXCLUDED.close_price,
+                close_type = EXCLUDED.close_type,
+                ts_event = EXCLUDED.ts_event,
+                ts_init = EXCLUDED.ts_init
+            "#,
+        )
+        .bind(close.instrument_id.to_string())
+        .bind(close.close_price.to_string())
+        .bind(close.close_type.to_string())
+        .bind(close.ts_event.to_string())
+        .bind(close.ts_init.to_string())
+        .execute(pool)
+        .await
+        .map(|_| ())
+        .map_err(|e| anyhow::anyhow!("Failed to insert instrument close: {e}"))
+    }
+
+    /// Loads all `InstrumentClose` entries.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the SQL SELECT or row decoding fails.
+    pub async fn load_instrument_closes(pool: &PgPool) -> anyhow::Result<Vec<InstrumentClose>> {
+        sqlx::query_as::<_, InstrumentCloseRow>(
+            "SELECT * FROM instrument_close ORDER BY instrument_id ASC",
+        )
+        .fetch_all(pool)
+        .await
+        .map(|rows| rows.into_iter().map(|row| row.0).collect())
+        .map_err(|e| anyhow::anyhow!("Failed to load instrument closes: {e}"))
+    }
+
+    pub(crate) async fn add_greeks(pool: &PgPool, greeks: &GreeksData) -> anyhow::Result<()> {
+        let value = serde_json::to_value(greeks)?;
+        sqlx::query(
+            "INSERT INTO greeks (instrument_id, value) VALUES ($1, $2) \
+             ON CONFLICT (instrument_id) DO UPDATE SET value = EXCLUDED.value",
+        )
+        .bind(greeks.instrument_id.to_string())
+        .bind(value)
+        .execute(pool)
+        .await?;
+        Ok(())
+    }
+
+    pub(crate) async fn load_greeks(
+        pool: &PgPool,
+    ) -> anyhow::Result<AHashMap<InstrumentId, GreeksData>> {
+        let rows = sqlx::query("SELECT instrument_id, value FROM greeks")
+            .fetch_all(pool)
+            .await?;
+        let mut greeks = AHashMap::with_capacity(rows.len());
+        for row in rows {
+            let key: String = row.try_get("instrument_id")?;
+            let instrument_id = key.parse::<InstrumentId>()?;
+            let data: GreeksData = serde_json::from_value(row.try_get("value")?)?;
+            anyhow::ensure!(
+                data.instrument_id == instrument_id,
+                "Greeks key ID {instrument_id} did not match payload ID {}",
+                data.instrument_id
+            );
+            greeks.insert(instrument_id, data);
+        }
+
+        Ok(greeks)
+    }
+
+    pub(crate) async fn add_yield_curve(pool: &PgPool, curve: &YieldCurve) -> anyhow::Result<()> {
+        let value = serde_json::to_value(curve)?;
+        sqlx::query(
+            "INSERT INTO yield_curve (curve_name, value) VALUES ($1, $2) \
+             ON CONFLICT (curve_name) DO UPDATE SET value = EXCLUDED.value",
+        )
+        .bind(&curve.curve_name)
+        .bind(value)
+        .execute(pool)
+        .await?;
+        Ok(())
+    }
+
+    pub(crate) async fn load_yield_curves(
+        pool: &PgPool,
+    ) -> anyhow::Result<AHashMap<String, YieldCurve>> {
+        let rows = sqlx::query("SELECT curve_name, value FROM yield_curve")
+            .fetch_all(pool)
+            .await?;
+        let mut curves = AHashMap::with_capacity(rows.len());
+        for row in rows {
+            let name: String = row.try_get("curve_name")?;
+            let curve: YieldCurve = serde_json::from_value(row.try_get("value")?)?;
+            anyhow::ensure!(
+                curve.curve_name == name,
+                "Yield curve key {name} did not match payload name {}",
+                curve.curve_name
+            );
+            curve.validate()?;
+            curves.insert(name, curve);
+        }
+
+        Ok(curves)
+    }
+
+    /// Inserts an `OrderInitialized` event via the provided `pool`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the SQL INSERT or UPDATE operation fails.
+    pub async fn add_order(
+        pool: &PgPool,
+        event: OrderInitialized,
+        client_id: Option<ClientId>,
+    ) -> anyhow::Result<()> {
+        Self::add_order_event(pool, Box::new(event), client_id).await
+    }
+
+    /// Inserts an `OrderSnapshot` entry via the provided `pool`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the SQL INSERT operation fails.
+    ///
+    /// # Panics
+    ///
+    /// Panics if serialization of `snapshot.exec_algorithm_params` fails.
+    #[expect(
+        clippy::too_many_lines,
+        reason = "order snapshot persistence maps the full database schema in one transaction"
+    )]
+    pub async fn add_order_snapshot(pool: &PgPool, snapshot: OrderSnapshot) -> anyhow::Result<()> {
+        let mut transaction = pool.begin().await?;
+
+        // Insert trader if it does not exist
+        // TODO remove this when node and trader initialization is implemented
+        sqlx::query(
+            r#"
+            INSERT INTO "trader" (id) VALUES ($1) ON CONFLICT (id) DO NOTHING
+            "#,
+        )
+        .bind(snapshot.trader_id.to_string())
+        .execute(&mut *transaction)
+        .await
+        .map(|_| ())
+        .map_err(|e| anyhow::anyhow!("Failed to insert into trader table: {e}"))?;
+
+        sqlx::query(
+            r#"
+            INSERT INTO "order" (
+                id, trader_id, strategy_id, instrument_id, client_order_id, venue_order_id, position_id,
+                account_id, last_trade_id, order_type, order_side, quantity, price, trigger_price,
+                trigger_type, limit_offset, trailing_offset, trailing_offset_type, time_in_force,
+                expire_time, filled_qty, liquidity_side, avg_px, slippage, commissions, status,
+                is_post_only, is_reduce_only, is_quote_quantity, display_qty, emulation_trigger,
+                trigger_instrument_id, contingency_type, order_list_id, linked_order_ids,
+                parent_order_id, exec_algorithm_id, exec_algorithm_params, exec_spawn_id, tags, init_id, ts_init, ts_last,
+                activation_price, created_at, updated_at
+            ) VALUES (
+                $1, $2, $3, $4, $1, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16,
+                $17::TRAILING_OFFSET_TYPE, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28,
+                $29, $30, $31, $32, $33, $34, $35, $36, $37, $38, $39, $40, $41, $42, $43,
+                CURRENT_TIMESTAMP, CURRENT_TIMESTAMP
+            )
+            ON CONFLICT (trader_id, id)
+            DO UPDATE SET
+                strategy_id = $3,
+                instrument_id = $4,
+                venue_order_id = $5,
+                position_id = $6,
+                account_id = $7,
+                last_trade_id = $8,
+                order_type = $9,
+                order_side = $10,
+                quantity = $11,
+                price = $12,
+                trigger_price = $13,
+                trigger_type = $14,
+                limit_offset = $15,
+                trailing_offset = $16,
+                trailing_offset_type = $17::TRAILING_OFFSET_TYPE,
+                time_in_force = $18,
+                expire_time = $19,
+                filled_qty = $20,
+                liquidity_side = $21,
+                avg_px = $22,
+                slippage = $23,
+                commissions = $24,
+                status = $25,
+                is_post_only = $26,
+                is_reduce_only = $27,
+                is_quote_quantity = $28,
+                display_qty = $29,
+                emulation_trigger = $30,
+                trigger_instrument_id = $31,
+                contingency_type = $32,
+                order_list_id = $33,
+                linked_order_ids = $34,
+                parent_order_id = $35,
+                exec_algorithm_id = $36,
+                exec_algorithm_params = $37,
+                exec_spawn_id = $38,
+                tags = $39,
+                init_id = $40,
+                ts_init = $41,
+                ts_last = $42,
+                activation_price = $43,
+                updated_at = CURRENT_TIMESTAMP
+        "#)
+            .bind(snapshot.client_order_id.to_string())  // Used for both id and client_order_id
+            .bind(snapshot.trader_id.to_string())
+            .bind(snapshot.strategy_id.to_string())
+            .bind(snapshot.instrument_id.to_string())
+            .bind(snapshot.venue_order_id.map(|x| x.to_string()))
+            .bind(snapshot.position_id.map(|x| x.to_string()))
+            .bind(snapshot.account_id.map(|x| x.to_string()))
+            .bind(snapshot.last_trade_id.map(|x| x.to_string()))
+            .bind(snapshot.order_type.to_string())
+            .bind(snapshot.order_side.to_string())
+            .bind(snapshot.quantity.to_string())
+            .bind(snapshot.price.map(|x| x.to_string()))
+            .bind(snapshot.trigger_price.map(|x| x.to_string()))
+            .bind(snapshot.trigger_type.map(|x| x.to_string()))
+            .bind(snapshot.limit_offset.map(|x| x.to_string()))
+            .bind(snapshot.trailing_offset.map(|x| x.to_string()))
+            .bind(
+                snapshot
+                    .trailing_offset_type
+                    .map(|value| TrailingOffsetTypePg(Some(value))),
+            )
+            .bind(snapshot.time_in_force.to_string())
+            .bind(snapshot.expire_time.map(|x| x.to_string()))
+            .bind(snapshot.filled_qty.to_string())
+            .bind(snapshot.liquidity_side.map(|x| x.to_string()))
+            .bind(snapshot.avg_px)
+            .bind(snapshot.slippage)
+            .bind(snapshot.commissions.iter().map(ToString::to_string).collect::<Vec<String>>())
+            .bind(snapshot.status.to_string())
+            .bind(snapshot.is_post_only)
+            .bind(snapshot.is_reduce_only)
+            .bind(snapshot.is_quote_quantity)
+            .bind(snapshot.display_qty.map(|x| x.to_string()))
+            .bind(
+                snapshot
+                    .emulation_trigger
+                    .map_or_else(|| "NO_TRIGGER".to_string(), |value| value.to_string()),
+            )
+            .bind(snapshot.trigger_instrument_id.map(|x| x.to_string()))
+            .bind(snapshot.contingency_type.map_or_else(
+                || "NO_CONTINGENCY".to_string(),
+                |value| value.to_string(),
+            ))
+            .bind(snapshot.order_list_id.map(|x| x.to_string()))
+            .bind(snapshot.linked_order_ids.map(|x| x.iter().map(ToString::to_string).collect::<Vec<String>>()))
+            .bind(snapshot.parent_order_id.map(|x| x.to_string()))
+            .bind(snapshot.exec_algorithm_id.map(|x| x.to_string()))
+            .bind(snapshot.exec_algorithm_params.map(|x| serde_json::to_value(x).unwrap()))
+            .bind(snapshot.exec_spawn_id.map(|x| x.to_string()))
+            .bind(snapshot.tags.map(|x| x.iter().map(ToString::to_string).collect::<Vec<String>>()))
+            .bind(snapshot.init_id.to_string())
+            .bind(snapshot.ts_init.to_string())
+            .bind(snapshot.ts_last.to_string())
+            .bind(snapshot.activation_price.map(|x| x.to_string()))
+            .execute(&mut *transaction)
+            .await
+            .map(|_| ())
+            .map_err(|e| anyhow::anyhow!("Failed to insert into order table: {e}"))?;
+
+        transaction
+            .commit()
+            .await
+            .map_err(|e| anyhow::anyhow!("Failed to commit transaction: {e}"))
+    }
+
+    /// Loads an `OrderSnapshot` entry by client order ID via the provided `pool`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the SQL SELECT or deserialization fails.
+    pub async fn load_order_snapshot(
+        pool: &PgPool,
+        client_order_id: &ClientOrderId,
+        trader_id: &TraderId,
+    ) -> anyhow::Result<Option<OrderSnapshot>> {
+        sqlx::query_as::<_, OrderSnapshotRow>(
+            r#"SELECT * FROM "order" WHERE client_order_id = $1 AND trader_id = $2"#,
+        )
+        .bind(client_order_id.to_string())
+        .bind(trader_id.to_string())
+        .fetch_optional(pool)
+        .await
+        .map(|row| row.map(|row| row.0))
+        .map_err(|e| anyhow::anyhow!("Failed to load order snapshot: {e}"))
+    }
+
+    /// Inserts or updates a `PositionSnapshot` entry via the provided `pool`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the SQL INSERT or UPDATE operation fails, or if beginning the transaction fails.
+    pub async fn add_position_snapshot(
+        pool: &PgPool,
+        snapshot: PositionSnapshot,
+    ) -> anyhow::Result<()> {
+        let mut transaction = pool.begin().await?;
+
+        // Insert trader if it does not exist
+        // TODO remove this when node and trader initialization is implemented
+        sqlx::query(
+            r#"
+            INSERT INTO "trader" (id) VALUES ($1) ON CONFLICT (id) DO NOTHING
+        "#,
+        )
+        .bind(snapshot.trader_id.to_string())
+        .execute(&mut *transaction)
+        .await
+        .map(|_| ())
+        .map_err(|e| anyhow::anyhow!("Failed to insert into trader table: {e}"))?;
+
+        sqlx::query(r#"
+            INSERT INTO "position" (
+                id, trader_id, strategy_id, instrument_id, account_id, opening_order_id, closing_order_id, entry, side, signed_qty, quantity, peak_qty,
+                quote_currency, base_currency, settlement_currency, avg_px_open, avg_px_close, realized_return, realized_pnl, unrealized_pnl, commissions,
+                duration_ns, ts_opened, ts_closed, ts_init, ts_last, replay_state, created_at, updated_at
+            ) VALUES (
+                $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20,
+                $21, $22, $23, $24, $25, $26, $27, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP
+            )
+            ON CONFLICT (trader_id, id)
+            DO UPDATE
+            SET
+                strategy_id = $3, instrument_id = $4, account_id = $5, opening_order_id = $6, closing_order_id = $7, entry = $8, side = $9, signed_qty = $10, quantity = $11,
+                peak_qty = $12, quote_currency = $13, base_currency = $14, settlement_currency = $15, avg_px_open = $16, avg_px_close = $17, realized_return = $18, realized_pnl = $19, unrealized_pnl = $20,
+                commissions = $21, duration_ns = $22, ts_opened = $23, ts_closed = $24, ts_init = $25, ts_last = $26,
+                replay_state = $27, updated_at = CURRENT_TIMESTAMP
+        "#)
+            .bind(snapshot.position_id.to_string())
+            .bind(snapshot.trader_id.to_string())
+            .bind(snapshot.strategy_id.to_string())
+            .bind(snapshot.instrument_id.to_string())
+            .bind(snapshot.account_id.to_string())
+            .bind(snapshot.opening_order_id.to_string())
+            .bind(snapshot.closing_order_id.map(|x| x.to_string()))
+            .bind(snapshot.entry.to_string())
+            .bind(snapshot.side.to_string())
+            .bind(snapshot.signed_qty)
+            .bind(snapshot.quantity.to_string())
+            .bind(snapshot.peak_qty.to_string())
+            .bind(snapshot.quote_currency.to_string())
+            .bind(snapshot.base_currency.map(|x| x.to_string()))
+            .bind(snapshot.settlement_currency.to_string())
+            .bind(snapshot.avg_px_open)
+            .bind(snapshot.avg_px_close)
+            .bind(snapshot.realized_return)
+            .bind(snapshot.realized_pnl.map(|x| x.to_string()))
+            .bind(snapshot.unrealized_pnl.map(|x| x.to_string()))
+            .bind(snapshot.commissions.iter().map(ToString::to_string).collect::<Vec<String>>())
+            .bind(snapshot.duration_ns.map(|x| x.to_string()))
+            .bind(snapshot.ts_opened.to_string())
+            .bind(snapshot.ts_closed.map(|x| x.to_string()))
+            .bind(snapshot.ts_init.to_string())
+            .bind(snapshot.ts_last.to_string())
+            .bind(snapshot.replay_state)
+            .execute(&mut *transaction)
+            .await
+            .map(|_| ())
+            .map_err(|e| anyhow::anyhow!("Failed to insert into position table: {e}"))?;
+        transaction
+            .commit()
+            .await
+            .map_err(|e| anyhow::anyhow!("Failed to commit transaction: {e}"))
+    }
+
+    /// Loads a `PositionSnapshot` entry by `position_id` via the provided `pool`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the SQL SELECT or deserialization fails.
+    pub async fn load_position_snapshot(
+        pool: &PgPool,
+        position_id: &PositionId,
+        trader_id: &TraderId,
+    ) -> anyhow::Result<Option<PositionSnapshot>> {
+        sqlx::query_as::<_, PositionSnapshotRow>(
+            r#"SELECT * FROM "position" WHERE id = $1 AND trader_id = $2"#,
+        )
+        .bind(position_id.to_string())
+        .bind(trader_id.to_string())
+        .fetch_optional(pool)
+        .await
+        .map(|row| row.map(|row| row.0))
+        .map_err(|e| anyhow::anyhow!("Failed to load position snapshot: {e}"))
+    }
+
+    /// Checks if an `OrderInitialized` event exists for the given `client_order_id` via the provided `pool`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the SQL SELECT operation fails.
+    pub async fn check_if_order_initialized_exists(
+        pool: &PgPool,
+        client_order_id: ClientOrderId,
+        trader_id: &TraderId,
+    ) -> anyhow::Result<bool> {
+        sqlx::query(
+            r#"
+            SELECT EXISTS(
+                SELECT 1 FROM "order_event"
+                WHERE client_order_id = $1 AND trader_id = $2 AND kind = 'OrderInitialized'
+            )
+        "#,
+        )
+        .bind(client_order_id.to_string())
+        .bind(trader_id.to_string())
+        .fetch_one(pool)
+        .await
+        .map(|row| row.get(0))
+        .map_err(|e| anyhow::anyhow!("Failed to check if order initialized exists: {e}"))
+    }
+
+    /// Checks if any account event exists for the given `account_id` via the provided `pool`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the SQL SELECT operation fails.
+    pub async fn check_if_account_event_exists(
+        pool: &PgPool,
+        account_id: AccountId,
+        trader_id: &TraderId,
+    ) -> anyhow::Result<bool> {
+        sqlx::query(
+            r#"
+            SELECT EXISTS(
+                SELECT 1 FROM "account_event"
+                WHERE account_id = $1 AND trader_id = $2
+            )
+        "#,
+        )
+        .bind(account_id.to_string())
+        .bind(trader_id.to_string())
+        .fetch_one(pool)
+        .await
+        .map(|row| row.get(0))
+        .map_err(|e| anyhow::anyhow!("Failed to check if account event exists: {e}"))
+    }
+
+    /// Inserts or updates an order event entry via the provided `pool`.
+    ///
+    /// An event already persisted for another trader is left unchanged.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the SQL INSERT or UPDATE operation fails, if serialization of
+    /// `exec_algorithm_params` fails, or if the event is already persisted for another trader.
+    #[expect(
+        clippy::too_many_lines,
+        reason = "order event persistence maps the full database schema in one transaction"
+    )]
+    pub async fn add_order_event(
+        pool: &PgPool,
+        order_event: Box<dyn OrderEvent>,
+        client_id: Option<ClientId>,
+    ) -> anyhow::Result<()> {
+        let mut transaction = pool.begin().await?;
+
+        // Insert trader if it does not exist
+        // TODO remove this when node and trader initialization is implemented
+        sqlx::query(
+            r#"
+            INSERT INTO "trader" (id) VALUES ($1) ON CONFLICT (id) DO NOTHING
+        "#,
+        )
+        .bind(order_event.trader_id().to_string())
+        .execute(&mut *transaction)
+        .await
+        .map(|_| ())
+        .map_err(|e| anyhow::anyhow!("Failed to insert into trader table: {e}"))?;
+
+        // Insert client if it does not exist
+        // TODO remove this when client initialization is implemented
+        if let Some(client_id) = client_id {
+            sqlx::query(
+                r#"
+                INSERT INTO "client" (id) VALUES ($1) ON CONFLICT (id) DO NOTHING
+            "#,
+            )
+            .bind(client_id.to_string())
+            .execute(&mut *transaction)
+            .await
+            .map(|_| ())
+            .map_err(|e| anyhow::anyhow!("Failed to insert into client table: {e}"))?;
+        }
+
+        let exec_algorithm_params = order_event
+            .exec_algorithm_params()
+            .map(serde_json::to_value)
+            .transpose()
+            .map_err(|e| anyhow::anyhow!("Failed to serialize exec algorithm params: {e}"))?;
+        let info = order_event
+            .info()
+            .map(serde_json::to_value)
+            .transpose()
+            .map_err(|e| anyhow::anyhow!("Failed to serialize order event info: {e}"))?;
+
+        let inserted = sqlx::query(r#"
+            INSERT INTO "order_event" (
+                id, kind, client_order_id, order_type, order_side, trader_id, client_id, reason, strategy_id, instrument_id, trade_id, currency, quantity, time_in_force, liquidity_side,
+                post_only, reduce_only, quote_quantity, reconciliation, price, last_px, last_qty, trigger_price, trigger_type, limit_offset, trailing_offset,
+                trailing_offset_type, expire_time, display_qty, emulation_trigger, trigger_instrument_id, contingency_type,
+                order_list_id, linked_order_ids, parent_order_id,
+                exec_algorithm_id, exec_spawn_id, venue_order_id, account_id, position_id, commission, ts_event, ts_init, activation_price, exec_algorithm_params, tags,
+                released_price, protection_price, due_post_only, correction_id, is_reopened, info, causation_id, created_at, updated_at
+            ) VALUES (
+                $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20,
+                $21, $22, $23, $24, $25, $26::trailing_offset_type, $27, $28, $29, $30, $31, $32, $33, $34,
+                $35, $36, $37, $38, $39, $40, $41, $42, $43, $44, $45, $46,
+                $47, $48, $49, $50, $51, $52, $53, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP
+            )
+            ON CONFLICT (id)
+            DO UPDATE
+            SET
+                kind = $2, client_order_id = $3, order_type = $4, order_side=$5, client_id = $7, reason = $8, strategy_id = $9, instrument_id = $10, trade_id = $11, currency = $12,
+                quantity = $13, time_in_force = $14, liquidity_side = $15, post_only = $16, reduce_only = $17, quote_quantity = $18, reconciliation = $19, price = $20, last_px = $21,
+                last_qty = $22, trigger_price = $23, trigger_type = $24, limit_offset = $25, trailing_offset = $26, trailing_offset_type = $27, expire_time = $28, display_qty = $29,
+                emulation_trigger = $30, trigger_instrument_id = $31, contingency_type = $32, order_list_id = $33, linked_order_ids = $34, parent_order_id = $35, exec_algorithm_id = $36,
+                exec_spawn_id = $37, venue_order_id = $38, account_id = $39, position_id = $40, commission = $41, ts_event = $42, ts_init = $43, activation_price = $44,
+                exec_algorithm_params = $45, tags = $46, released_price = $47, protection_price = $48, due_post_only = $49, correction_id = $50,
+                is_reopened = $51, info = $52, causation_id = $53, updated_at = CURRENT_TIMESTAMP
+            WHERE "order_event".trader_id = $6
+        "#)
+            .bind(order_event.id().to_string())
+            .bind(order_event.type_name())
+            .bind(order_event.client_order_id().to_string())
+            .bind(order_event.order_type().map(|x| x.to_string()))
+            .bind(order_event.order_side().map(|x| x.to_string()))
+            .bind(order_event.trader_id().to_string())
+            .bind(client_id.map(|x| x.to_string()))
+            .bind(order_event.reason().map(|x| x.to_string()))
+            .bind(order_event.strategy_id().to_string())
+            .bind(order_event.instrument_id().to_string())
+            .bind(order_event.trade_id().map(|x| x.to_string()))
+            .bind(order_event.currency().map(|x| x.code.as_str()))
+            .bind(order_event.quantity().map(|x| x.to_string()))
+            .bind(order_event.time_in_force().map(|x| x.to_string()))
+            .bind(order_event.liquidity_side().map(|x| x.to_string()))
+            .bind(order_event.post_only())
+            .bind(order_event.reduce_only())
+            .bind(order_event.quote_quantity())
+            .bind(order_event.reconciliation())
+            .bind(order_event.price().map(|x| x.to_string()))
+            .bind(order_event.last_px().map(|x| x.to_string()))
+            .bind(order_event.last_qty().map(|x| x.to_string()))
+            .bind(order_event.trigger_price().map(|x| x.to_string()))
+            .bind(order_event.trigger_type().map(|x| x.to_string()))
+            .bind(order_event.limit_offset().map(|x| x.to_string()))
+            .bind(order_event.trailing_offset().map(|x| x.to_string()))
+            .bind(
+                order_event
+                    .trailing_offset_type()
+                    .map(|value| TrailingOffsetTypePg(Some(value))),
+            )
+            .bind(order_event.expire_time().map(|x| x.to_string()))
+            .bind(order_event.display_qty().map(|x| x.to_string()))
+            .bind(
+                order_event
+                    .emulation_trigger()
+                    .map_or_else(|| "NO_TRIGGER".to_string(), |value| value.to_string()),
+            )
+            .bind(order_event.trigger_instrument_id().map(|x| x.to_string()))
+            .bind(order_event.contingency_type().map_or_else(
+                || "NO_CONTINGENCY".to_string(),
+                |value| value.to_string(),
+            ))
+            .bind(order_event.order_list_id().map(|x| x.to_string()))
+            .bind(order_event.linked_order_ids().map(|x| x.iter().map(ToString::to_string).collect::<Vec<String>>()))
+            .bind(order_event.parent_order_id().map(|x| x.to_string()))
+            .bind(order_event.exec_algorithm_id().map(|x| x.to_string()))
+            .bind(order_event.exec_spawn_id().map(|x| x.to_string()))
+            .bind(order_event.venue_order_id().map(|x| x.to_string()))
+            .bind(order_event.account_id().map(|x| x.to_string()))
+            .bind(order_event.position_id().map(|x| x.to_string()))
+            .bind(order_event.commission().map(|x| x.to_string()))
+            .bind(order_event.ts_event().to_string())
+            .bind(order_event.ts_init().to_string())
+            .bind(order_event.activation_price().map(|x| x.to_string()))
+            .bind(exec_algorithm_params)
+            .bind(order_event.tags().map(|x| x.iter().map(ToString::to_string).collect::<Vec<String>>()))
+            .bind(order_event.released_price().map(|x| x.to_string()))
+            .bind(order_event.protection_price().map(|x| x.to_string()))
+            .bind(order_event.due_post_only())
+            .bind(order_event.correction_id().map(|x| x.to_string()))
+            .bind(order_event.is_reopened())
+            .bind(info)
+            .bind(order_event.causation_id().map(|x| x.to_string()))
+            .execute(&mut *transaction)
+            .await
+            .map_err(|e| anyhow::anyhow!("Failed to insert into order_event table: {e}"))?;
+
+        // Event IDs are shared when two traders persist the same event, and the existing row
+        // belongs to its first writer
+        if inserted.rows_affected() == 0 {
+            anyhow::bail!(
+                "Order event {} is already persisted for another trader, not {}",
+                order_event.id(),
+                order_event.trader_id()
+            );
+        }
+
+        transaction
+            .commit()
+            .await
+            .map_err(|e| anyhow::anyhow!("Failed to commit transaction: {e}"))
+    }
+
+    /// Loads all order events for a `client_order_id` via the provided `pool`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the SQL SELECT or deserialization fails.
+    pub async fn load_order_events(
+        pool: &PgPool,
+        client_order_id: &ClientOrderId,
+        trader_id: &TraderId,
+    ) -> anyhow::Result<Vec<OrderEventAny>> {
+        sqlx::query_as::<_, OrderEventAnyRow>(
+            r#"
+            SELECT * FROM "order_event" event
+            WHERE event.client_order_id = $1 AND event.trader_id = $2
+            ORDER BY created_at ASC
+        "#,
+        )
+        .bind(client_order_id.to_string())
+        .bind(trader_id.to_string())
+        .fetch_all(pool)
+        .await
+        .map(|rows| rows.into_iter().map(|row| row.0).collect())
+        .map_err(|e| anyhow::anyhow!("Failed to load order events: {e}"))
+    }
+
+    /// Loads and assembles a complete `OrderAny` for a `client_order_id` via the provided `pool`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if assembling events or SQL operations fail.
+    pub async fn load_order(
+        pool: &PgPool,
+        client_order_id: &ClientOrderId,
+        trader_id: &TraderId,
+    ) -> anyhow::Result<Option<OrderAny>> {
+        let order_events = Self::load_order_events(pool, client_order_id, trader_id).await;
+
+        match order_events {
+            Ok(order_events) => {
+                if order_events.is_empty() {
+                    return Ok(None);
+                }
+                let order = OrderAny::from_events(order_events).map_err(|e| {
+                    anyhow::anyhow!("Failed to assemble order {client_order_id} from events: {e}")
+                })?;
+                Ok(Some(order))
+            }
+            Err(e) => anyhow::bail!("Failed to load order events: {e}"),
+        }
+    }
+
+    /// Loads and assembles all `OrderAny` entries via the provided `pool`.
+    ///
+    /// Only orders written by `trader_id` are loaded.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if loading events or SQL operations fail.
+    pub async fn load_orders(pool: &PgPool, trader_id: &TraderId) -> anyhow::Result<Vec<OrderAny>> {
+        let mut orders: Vec<OrderAny> = Vec::new();
+        let client_order_ids: Vec<ClientOrderId> = sqlx::query(
+            r#"
+            SELECT DISTINCT client_order_id FROM "order_event"
+            WHERE trader_id = $1
+        "#,
+        )
+        .bind(trader_id.to_string())
+        .fetch_all(pool)
+        .await
+        .map(|rows| {
+            rows.into_iter()
+                .map(|row| ClientOrderId::from(row.get::<&str, _>(0)))
+                .collect()
+        })
+        .map_err(|e| anyhow::anyhow!("Failed to load order ids: {e}"))?;
+        for id in client_order_ids {
+            let order = Self::load_order(pool, &id, trader_id).await?;
+            if let Some(order) = order {
+                orders.push(order);
+            }
+        }
+        Ok(orders)
+    }
+
+    /// Replaces the fill event log for a `position_id` via the provided `pool`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the fill is invalid or if the SQL operations fail.
+    pub async fn add_position(
+        pool: &PgPool,
+        position_id: PositionId,
+        event: &OrderFilled,
+    ) -> anyhow::Result<()> {
+        let event_position_id = Self::event_position_id(event)?;
+        if event_position_id != position_id {
+            anyhow::bail!(
+                "Cannot persist position event {} for mismatched position_id: expected {}, was {}",
+                event.event_id,
+                position_id,
+                event_position_id
+            );
+        }
+
+        let mut transaction = pool.begin().await?;
+
+        // Position IDs are only unique per trader (NETTING IDs are `{instrument_id}-{strategy_id}`),
+        // so the replaced event log is the fill trader's alone
+        sqlx::query(r#"DELETE FROM "position_event" WHERE position_id = $1 AND trader_id = $2"#)
+            .bind(position_id.to_string())
+            .bind(event.trader_id.to_string())
+            .execute(&mut *transaction)
+            .await
+            .map(|_| ())
+            .map_err(|e| anyhow::anyhow!("Failed to delete position_event rows: {e}"))?;
+
+        Self::insert_position_event(&mut transaction, event).await?;
+        transaction
+            .commit()
+            .await
+            .map_err(|e| anyhow::anyhow!("Failed to commit transaction: {e}"))
+    }
+
+    /// Appends a fill event for a `Position` via the provided `pool`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the fill is invalid or if the SQL operations fail.
+    pub async fn update_position(pool: &PgPool, event: &OrderFilled) -> anyhow::Result<()> {
+        let mut transaction = pool.begin().await?;
+
+        Self::insert_position_event(&mut transaction, event).await?;
+        transaction
+            .commit()
+            .await
+            .map_err(|e| anyhow::anyhow!("Failed to commit transaction: {e}"))
+    }
+
+    /// Appends an `OrderFilled` event to the position event log via the provided `pool`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the SQL INSERT operation fails.
+    pub async fn add_position_event(pool: &PgPool, event: &OrderFilled) -> anyhow::Result<()> {
+        let mut transaction = pool.begin().await?;
+
+        Self::insert_position_event(&mut transaction, event).await?;
+        transaction
+            .commit()
+            .await
+            .map_err(|e| anyhow::anyhow!("Failed to commit transaction: {e}"))
+    }
+
+    /// Loads all fill events for a `position_id` via the provided `pool`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the SQL SELECT or deserialization fails.
+    pub async fn load_position_events(
+        pool: &PgPool,
+        position_id: &PositionId,
+        trader_id: &TraderId,
+    ) -> anyhow::Result<Vec<OrderFilled>> {
+        sqlx::query_as::<_, OrderFilledRow>(
+            r#"
+            SELECT *
+            FROM "position_event"
+            WHERE position_id = $1 AND trader_id = $2
+            ORDER BY event_sequence ASC
+        "#,
+        )
+        .bind(position_id.to_string())
+        .bind(trader_id.to_string())
+        .fetch_all(pool)
+        .await
+        .map(|rows| rows.into_iter().map(|row| row.0).collect())
+        .map_err(|e| anyhow::anyhow!("Failed to load position events: {e}"))
+    }
+
+    /// Loads and replays a complete `Position` for a `position_id` via the provided `pool`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if loading events, loading instruments, or replaying fills fails.
+    pub async fn load_position(
+        pool: &PgPool,
+        position_id: &PositionId,
+        trader_id: &TraderId,
+    ) -> anyhow::Result<Option<Position>> {
+        if let Some(snapshot) = Self::load_position_snapshot(pool, position_id, trader_id).await?
+            && let Some(replay_state) = snapshot.replay_state
+        {
+            let position: Position = serde_json::from_value(replay_state)
+                .map_err(|e| anyhow::anyhow!("Failed to decode position replay state: {e}"))?;
+            position.check_accounting()?;
+            return Ok(Some(position));
+        }
+
+        let fills = Self::load_position_events(pool, position_id, trader_id).await?;
+        let Some((first_fill, remaining_fills)) = fills.split_first() else {
+            return Ok(None);
+        };
+        let Some(instrument) = Self::load_instrument(pool, &first_fill.instrument_id).await? else {
+            log::error!(
+                "Instrument not found for position {position_id}: {}",
+                first_fill.instrument_id
+            );
+            return Ok(None);
+        };
+
+        let mut position = Position::new_checked(&instrument, first_fill.clone())?;
+        for fill in remaining_fills {
+            if position.trade_ids.contains(&fill.trade_id) {
+                anyhow::bail!(
+                    "Duplicate fill event for position {position_id}: {}",
+                    fill.trade_id
+                );
+            }
+
+            position.try_apply(fill)?;
+        }
+
+        Ok(Some(position))
+    }
+
+    /// Loads and replays all `Position` entries via the provided `pool`.
+    ///
+    /// Only positions written by `trader_id` are loaded.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if loading position IDs or replaying any position fails.
+    pub async fn load_positions(
+        pool: &PgPool,
+        trader_id: &TraderId,
+    ) -> anyhow::Result<Vec<Position>> {
+        let position_ids: Vec<PositionId> = sqlx::query(
+            r#"
+            SELECT DISTINCT position_id
+            FROM "position_event"
+            WHERE trader_id = $1
+            ORDER BY position_id ASC
+        "#,
+        )
+        .bind(trader_id.to_string())
+        .fetch_all(pool)
+        .await
+        .map(|rows| {
+            rows.into_iter()
+                .map(|row| PositionId::from(row.get::<&str, _>(0)))
+                .collect()
+        })
+        .map_err(|e| anyhow::anyhow!("Failed to load position ids: {e}"))?;
+
+        let mut positions = Vec::new();
+
+        for id in position_ids {
+            match Self::load_position(pool, &id, trader_id).await {
+                Ok(Some(position)) => positions.push(position),
+                Ok(None) => log::error!("Position not found: {id}"),
+                Err(e) => log::error!("Failed to load position {id}: {e}"),
+            }
+        }
+
+        Ok(positions)
+    }
+
+    async fn insert_position_event(
+        transaction: &mut Transaction<'_, Postgres>,
+        event: &OrderFilled,
+    ) -> anyhow::Result<()> {
+        let position_id = Self::event_position_id(event)?;
+
+        sqlx::query(
+            r#"
+            INSERT INTO "trader" (id)
+            VALUES ($1)
+            ON CONFLICT (id) DO NOTHING
+        "#,
+        )
+        .bind(event.trader_id.to_string())
+        .execute(&mut **transaction)
+        .await
+        .map(|_| ())
+        .map_err(|e| anyhow::anyhow!("Failed to insert into trader table: {e}"))?;
+
+        let position_event_info = event
+            .info
+            .clone()
+            .map(serde_json::to_value)
+            .transpose()
+            .map_err(|e| anyhow::anyhow!("Failed to serialize fill info: {e}"))?;
+
+        sqlx::query(
+            r#"
+            INSERT INTO "position_event" (
+                id, kind, trader_id, strategy_id, instrument_id, client_order_id, venue_order_id,
+                account_id, trade_id, currency, order_type, order_side, last_px, last_qty,
+                liquidity_side, position_id, commission, reconciliation, info, causation_id,
+                ts_event, ts_init, created_at, updated_at
+            ) VALUES (
+                $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17,
+                $18, $19, $20, $21, $22, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP
+            )
+        "#,
+        )
+        .bind(event.event_id.to_string())
+        .bind("OrderFilled")
+        .bind(event.trader_id.to_string())
+        .bind(event.strategy_id.to_string())
+        .bind(event.instrument_id.to_string())
+        .bind(event.client_order_id.to_string())
+        .bind(event.venue_order_id.to_string())
+        .bind(event.account_id.to_string())
+        .bind(event.trade_id.to_string())
+        .bind(event.currency.code.as_str())
+        .bind(event.order_type.to_string())
+        .bind(event.order_side.to_string())
+        .bind(event.last_px.to_string())
+        .bind(event.last_qty.to_string())
+        .bind(event.liquidity_side.to_string())
+        .bind(position_id.to_string())
+        .bind(event.commission.map(|commission| commission.to_string()))
+        .bind(event.reconciliation)
+        .bind(position_event_info)
+        .bind(
+            event
+                .causation_id
+                .map(|causation_id| causation_id.to_string()),
+        )
+        .bind(event.ts_event.to_string())
+        .bind(event.ts_init.to_string())
+        .execute(&mut **transaction)
+        .await
+        .map(|_| ())
+        .map_err(|e| anyhow::anyhow!("Failed to insert into position_event table: {e}"))
+    }
+
+    fn event_position_id(event: &OrderFilled) -> anyhow::Result<PositionId> {
+        event.position_id.ok_or_else(|| {
+            anyhow::anyhow!(
+                "Cannot persist position event with no position_id: {}",
+                event.event_id
+            )
+        })
+    }
+
+    /// Inserts or updates an `AccountState` event for `trader_id` via the provided `pool`.
+    ///
+    /// An event already persisted for another trader, or awaiting assignment, is left unchanged.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the SQL INSERT or UPDATE operation fails, or if the event is already
+    /// persisted for another trader or awaiting assignment.
+    pub async fn add_account(
+        pool: &PgPool,
+        updated: bool,
+        account_event: AccountState,
+        trader_id: &TraderId,
+    ) -> anyhow::Result<()> {
+        if updated {
+            let exists =
+                Self::check_if_account_event_exists(pool, account_event.account_id, trader_id)
+                    .await?;
+
+            if !exists {
+                anyhow::bail!(
+                    "Account event does not exist for account: {}",
+                    account_event.account_id
+                );
+            }
+        }
+
+        let mut transaction = pool.begin().await?;
+        let event = serde_json::to_value(&account_event)
+            .map_err(|e| anyhow::anyhow!("Failed to serialize account event: {e}"))?;
+        let balances = event
+            .get("balances")
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("Serialized account event has no balances"))?;
+        let margins = event
+            .get("margins")
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("Serialized account event has no margins"))?;
+        let info = account_event
+            .info
+            .as_ref()
+            .map(serde_json::to_string)
+            .transpose()?;
+
+        sqlx::query(
+            r#"
+            INSERT INTO "trader" (id) VALUES ($1) ON CONFLICT (id) DO NOTHING
+        "#,
+        )
+        .bind(trader_id.to_string())
+        .execute(&mut *transaction)
+        .await
+        .map(|_| ())
+        .map_err(|e| anyhow::anyhow!("Failed to insert into trader table: {e}"))?;
+
+        sqlx::query(
+            r#"
+            INSERT INTO "account" (id) VALUES ($1) ON CONFLICT (id) DO NOTHING
+        "#,
+        )
+        .bind(account_event.account_id.to_string())
+        .execute(&mut *transaction)
+        .await
+        .map(|_| ())
+        .map_err(|e| anyhow::anyhow!("Failed to insert into account table: {e}"))?;
+
+        let inserted = sqlx::query(r#"
+            INSERT INTO "account_event" (
+                id, kind, account_id, trader_id, base_currency, balances, margins, info, is_reported, ts_event, ts_init, created_at, updated_at
+            ) VALUES (
+                $1, $2, $3, $10, $4, $5, $6, $11::json, $7, $8, $9, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP
+            )
+            ON CONFLICT (id)
+            DO UPDATE
+            SET
+                kind = $2, account_id = $3,
+                base_currency = $4, balances = $5, margins = $6, info = $11::json, is_reported = $7,
+                ts_event = $8, ts_init = $9, updated_at = CURRENT_TIMESTAMP
+            WHERE "account_event".trader_id = $10
+        "#)
+            .bind(account_event.event_id.to_string())
+            .bind(account_event.account_type.to_string())
+            .bind(account_event.account_id.to_string())
+            .bind(account_event.base_currency.map(|x| x.code.as_str()))
+            .bind(balances)
+            .bind(margins)
+            .bind(account_event.is_reported)
+            .bind(account_event.ts_event.to_string())
+            .bind(account_event.ts_init.to_string())
+            .bind(trader_id.to_string())
+            .bind(info)
+            .execute(&mut *transaction)
+            .await
+            .map_err(|e| anyhow::anyhow!("Failed to insert into account_event table: {e}"))?;
+
+        // Event IDs are shared when two traders persist the same account state, and the existing
+        // row belongs to its first writer (or awaits assignment if it has no trader)
+        if inserted.rows_affected() == 0 {
+            anyhow::bail!(
+                "Account event {} for {} is already persisted for another trader, not {trader_id}",
+                account_event.event_id,
+                account_event.account_id
+            );
+        }
+
+        transaction
+            .commit()
+            .await
+            .map_err(|e| anyhow::anyhow!("Failed to commit add_account transaction: {e}"))
+    }
+
+    /// Loads all account events for `account_id` via the provided `pool`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the SQL SELECT or deserialization fails.
+    pub async fn load_account_events(
+        pool: &PgPool,
+        account_id: &AccountId,
+        trader_id: &TraderId,
+    ) -> anyhow::Result<Vec<AccountState>> {
+        sqlx::query_as::<_, AccountEventRow>(
+            r#"
+            SELECT * FROM "account_event"
+            WHERE account_id = $1 AND trader_id = $2
+            ORDER BY created_at ASC
+        "#,
+        )
+        .bind(account_id.to_string())
+        .bind(trader_id.to_string())
+        .fetch_all(pool)
+        .await
+        .map(|rows| rows.into_iter().map(|row| row.0).collect())
+        .map_err(|e| anyhow::anyhow!("Failed to load account events: {e}"))
+    }
+
+    /// Loads and assembles a complete `AccountAny` for `account_id` via the provided `pool`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if assembling events or SQL operations fail.
+    pub async fn load_account(
+        pool: &PgPool,
+        account_id: &AccountId,
+        trader_id: &TraderId,
+    ) -> anyhow::Result<Option<AccountAny>> {
+        let account_events = Self::load_account_events(pool, account_id, trader_id).await;
+        match account_events {
+            Ok(account_events) => {
+                if account_events.is_empty() {
+                    return Ok(None);
+                }
+                let account = AccountAny::from_events(&account_events).map_err(|e| {
+                    anyhow::anyhow!("Failed to assemble account {account_id} from events: {e}")
+                })?;
+                Ok(Some(account))
+            }
+            Err(e) => anyhow::bail!("Failed to load account events: {e}"),
+        }
+    }
+
+    /// Loads and assembles all `AccountAny` entries via the provided `pool`.
+    ///
+    /// Only accounts with events written by `trader_id` are loaded.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if loading events or SQL operations fail.
+    pub async fn load_accounts(
+        pool: &PgPool,
+        trader_id: &TraderId,
+    ) -> anyhow::Result<Vec<AccountAny>> {
+        let mut accounts: Vec<AccountAny> = Vec::new();
+        let account_ids: Vec<AccountId> = sqlx::query(
+            r#"
+            SELECT DISTINCT account_id FROM "account_event"
+            WHERE trader_id = $1
+        "#,
+        )
+        .bind(trader_id.to_string())
+        .fetch_all(pool)
+        .await
+        .map(|rows| {
+            rows.into_iter()
+                .map(|row| AccountId::from(row.get::<&str, _>(0)))
+                .collect()
+        })
+        .map_err(|e| anyhow::anyhow!("Failed to load account ids: {e}"))?;
+        for id in account_ids {
+            let account = Self::load_account(pool, &id, trader_id).await?;
+            if let Some(account) = account {
+                accounts.push(account);
+            }
+        }
+        Ok(accounts)
+    }
+
+    /// Loads the IDs of accounts that have events with no trader via the provided `pool`.
+    ///
+    /// These events predate trader-scoped account persistence, so no trader-scoped cache loads
+    /// them until they are assigned with [`Self::assign_account_trader`].
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the SQL SELECT operation fails.
+    pub async fn load_unassigned_account_ids(pool: &PgPool) -> anyhow::Result<Vec<AccountId>> {
+        sqlx::query_scalar::<_, String>(
+            r#"
+            SELECT DISTINCT account_id FROM "account_event"
+            WHERE trader_id IS NULL AND account_id IS NOT NULL
+            ORDER BY account_id
+        "#,
+        )
+        .fetch_all(pool)
+        .await
+        .map(|ids| ids.iter().map(|id| AccountId::from(id.as_str())).collect())
+        .map_err(|e| anyhow::anyhow!("Failed to load unassigned account ids: {e}"))
+    }
+
+    /// Assigns the account events of `account_id` that have no trader to `trader_id` via the
+    /// provided `pool`, returning the number of events assigned.
+    ///
+    /// Events already stamped with a trader are left unchanged.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the account has no events, or if any SQL operation fails.
+    pub async fn assign_account_trader(
+        pool: &PgPool,
+        account_id: &AccountId,
+        trader_id: &TraderId,
+    ) -> anyhow::Result<u64> {
+        let mut transaction = pool.begin().await?;
+
+        let has_events: bool = sqlx::query_scalar(
+            r#"SELECT EXISTS(SELECT 1 FROM "account_event" WHERE account_id = $1)"#,
+        )
+        .bind(account_id.to_string())
+        .fetch_one(&mut *transaction)
+        .await
+        .map_err(|e| anyhow::anyhow!("Failed to check account events for {account_id}: {e}"))?;
+
+        if !has_events {
+            anyhow::bail!("No account events found for {account_id}");
+        }
+
+        sqlx::query(
+            r#"
+            INSERT INTO "trader" (id) VALUES ($1) ON CONFLICT (id) DO NOTHING
+        "#,
+        )
+        .bind(trader_id.to_string())
+        .execute(&mut *transaction)
+        .await
+        .map(|_| ())
+        .map_err(|e| anyhow::anyhow!("Failed to insert into trader table: {e}"))?;
+
+        let assigned = sqlx::query(
+            r#"
+            UPDATE "account_event"
+            SET trader_id = $2, updated_at = CURRENT_TIMESTAMP
+            WHERE account_id = $1 AND trader_id IS NULL
+        "#,
+        )
+        .bind(account_id.to_string())
+        .bind(trader_id.to_string())
+        .execute(&mut *transaction)
+        .await
+        .map_err(|e| anyhow::anyhow!("Failed to assign {account_id} to {trader_id}: {e}"))?
+        .rows_affected();
+
+        transaction
+            .commit()
+            .await
+            .map_err(|e| anyhow::anyhow!("Failed to commit account assignment: {e}"))?;
+
+        Ok(assigned)
+    }
+
+    /// Inserts a `TradeTick` entry via the provided `pool`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the SQL INSERT operation fails.
+    pub async fn add_trade(pool: &PgPool, trade: &TradeTick) -> anyhow::Result<()> {
+        sqlx::query(r#"
+            INSERT INTO "trade" (
+                instrument_id, price, quantity, aggressor_side, venue_trade_id,
+                ts_event, ts_init, created_at, updated_at
+            ) VALUES (
+                $1, $2, $3, $4::aggressor_side, $5, $6, $7, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP
+            )
+            ON CONFLICT (id)
+            DO UPDATE
+            SET
+                instrument_id = $1, price = $2, quantity = $3, aggressor_side = $4, venue_trade_id = $5,
+                ts_event = $6, ts_init = $7, updated_at = CURRENT_TIMESTAMP
+        "#)
+            .bind(trade.instrument_id.to_string())
+            .bind(trade.price.to_string())
+            .bind(trade.size.to_string())
+            .bind(AggressorSidePg(trade.aggressor_side))
+            .bind(trade.trade_id.to_string())
+            .bind(trade.ts_event.to_string())
+            .bind(trade.ts_init.to_string())
+            .execute(pool)
+            .await
+            .map(|_| ())
+            .map_err(|e| anyhow::anyhow!("Failed to insert into trade table: {e}"))
+    }
+
+    /// Loads all `TradeTick` entries for `instrument_id` via the provided `pool`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the SQL SELECT or deserialization fails.
+    pub async fn load_trades(
+        pool: &PgPool,
+        instrument_id: &InstrumentId,
+    ) -> anyhow::Result<Vec<TradeTick>> {
+        sqlx::query_as::<_, TradeTickRow>(
+            r#"SELECT * FROM "trade" WHERE instrument_id = $1 ORDER BY ts_event ASC"#,
+        )
+        .bind(instrument_id.to_string())
+        .fetch_all(pool)
+        .await
+        .map(|rows| rows.into_iter().map(|row| row.0).collect())
+        .map_err(|e| anyhow::anyhow!("Failed to load trades: {e}"))
+    }
+
+    /// Inserts a `QuoteTick` entry via the provided `pool`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the SQL INSERT operation fails.
+    pub async fn add_quote(pool: &PgPool, quote: &QuoteTick) -> anyhow::Result<()> {
+        sqlx::query(r#"
+            INSERT INTO "quote" (
+                instrument_id, bid_price, ask_price, bid_size, ask_size, ts_event, ts_init, created_at, updated_at
+            ) VALUES (
+                $1, $2, $3, $4, $5, $6, $7, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP
+            )
+            ON CONFLICT (id)
+            DO UPDATE
+            SET
+                instrument_id = $1, bid_price = $2, ask_price = $3, bid_size = $4, ask_size = $5,
+                ts_event = $6, ts_init = $7, updated_at = CURRENT_TIMESTAMP
+        "#)
+            .bind(quote.instrument_id.to_string())
+            .bind(quote.bid_price.to_string())
+            .bind(quote.ask_price.to_string())
+            .bind(quote.bid_size.to_string())
+            .bind(quote.ask_size.to_string())
+            .bind(quote.ts_event.to_string())
+            .bind(quote.ts_init.to_string())
+            .execute(pool)
+            .await
+            .map(|_| ())
+            .map_err(|e| anyhow::anyhow!("Failed to insert into quote table: {e}"))
+    }
+
+    /// Loads all `QuoteTick` entries for `instrument_id` via the provided `pool`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the SQL SELECT or deserialization fails.
+    pub async fn load_quotes(
+        pool: &PgPool,
+        instrument_id: &InstrumentId,
+    ) -> anyhow::Result<Vec<QuoteTick>> {
+        sqlx::query_as::<_, QuoteTickRow>(
+            r#"SELECT * FROM "quote" WHERE instrument_id = $1 ORDER BY ts_event ASC"#,
+        )
+        .bind(instrument_id.to_string())
+        .fetch_all(pool)
+        .await
+        .map(|rows| rows.into_iter().map(|row| row.0).collect())
+        .map_err(|e| anyhow::anyhow!("Failed to load quotes: {e}"))
+    }
+
+    /// Inserts a `Bar` entry via the provided `pool`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the SQL INSERT operation fails.
+    pub async fn add_bar(pool: &PgPool, bar: &Bar) -> anyhow::Result<()> {
+        if bar.bar_type.is_composite() {
+            anyhow::bail!(
+                "Cannot persist bar with composite bar type {}: the bar table stores only \
+                 the standard form; standardize the bar type before persisting",
+                bar.bar_type,
+            );
+        }
+
+        let bar_step = i32::try_from(bar.bar_type.spec().step.get())
+            .map_err(|e| anyhow::anyhow!("invalid bar step: {e}"))?;
+
+        sqlx::query(r#"
+            INSERT INTO "bar" (
+                instrument_id, step, bar_aggregation, price_type, aggregation_source, open, high, low, close, volume, ts_event, ts_init, created_at, updated_at
+            ) VALUES (
+                $1, $2, $3::bar_aggregation, $4::price_type, $5::aggregation_source, $6, $7, $8, $9, $10, $11, $12, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP
+            )
+            ON CONFLICT (id)
+            DO UPDATE
+            SET
+                instrument_id = $1, step = $2, bar_aggregation = $3::bar_aggregation, price_type = $4::price_type, aggregation_source = $5::aggregation_source,
+                open = $6, high = $7, low = $8, close = $9, volume = $10, ts_event = $11, ts_init = $12, updated_at = CURRENT_TIMESTAMP
+        "#)
+            .bind(bar.bar_type.instrument_id().to_string())
+            .bind(bar_step)
+            .bind(BarAggregationPg(bar.bar_type.spec().aggregation))
+            .bind(PriceTypePg(bar.bar_type.spec().price_type))
+            .bind(AggregationSourcePg(bar.bar_type.aggregation_source()))
+            .bind(bar.open.to_string())
+            .bind(bar.high.to_string())
+            .bind(bar.low.to_string())
+            .bind(bar.close.to_string())
+            .bind(bar.volume.to_string())
+            .bind(bar.ts_event.to_string())
+            .bind(bar.ts_init.to_string())
+            .execute(pool)
+            .await
+            .map(|_| ())
+            .map_err(|e| anyhow::anyhow!("Failed to insert into bar table: {e}"))
+    }
+
+    /// Loads all `Bar` entries for `instrument_id` via the provided `pool`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the SQL SELECT or deserialization fails.
+    pub async fn load_bars(
+        pool: &PgPool,
+        instrument_id: &InstrumentId,
+    ) -> anyhow::Result<Vec<Bar>> {
+        sqlx::query_as::<_, BarRow>(
+            r#"SELECT * FROM "bar" WHERE instrument_id = $1 ORDER BY ts_event ASC"#,
+        )
+        .bind(instrument_id.to_string())
+        .fetch_all(pool)
+        .await
+        .map(|rows| rows.into_iter().map(|row| row.0).collect())
+        .map_err(|e| anyhow::anyhow!("Failed to load bars: {e}"))
+    }
+
+    /// Loads all distinct client order IDs from order events via the provided `pool`.
+    ///
+    /// Only order events written by `trader_id` are read.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the SQL SELECT or iteration fails.
+    pub async fn load_distinct_order_event_client_ids(
+        pool: &PgPool,
+        trader_id: &TraderId,
+    ) -> anyhow::Result<AHashMap<ClientOrderId, ClientId>> {
+        let mut map: AHashMap<ClientOrderId, ClientId> = AHashMap::new();
+        let result = sqlx::query_as::<_, OrderEventOrderClientIdCombination>(
+            r#"
+            SELECT DISTINCT ON (client_order_id)
+                client_order_id AS "client_order_id",
+                client_id AS "client_id"
+            FROM "order_event"
+            WHERE client_id IS NOT NULL AND trader_id = $1
+            ORDER BY client_order_id, created_at DESC
+        "#,
+        )
+        .bind(trader_id.to_string())
+        .fetch_all(pool)
+        .await
+        .map_err(|e| anyhow::anyhow!("Failed to load account ids: {e}"))?;
+
+        for id in result {
+            map.insert(id.client_order_id, id.client_id);
+        }
+        Ok(map)
+    }
+
+    /// Claims execution-client origins for existing order events in one transaction.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if an order has no persisted events, an order is already claimed by a
+    /// different client, or any SQL operation fails. Any error rolls back the complete batch.
+    pub async fn index_order_clients(
+        pool: &PgPool,
+        trader_id: &TraderId,
+        claims: &[(ClientOrderId, ClientId)],
+    ) -> anyhow::Result<()> {
+        if claims.is_empty() {
+            return Ok(());
+        }
+
+        let mut transaction = pool.begin().await?;
+
+        for (client_order_id, client_id) in claims {
+            let conflicting_client_id = sqlx::query_scalar::<_, String>(
+                r#"
+                SELECT client_id
+                FROM "order_event"
+                WHERE client_order_id = $1
+                  AND trader_id = $3
+                  AND client_id IS NOT NULL
+                  AND client_id <> $2
+                LIMIT 1
+            "#,
+            )
+            .bind(client_order_id.to_string())
+            .bind(client_id.to_string())
+            .bind(trader_id.to_string())
+            .fetch_optional(&mut *transaction)
+            .await
+            .map_err(|e| anyhow::anyhow!("Failed to validate order client origin: {e}"))?;
+
+            if let Some(conflicting_client_id) = conflicting_client_id {
+                anyhow::bail!(
+                    "Order {client_order_id} is already claimed by execution client \
+                     {conflicting_client_id} and cannot be claimed by {client_id}"
+                );
+            }
+
+            sqlx::query(
+                r#"
+                INSERT INTO "client" (id)
+                VALUES ($1)
+                ON CONFLICT (id) DO NOTHING
+            "#,
+            )
+            .bind(client_id.to_string())
+            .execute(&mut *transaction)
+            .await
+            .map_err(|e| anyhow::anyhow!("Failed to persist execution client {client_id}: {e}"))?;
+
+            let result = sqlx::query(
+                r#"
+                UPDATE "order_event"
+                SET client_id = $2
+                WHERE client_order_id = $1
+                  AND trader_id = $3
+                  AND (client_id IS NULL OR client_id = $2)
+            "#,
+            )
+            .bind(client_order_id.to_string())
+            .bind(client_id.to_string())
+            .bind(trader_id.to_string())
+            .execute(&mut *transaction)
+            .await
+            .map_err(|e| anyhow::anyhow!("Failed to index order client origin: {e}"))?;
+
+            if result.rows_affected() == 0 {
+                anyhow::bail!("No persisted order events found for {client_order_id}");
+            }
+        }
+
+        transaction
+            .commit()
+            .await
+            .map_err(|e| anyhow::anyhow!("Failed to commit order client origins: {e}"))
+    }
+
+    /// Inserts or updates an order ID to position ID index entry via the provided `pool`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the SQL INSERT or UPDATE operation fails.
+    pub async fn index_order_position(
+        pool: &PgPool,
+        trader_id: &TraderId,
+        client_order_id: ClientOrderId,
+        position_id: PositionId,
+    ) -> anyhow::Result<()> {
+        let mut transaction = pool.begin().await?;
+
+        sqlx::query(
+            r#"
+            INSERT INTO "trader" (id) VALUES ($1) ON CONFLICT (id) DO NOTHING
+        "#,
+        )
+        .bind(trader_id.to_string())
+        .execute(&mut *transaction)
+        .await
+        .map(|_| ())
+        .map_err(|e| anyhow::anyhow!("Failed to insert into trader table: {e}"))?;
+
+        sqlx::query(
+            r#"
+            INSERT INTO "order_position_index" (
+                trader_id, client_order_id, position_id, created_at, updated_at
+            ) VALUES (
+                $1, $2, $3, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP
+            )
+            ON CONFLICT (trader_id, client_order_id)
+            DO UPDATE
+            SET
+                position_id = $3, updated_at = CURRENT_TIMESTAMP
+        "#,
+        )
+        .bind(trader_id.to_string())
+        .bind(client_order_id.to_string())
+        .bind(position_id.to_string())
+        .execute(&mut *transaction)
+        .await
+        .map(|_| ())
+        .map_err(|e| anyhow::anyhow!("Failed to insert into order_position_index table: {e}"))?;
+
+        transaction
+            .commit()
+            .await
+            .map_err(|e| anyhow::anyhow!("Failed to commit order position index: {e}"))
+    }
+
+    /// Loads the order ID to position ID index via the provided `pool`.
+    ///
+    /// Only entries written by `trader_id` are loaded.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the SQL SELECT or iteration fails.
+    pub async fn load_index_order_position(
+        pool: &PgPool,
+        trader_id: &TraderId,
+    ) -> anyhow::Result<AHashMap<ClientOrderId, PositionId>> {
+        let mut map: AHashMap<ClientOrderId, PositionId> = AHashMap::new();
+        let result = sqlx::query_as::<_, OrderPositionIndexRow>(
+            r#"
+            SELECT
+                client_order_id AS "client_order_id",
+                position_id AS "position_id"
+            FROM "order_position_index"
+            WHERE trader_id = $1
+        "#,
+        )
+        .bind(trader_id.to_string())
+        .fetch_all(pool)
+        .await
+        .map_err(|e| anyhow::anyhow!("Failed to load order position index: {e}"))?;
+
+        for row in result {
+            map.insert(row.client_order_id, row.position_id);
+        }
+        Ok(map)
+    }
+
+    /// Inserts a `Signal` entry via the provided `pool`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the SQL INSERT operation fails.
+    pub async fn add_signal(pool: &PgPool, signal: &Signal) -> anyhow::Result<()> {
+        sqlx::query(
+            r#"
+            INSERT INTO "signal" (
+                name, value, ts_event, ts_init, created_at, updated_at
+            ) VALUES (
+                $1, $2, $3, $4, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP
+            )
+            ON CONFLICT (id)
+            DO UPDATE
+            SET
+                name = $1, value = $2, ts_event = $3, ts_init = $4,
+                updated_at = CURRENT_TIMESTAMP
+        "#,
+        )
+        .bind(signal.name.to_string())
+        .bind(signal.value.clone())
+        .bind(signal.ts_event.to_string())
+        .bind(signal.ts_init.to_string())
+        .execute(pool)
+        .await
+        .map(|_| ())
+        .map_err(|e| anyhow::anyhow!("Failed to insert into signal table: {e}"))
+    }
+
+    /// Loads all `Signal` entries by `name` via the provided `pool`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the SQL SELECT or deserialization fails.
+    pub async fn load_signals(pool: &PgPool, name: &str) -> anyhow::Result<Vec<Signal>> {
+        sqlx::query_as::<_, SignalRow>(
+            r#"SELECT * FROM "signal" WHERE name = $1 ORDER BY ts_init ASC"#,
+        )
+        .bind(name)
+        .fetch_all(pool)
+        .await
+        .map(|rows| rows.into_iter().map(|row| row.0).collect())
+        .map_err(|e| anyhow::anyhow!("Failed to load signals: {e}"))
+    }
+
+    /// Inserts a `CustomData` entry via the provided `pool`.
+    ///
+    /// Serializes the model `CustomData` to full JSON and stores it in the JSONB `value` column.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the SQL INSERT operation fails.
+    pub async fn add_custom_data(pool: &PgPool, data: &CustomData) -> anyhow::Result<()> {
+        let json_bytes = serde_json::to_vec(data)
+            .map_err(|e| anyhow::anyhow!("CustomData must be valid JSON: {e}"))?;
+        let value_json: serde_json::Value = serde_json::from_slice(&json_bytes)
+            .map_err(|e| anyhow::anyhow!("CustomData value must be valid JSON: {e}"))?;
+        let data_type_obj = value_json
+            .get("data_type")
+            .and_then(|v| v.as_object())
+            .ok_or_else(|| anyhow::anyhow!("CustomData JSON missing data_type"))?;
+        let data_type_name = data_type_obj
+            .get("type_name")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        let metadata_json = data_type_obj
+            .get("metadata")
+            .cloned()
+            .unwrap_or_else(|| serde_json::Value::Object(serde_json::Map::new()));
+        let identifier = data_type_obj
+            .get("identifier")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        sqlx::query(
+            r#"
+            INSERT INTO "custom" (data_type, metadata, identifier, value, ts_event, ts_init, created_at, updated_at)
+            VALUES ($1, $2, $3, $4, $5, $6, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+            ON CONFLICT (id)
+            DO UPDATE SET
+                data_type = EXCLUDED.data_type,
+                metadata = EXCLUDED.metadata,
+                identifier = EXCLUDED.identifier,
+                value = EXCLUDED.value,
+                ts_event = EXCLUDED.ts_event,
+                ts_init = EXCLUDED.ts_init,
+                updated_at = CURRENT_TIMESTAMP
+        "#,
+        )
+        .bind(data_type_name)
+        .bind(&metadata_json)
+        .bind(identifier)
+        .bind(&value_json)
+        .bind(
+            value_json
+                .get("ts_event")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or_else(|| data.ts_init().as_u64())
+                .to_string(),
+        )
+        .bind(data.ts_init().to_string())
+        .execute(pool)
+        .await
+        .map(|_| ())
+        .map_err(|e| anyhow::anyhow!("Failed to insert into custom table: {e}"))
+    }
+
+    /// Loads all `CustomData` entries of `data_type` via the provided `pool`.
+    ///
+    /// Filters by `data_type`, `metadata`, and `identifier` columns to match the requested data type.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the SQL SELECT or deserialization fails.
+    pub async fn load_custom_data(
+        pool: &PgPool,
+        data_type: &DataType,
+    ) -> anyhow::Result<Vec<CustomData>> {
+        let metadata_json = data_type.metadata().as_ref().map_or(
+            Ok(serde_json::Value::Object(serde_json::Map::new())),
+            serde_json::to_value,
+        )?;
+
+        let type_name = data_type.type_name();
+        let short_type = type_name.rsplit([':', '.']).next().unwrap_or(type_name);
+
+        let rows = match data_type.identifier() {
+            Some(identifier) => {
+                sqlx::query(
+                    r#"SELECT value, ts_event, ts_init FROM "custom"
+                   WHERE (data_type = $1 OR data_type = $2)
+                     AND metadata = $3
+                     AND identifier = $4
+                   ORDER BY ts_init ASC"#,
+                )
+                .bind(type_name)
+                .bind(short_type)
+                .bind(&metadata_json)
+                .bind(identifier)
+                .fetch_all(pool)
+                .await
+            }
+            None => {
+                sqlx::query(
+                    r#"SELECT value, ts_event, ts_init FROM "custom"
+                   WHERE (data_type = $1 OR data_type = $2)
+                     AND metadata = $3
+                     AND identifier = ''
+                   ORDER BY ts_init ASC"#,
+                )
+                .bind(type_name)
+                .bind(short_type)
+                .bind(&metadata_json)
+                .fetch_all(pool)
+                .await
+            }
+        }
+        .map_err(|e| anyhow::anyhow!("Failed to load custom data: {e}"))?;
+
+        let mut results = Vec::with_capacity(rows.len());
+        for row in rows {
+            let value_json: serde_json::Value = row.try_get("value")?;
+            let json_bytes = serde_json::to_vec(&value_json)
+                .map_err(|e| anyhow::anyhow!("Failed to serialize JSON: {e}"))?;
+            let custom =
+                CustomData::from_json_bytes(&json_bytes).map_err(|e| anyhow::anyhow!("{e}"))?;
+            results.push(custom);
+        }
+        Ok(results)
+    }
+}
+
+pub(super) fn trader_key_prefix(trader_id: TraderId) -> String {
+    format!(
+        "{CACHE_DATABASE_KEY_PREFIX}trader:{}:{trader_id}:",
+        trader_id.as_str().len()
+    )
+}
+
+#[cfg(all(test, feature = "defi"))]
+mod tests {
+    use nautilus_model::instruments::stubs::audusd_sim;
+    use sqlx::{Error, postgres::PgPoolOptions};
+
+    use super::DatabaseQueries;
+    use crate::defi::IntegrityError;
+
+    #[tokio::test]
+    async fn test_token_write_closed_pool_preserves_database_error() {
+        let pool = PgPoolOptions::new()
+            .connect_lazy("postgres://localhost/unused")
+            .unwrap();
+        pool.close().await;
+        let error = DatabaseQueries::write_token_instrument(
+            &pool,
+            "CurrencyPair",
+            Box::new(audusd_sim()),
+            &[],
+            None,
+        )
+        .await
+        .unwrap_err();
+        assert!(!error.is::<IntegrityError>());
+        assert!(matches!(
+            error.downcast_ref::<Error>(),
+            Some(Error::PoolClosed)
+        ));
+    }
+}

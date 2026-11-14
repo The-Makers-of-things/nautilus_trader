@@ -1,0 +1,4461 @@
+// -------------------------------------------------------------------------------------------------
+//  Copyright (C) 2015-2026 Nautech Systems Pty Ltd. All rights reserved.
+//  https://nautechsystems.io
+//
+//  Licensed under the GNU Lesser General Public License Version 3.0 (the "License");
+//  You may not use this file except in compliance with the License.
+//  You may obtain a copy of the License at https://www.gnu.org/licenses/lgpl-3.0.en.html
+//
+//  Unless required by applicable law or agreed to in writing, software
+//  distributed under the License is distributed on an "AS IS" BASIS,
+//  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+//  See the License for the specific language governing permissions and
+//  limitations under the License.
+// -------------------------------------------------------------------------------------------------
+
+//! Provides the WebSocket client integration for the [OKX](https://okx.com) WebSocket API.
+//!
+//! The [`OKXWebSocketClient`] ties together several recurring patterns:
+//! - Heartbeats use text `ping`/`pong`, responding to both text and control-frame pings.
+//! - Authentication re-runs on reconnect before resubscribing and skips private channels when
+//!   credentials are unavailable.
+//! - Subscriptions retain channel arguments so reconnects rebuild the same set of channels while
+//!   respecting the authentication guard described above.
+
+use std::{
+    fmt::Debug,
+    num::NonZeroU32,
+    sync::{
+        Arc, LazyLock,
+        atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering},
+    },
+    time::Duration,
+};
+
+use ahash::{AHashMap, AHashSet};
+use arc_swap::ArcSwap;
+use dashmap::DashMap;
+use futures_util::Stream;
+use nautilus_common::live::dst::time;
+use nautilus_core::{
+    AtomicMap, AtomicTime, UUID4, UnixNanos,
+    env::{get_env_var, get_or_env_var},
+    string::secret::{REDACTED, SecretString},
+    time::get_atomic_clock_realtime,
+};
+use nautilus_live::{
+    SocketControl,
+    task::{TaskGroup, TaskShutdownError},
+};
+use nautilus_model::{
+    data::BarType,
+    enums::{OrderSide, OrderType, PositionSide, TimeInForce, TriggerType},
+    identifiers::{AccountId, ClientOrderId, InstrumentId, StrategyId, TraderId, VenueOrderId},
+    instruments::{Instrument, InstrumentAny},
+    types::{Price, Quantity},
+};
+use nautilus_network::{
+    error::SendError,
+    http::create_standard_nautilus_headers,
+    mode::ConnectionMode,
+    ratelimiter::quota::Quota,
+    websocket::{
+        AUTHENTICATION_TIMEOUT_SECS, AuthTracker, SubscriptionState, TEXT_PING, TransportBackend,
+        WebSocketClient, WebSocketConfig, channel_message_handler,
+    },
+};
+use parking_lot::Mutex;
+use serde_json::Value;
+use tokio_tungstenite::tungstenite::Error;
+use tokio_util::sync::CancellationToken;
+use ustr::Ustr;
+
+use super::{
+    enums::OKXWsChannel,
+    error::OKXWsError,
+    handler::{HandlerCommand, OKXWsFeedHandler, SnapshotGate},
+    messages::{
+        OKXAuthentication, OKXAuthenticationArg, OKXSubscriptionArg, OKXWsMessage, OKXWsRequest,
+        WsAmendOrderParamsBuilder, WsAttachAlgoOrdParams, WsCancelOrderParamsBuilder,
+        WsMassCancelParams, WsPostOrderParamsBuilder,
+    },
+    subscription::{is_topic_subscribed, topic_from_subscription_arg},
+};
+use crate::common::{
+    consts::{
+        OKX_NAUTILUS_BROKER_ID, OKX_SUPPORTED_ORDER_TYPES, OKX_WS_PUBLIC_URL,
+        OKX_WS_TOPIC_DELIMITER, okx_market_target_currency, okx_reduce_only_wire_value,
+        select_book_channel, spot_trade_quote_ccy_wire_value, validate_order_time_in_force,
+        validate_regular_order_params,
+    },
+    credential::Credential,
+    enums::{
+        OKXBookChannel, OKXGreeksType, OKXInstrumentType, OKXOrderType, OKXPositionSide,
+        OKXTradeMode, OKXVipLevel,
+    },
+    parse::{
+        bar_spec_as_okx_channel, okx_instrument_type, okx_instrument_type_from_symbol,
+        parse_base_quote_from_symbol,
+    },
+};
+
+/// Default OKX WebSocket connection rate limit: 3 requests per second.
+///
+/// This applies to establishing WebSocket connections, not to subscribe/unsubscribe operations.
+pub static OKX_WS_CONNECTION_QUOTA: LazyLock<Quota> = LazyLock::new(|| {
+    Quota::per_second(NonZeroU32::new(3).expect("non-zero")).expect("valid constant")
+});
+
+/// OKX WebSocket subscription rate limit: 480 requests per hour per connection.
+///
+/// This applies to subscribe/unsubscribe/login operations.
+/// 480 per hour = 8 per minute, but we use per-hour for accurate limiting.
+pub static OKX_WS_SUBSCRIPTION_QUOTA: LazyLock<Quota> =
+    LazyLock::new(|| Quota::per_hour(NonZeroU32::new(480).expect("non-zero")));
+
+/// Rate limit for single order, cancel, and amend WebSocket operations: 30 requests per second.
+pub static OKX_WS_ORDER_QUOTA: LazyLock<Quota> = LazyLock::new(|| {
+    Quota::per_second(NonZeroU32::new(30).expect("non-zero")).expect("valid constant")
+});
+
+/// Rate limit for batch order, cancel, and amend WebSocket operations: 7 requests per second.
+pub static OKX_WS_BATCH_ORDER_QUOTA: LazyLock<Quota> = LazyLock::new(|| {
+    Quota::per_second(NonZeroU32::new(7).expect("non-zero")).expect("valid constant")
+});
+
+/// Rate limit for mass cancel WebSocket operations: 2 requests per second.
+pub static OKX_WS_MASS_CANCEL_QUOTA: LazyLock<Quota> = LazyLock::new(|| {
+    Quota::per_second(NonZeroU32::new(2).expect("non-zero")).expect("valid constant")
+});
+
+/// Rate limit for algo order WebSocket operations: 10 requests per second.
+pub static OKX_WS_ALGO_ORDER_QUOTA: LazyLock<Quota> = LazyLock::new(|| {
+    Quota::per_second(NonZeroU32::new(10).expect("non-zero")).expect("valid constant")
+});
+
+/// Rate limit for algo cancel WebSocket operations: 1 request per second.
+pub static OKX_WS_ALGO_CANCEL_QUOTA: LazyLock<Quota> = LazyLock::new(|| {
+    Quota::per_second(NonZeroU32::new(1).expect("non-zero")).expect("valid constant")
+});
+
+/// Maximum subscription args per subscribe/unsubscribe websocket message.
+const OKX_WS_SUBSCRIPTION_ARGS_MAX_PER_MESSAGE: usize = 256;
+
+/// Pre-interned rate limit key for subscription operations (subscribe/unsubscribe/login).
+///
+/// See: <https://www.okx.com/docs-v5/en/#websocket-api-login>
+/// See: <https://www.okx.com/docs-v5/en/#websocket-api-subscribe>
+pub static OKX_RATE_LIMIT_KEY_SUBSCRIPTION: LazyLock<[Ustr; 1]> =
+    LazyLock::new(|| [Ustr::from("subscription")]);
+
+/// Pre-interned rate limit key for single regular order operations.
+///
+/// See: <https://www.okx.com/docs-v5/en/#order-book-trading-trade-ws-place-order>
+pub static OKX_RATE_LIMIT_KEY_ORDER: LazyLock<[Ustr; 1]> = LazyLock::new(|| [Ustr::from("order")]);
+
+/// Pre-interned rate limit key for batch order operations.
+///
+/// See: <https://www.okx.com/docs-v5/en/#order-book-trading-trade-ws-place-multiple-orders>
+pub static OKX_RATE_LIMIT_KEY_BATCH_ORDER: LazyLock<[Ustr; 1]> =
+    LazyLock::new(|| [Ustr::from("batch-order")]);
+
+/// Pre-interned rate limit key for single regular cancel operations.
+///
+/// See: <https://www.okx.com/docs-v5/en/#order-book-trading-trade-ws-cancel-order>
+pub static OKX_RATE_LIMIT_KEY_CANCEL: LazyLock<[Ustr; 1]> =
+    LazyLock::new(|| [Ustr::from("cancel")]);
+
+/// Pre-interned rate limit key for batch cancel operations.
+///
+/// See: <https://www.okx.com/docs-v5/en/#order-book-trading-trade-ws-cancel-multiple-orders>
+pub static OKX_RATE_LIMIT_KEY_BATCH_CANCEL: LazyLock<[Ustr; 1]> =
+    LazyLock::new(|| [Ustr::from("batch-cancel")]);
+
+/// Pre-interned rate limit key for mass cancel operations.
+///
+/// See: <https://www.okx.com/docs-v5/en/#order-book-trading-trade-ws-mass-cancel-order>
+pub static OKX_RATE_LIMIT_KEY_MASS_CANCEL: LazyLock<[Ustr; 1]> =
+    LazyLock::new(|| [Ustr::from("mass-cancel")]);
+
+/// Pre-interned rate limit key for amend operations (amend orders).
+///
+/// See: <https://www.okx.com/docs-v5/en/#order-book-trading-trade-ws-amend-order>
+pub static OKX_RATE_LIMIT_KEY_AMEND: LazyLock<[Ustr; 1]> = LazyLock::new(|| [Ustr::from("amend")]);
+
+/// Pre-interned rate limit key for batch amend operations.
+///
+/// See: <https://www.okx.com/docs-v5/en/#order-book-trading-trade-ws-amend-multiple-orders>
+pub static OKX_RATE_LIMIT_KEY_BATCH_AMEND: LazyLock<[Ustr; 1]> =
+    LazyLock::new(|| [Ustr::from("batch-amend")]);
+
+/// Pre-interned rate limit key for algo order operations.
+///
+/// See: <https://www.okx.com/docs-v5/en/#order-book-trading-algo-trading-ws-place-algo-order>
+pub static OKX_RATE_LIMIT_KEY_ALGO_ORDER: LazyLock<[Ustr; 1]> =
+    LazyLock::new(|| [Ustr::from("algo-order")]);
+
+/// Pre-interned rate limit key for algo cancel operations.
+///
+/// See: <https://www.okx.com/docs-v5/en/#order-book-trading-algo-trading-ws-cancel-algo-order>
+pub static OKX_RATE_LIMIT_KEY_ALGO_CANCEL: LazyLock<[Ustr; 1]> =
+    LazyLock::new(|| [Ustr::from("algo-cancel")]);
+
+/// Context stored at order submission time for correlating venue responses.
+///
+/// Fields are read in `python/websocket.rs` (behind the `python` feature gate).
+#[derive(Debug, Clone)]
+#[allow(dead_code)]
+#[allow(
+    clippy::struct_field_names,
+    reason = "fields follow the codebase-wide trader_id/strategy_id/instrument_id naming family"
+)]
+pub(crate) struct PendingOrderInfo {
+    pub trader_id: TraderId,
+    pub strategy_id: StrategyId,
+    pub instrument_id: InstrumentId,
+}
+
+/// Provides a WebSocket client for connecting to [OKX](https://okx.com).
+///
+/// Instruments with the same base pair share one `index-tickers` subscription.
+/// Only the first subscriber triggers a venue subscribe, and only the last triggers
+/// a venue unsubscribe. Reference count updates and venue sends are serialized so
+/// concurrent subscription changes cannot leave the venue unsubscribed while local
+/// subscribers remain.
+#[derive(Clone)]
+pub struct OKXWebSocketClient {
+    clock: &'static AtomicTime,
+    url: String,
+    vip_level: Arc<AtomicU8>,
+    credential: Option<Credential>,
+    heartbeat: Option<u64>,
+    auth_timeout_secs: u64,
+    auth_tracker: AuthTracker,
+    signal: Arc<AtomicBool>,
+    connection_mode: Arc<ArcSwap<AtomicU8>>,
+    cmd_tx: Arc<tokio::sync::RwLock<tokio::sync::mpsc::UnboundedSender<HandlerCommand>>>,
+    out_rx: Option<Arc<tokio::sync::mpsc::UnboundedReceiver<OKXWsMessage>>>,
+    handler_tasks: Arc<TaskGroup>,
+    connect_lock: Arc<tokio::sync::Mutex<()>>,
+    handler_abort: Arc<Mutex<CancellationToken>>,
+    subscriptions: Arc<DashMap<String, OKXSubscriptionArg>>,
+    subscriptions_state: SubscriptionState,
+    request_id_counter: Arc<AtomicU64>,
+    instruments_cache: Arc<AtomicMap<Ustr, InstrumentAny>>,
+    inst_id_code_cache: Arc<AtomicMap<Ustr, u64>>,
+    trade_quote_ccy_lists: Arc<AtomicMap<Ustr, Vec<Ustr>>>,
+    spot_trade_quote_ccy: Arc<Mutex<Option<Ustr>>>,
+    order_request_ttl_ms: Option<u64>,
+    pub(crate) pending_orders: Arc<DashMap<String, PendingOrderInfo>>,
+    pub(crate) pending_cancels: Arc<DashMap<String, PendingOrderInfo>>,
+    pub(crate) pending_amends: Arc<DashMap<String, PendingOrderInfo>>,
+    pub(crate) pending_command_ids: Arc<DashMap<String, Vec<(ClientOrderId, UUID4)>>>,
+    option_greeks_subs: Arc<AtomicMap<InstrumentId, AHashSet<OKXGreeksType>>>,
+    index_pair_subscribers: Arc<DashMap<Ustr, usize>>,
+    index_pair_transition: Arc<tokio::sync::Mutex<()>>,
+    transport_backend: TransportBackend,
+    proxy_url: Option<SecretString>,
+    cancellation_token: CancellationToken,
+    socket_control: Option<Arc<SocketControl>>,
+}
+
+struct ConnectRollback {
+    handler_tasks: Arc<TaskGroup>,
+    signal: Arc<AtomicBool>,
+    handler_abort: CancellationToken,
+    socket_control: Option<Arc<SocketControl>>,
+    armed: bool,
+}
+
+impl ConnectRollback {
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for ConnectRollback {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+
+        self.handler_tasks.begin_shutdown();
+        self.signal.store(true, Ordering::Release);
+        self.handler_abort.cancel();
+
+        if let Some(control) = &self.socket_control {
+            control.deregister();
+        }
+    }
+}
+
+impl Default for OKXWebSocketClient {
+    fn default() -> Self {
+        Self::new(
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            TransportBackend::default(),
+            None,
+        )
+        .unwrap()
+    }
+}
+
+impl Debug for OKXWebSocketClient {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct(stringify!(OKXWebSocketClient))
+            .field("url", &self.url)
+            .field("credential", &self.credential.as_ref().map(|_| REDACTED))
+            .field("heartbeat", &self.heartbeat)
+            .finish_non_exhaustive()
+    }
+}
+
+impl OKXWebSocketClient {
+    /// Creates a new [`OKXWebSocketClient`] instance.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the request fails.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        url: Option<String>,
+        api_key: Option<String>,
+        api_secret: Option<String>,
+        api_passphrase: Option<String>,
+        _account_id: Option<AccountId>,
+        heartbeat: Option<u64>,
+        auth_timeout_secs: Option<u64>,
+        transport_backend: TransportBackend,
+        proxy_url: Option<String>,
+    ) -> anyhow::Result<Self> {
+        let url = url.unwrap_or(OKX_WS_PUBLIC_URL.to_string());
+        let credential = match (api_key, api_secret, api_passphrase) {
+            (Some(key), Some(secret), Some(passphrase)) => {
+                Some(Credential::new(key, secret, passphrase))
+            }
+            (None, None, None) => None,
+            _ => anyhow::bail!(
+                "`api_key`, `api_secret`, `api_passphrase` credentials must be provided together"
+            ),
+        };
+
+        let signal = Arc::new(AtomicBool::new(false));
+        let subscriptions = Arc::new(DashMap::new());
+        let subscriptions_state = SubscriptionState::new(OKX_WS_TOPIC_DELIMITER);
+
+        Ok(Self {
+            clock: get_atomic_clock_realtime(),
+            url,
+            vip_level: Arc::new(AtomicU8::new(0)),
+            credential,
+            heartbeat,
+            auth_timeout_secs: auth_timeout_secs.unwrap_or(AUTHENTICATION_TIMEOUT_SECS),
+            auth_tracker: AuthTracker::new(),
+            signal,
+            connection_mode: Arc::new(ArcSwap::from_pointee(AtomicU8::new(
+                ConnectionMode::Closed.as_u8(),
+            ))),
+            cmd_tx: {
+                // Placeholder channel until connect() creates the real handler and replays queued instruments
+                let (tx, _) = tokio::sync::mpsc::unbounded_channel();
+                Arc::new(tokio::sync::RwLock::new(tx))
+            },
+            out_rx: None,
+            handler_tasks: Arc::new(TaskGroup::new()),
+            connect_lock: Arc::new(tokio::sync::Mutex::new(())),
+            handler_abort: Arc::new(Mutex::new(CancellationToken::new())),
+            subscriptions,
+            subscriptions_state,
+            request_id_counter: Arc::new(AtomicU64::new(1)),
+            instruments_cache: Arc::new(AtomicMap::new()),
+            inst_id_code_cache: Arc::new(AtomicMap::new()),
+            trade_quote_ccy_lists: Arc::new(AtomicMap::new()),
+            spot_trade_quote_ccy: Arc::new(Mutex::new(None)),
+            order_request_ttl_ms: None,
+            pending_orders: Arc::new(DashMap::new()),
+            pending_cancels: Arc::new(DashMap::new()),
+            pending_amends: Arc::new(DashMap::new()),
+            pending_command_ids: Arc::new(DashMap::new()),
+            option_greeks_subs: Arc::new(AtomicMap::new()),
+            index_pair_subscribers: Arc::new(DashMap::new()),
+            index_pair_transition: Arc::new(tokio::sync::Mutex::new(())),
+            transport_backend,
+            proxy_url: proxy_url.map(SecretString::from),
+            cancellation_token: CancellationToken::new(),
+            socket_control: None,
+        })
+    }
+
+    /// Configures socket state reporting and reconnect control.
+    #[must_use]
+    pub fn with_socket_control(mut self, control: SocketControl) -> Self {
+        self.socket_control = Some(Arc::new(control));
+        self
+    }
+
+    /// Sets the TTL used to derive `expTime` on place and amend requests.
+    ///
+    /// Each request carries `expTime = now + ttl_ms`, computed when the request is built.
+    /// OKX does not process the request if its server time is past `expTime`. `None` omits
+    /// `expTime`.
+    #[must_use]
+    pub fn with_order_request_ttl_ms(mut self, ttl_ms: Option<u64>) -> Self {
+        self.order_request_ttl_ms = ttl_ms;
+        self
+    }
+
+    fn order_request_exp_time(&self) -> Option<String> {
+        self.order_request_ttl_ms
+            .map(|ttl_ms| self.clock.get_time_ms().saturating_add(ttl_ms).to_string())
+    }
+
+    /// Creates a new [`OKXWebSocketClient`] instance.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if credential values cannot be loaded or if the
+    /// client fails to initialize.
+    #[allow(clippy::too_many_arguments)]
+    pub fn with_credentials(
+        url: Option<String>,
+        api_key: Option<String>,
+        api_secret: Option<String>,
+        api_passphrase: Option<String>,
+        account_id: Option<AccountId>,
+        heartbeat: Option<u64>,
+        auth_timeout_secs: Option<u64>,
+        transport_backend: TransportBackend,
+        proxy_url: Option<String>,
+    ) -> anyhow::Result<Self> {
+        let url = url.unwrap_or(OKX_WS_PUBLIC_URL.to_string());
+        let api_key = get_or_env_var(api_key, "OKX_API_KEY")?;
+        let api_secret = get_or_env_var(api_secret, "OKX_API_SECRET")?;
+        let api_passphrase = get_or_env_var(api_passphrase, "OKX_API_PASSPHRASE")?;
+
+        Self::new(
+            Some(url),
+            Some(api_key),
+            Some(api_secret),
+            Some(api_passphrase),
+            account_id,
+            heartbeat,
+            auth_timeout_secs,
+            transport_backend,
+            proxy_url,
+        )
+    }
+
+    /// Creates a new authenticated [`OKXWebSocketClient`] using environment variables.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if required environment variables are missing or if
+    /// the client fails to initialize.
+    pub fn from_env() -> anyhow::Result<Self> {
+        let url = get_env_var("OKX_WS_URL")?;
+        let api_key = get_env_var("OKX_API_KEY")?;
+        let api_secret = get_env_var("OKX_API_SECRET")?;
+        let api_passphrase = get_env_var("OKX_API_PASSPHRASE")?;
+
+        Self::new(
+            Some(url),
+            Some(api_key),
+            Some(api_secret),
+            Some(api_passphrase),
+            None,
+            None,
+            None,
+            TransportBackend::default(),
+            None,
+        )
+    }
+
+    /// Cancel all pending WebSocket requests.
+    pub fn cancel_all_requests(&self) {
+        self.cancellation_token.cancel();
+    }
+
+    /// Get the cancellation token for this client.
+    pub fn cancellation_token(&self) -> &CancellationToken {
+        &self.cancellation_token
+    }
+
+    /// Returns the websocket url being used by the client.
+    pub fn url(&self) -> &str {
+        self.url.as_str()
+    }
+
+    /// Returns the public API key being used by the client.
+    pub fn api_key(&self) -> Option<&str> {
+        self.credential.as_ref().map(Credential::api_key)
+    }
+
+    /// Returns a masked version of the API key for logging purposes.
+    #[must_use]
+    pub fn api_key_masked(&self) -> Option<String> {
+        self.credential.as_ref().map(Credential::api_key_masked)
+    }
+
+    /// Returns a value indicating whether the client is active.
+    pub fn is_active(&self) -> bool {
+        let connection_mode_arc = self.connection_mode.load();
+        ConnectionMode::from_atomic(&connection_mode_arc).is_active()
+            && !self.signal.load(Ordering::Acquire)
+    }
+
+    /// Returns a value indicating whether the client is closed.
+    pub fn is_closed(&self) -> bool {
+        let connection_mode_arc = self.connection_mode.load();
+        ConnectionMode::from_atomic(&connection_mode_arc).is_closed()
+            || self.signal.load(Ordering::Acquire)
+    }
+
+    /// Returns whether this client retains ownership of a handler task.
+    pub(crate) fn has_task(&self) -> bool {
+        !self.handler_tasks.is_empty()
+    }
+
+    /// Caches multiple instruments.
+    ///
+    /// Any existing instruments with the same symbols will be replaced.
+    pub fn cache_instruments(&self, instruments: &[InstrumentAny]) {
+        self.instruments_cache.rcu(|m| {
+            for inst in instruments {
+                m.insert(inst.symbol().inner(), inst.clone());
+            }
+        });
+    }
+
+    /// Caches a single instrument.
+    ///
+    /// Any existing instrument with the same symbol will be replaced.
+    pub fn cache_instrument(&self, instrument: InstrumentAny) {
+        self.instruments_cache
+            .insert(instrument.symbol().inner(), instrument);
+    }
+
+    /// Returns a snapshot of the instruments cache as an `AHashMap`.
+    pub fn instruments_snapshot(&self) -> AHashMap<Ustr, InstrumentAny> {
+        (**self.instruments_cache.load()).clone()
+    }
+
+    /// Returns a shared handle to the live instruments cache.
+    pub fn instruments_cache_arc(&self) -> Arc<AtomicMap<Ustr, InstrumentAny>> {
+        Arc::clone(&self.instruments_cache)
+    }
+
+    /// Caches the instIdCode mapping for an instrument.
+    ///
+    /// The instIdCode is required for WebSocket order operations per OKX API deprecation.
+    pub fn cache_inst_id_code(&self, inst_id: Ustr, inst_id_code: u64) {
+        self.inst_id_code_cache.insert(inst_id, inst_id_code);
+    }
+
+    /// Caches multiple instIdCode mappings for instruments.
+    ///
+    /// This is typically called after loading instruments from the HTTP API.
+    pub fn cache_inst_id_codes(&self, mappings: impl IntoIterator<Item = (Ustr, u64)>) {
+        let entries: Vec<_> = mappings.into_iter().collect();
+        self.inst_id_code_cache.rcu(|m| {
+            for (inst_id, inst_id_code) in &entries {
+                m.insert(*inst_id, *inst_id_code);
+            }
+        });
+    }
+
+    /// Gets the instIdCode for an instrument.
+    ///
+    /// Returns `None` if the instrument is not in the cache.
+    #[must_use]
+    pub fn get_inst_id_code(&self, inst_id: &Ustr) -> Option<u64> {
+        self.inst_id_code_cache.load().get(inst_id).copied()
+    }
+
+    /// Sets the optional SPOT `tradeQuoteCcy` override for subsequent order placement.
+    pub fn set_spot_trade_quote_ccy(&self, ccy: Option<String>) {
+        *self.spot_trade_quote_ccy.lock() = ccy.map(|value| Ustr::from(value.as_str()));
+    }
+
+    /// Caches `tradeQuoteCcyList` values keyed by instrument ID.
+    pub fn cache_trade_quote_ccy_lists(
+        &self,
+        mappings: impl IntoIterator<Item = (Ustr, Vec<Ustr>)>,
+    ) {
+        let entries: Vec<_> = mappings.into_iter().collect();
+        self.trade_quote_ccy_lists.rcu(|m| {
+            for (inst_id, list) in &entries {
+                m.insert(*inst_id, list.clone());
+            }
+        });
+    }
+
+    fn resolve_spot_trade_quote_ccy(
+        &self,
+        instrument_type: OKXInstrumentType,
+        inst_id: Ustr,
+    ) -> Result<Option<Ustr>, OKXWsError> {
+        let configured = *self.spot_trade_quote_ccy.lock();
+        let available = self
+            .trade_quote_ccy_lists
+            .load()
+            .get(&inst_id)
+            .cloned()
+            .unwrap_or_default();
+        spot_trade_quote_ccy_wire_value(
+            instrument_type,
+            configured.as_ref().map(Ustr::as_str),
+            &available,
+        )
+        .map_err(OKXWsError::ClientError)
+    }
+
+    fn inst_id_symbol_and_code_from_snapshot(
+        inst_id_codes: &AHashMap<Ustr, u64>,
+        inst_id: &InstrumentId,
+        action: &str,
+    ) -> Result<(Ustr, u64), OKXWsError> {
+        let inst_id_symbol = inst_id.symbol.inner();
+        let inst_id_code = inst_id_codes.get(&inst_id_symbol).copied().ok_or_else(|| {
+            OKXWsError::ClientError(format!(
+                "No instIdCode cached for {inst_id}, cannot {action} order"
+            ))
+        })?;
+        Ok((inst_id_symbol, inst_id_code))
+    }
+
+    /// Sets the VIP level for this client.
+    ///
+    /// The VIP level determines which WebSocket channels are available.
+    pub fn set_vip_level(&self, vip_level: OKXVipLevel) {
+        self.vip_level.store(vip_level as u8, Ordering::Relaxed);
+    }
+
+    /// Gets the current VIP level.
+    pub fn vip_level(&self) -> OKXVipLevel {
+        let level = self.vip_level.load(Ordering::Relaxed);
+        OKXVipLevel::from(level)
+    }
+
+    /// Connect to the OKX WebSocket server.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the connection process fails.
+    pub async fn connect(&mut self) -> anyhow::Result<()> {
+        let connect_lock = Arc::clone(&self.connect_lock);
+        let _connect_guard = connect_lock.lock().await;
+
+        if !self.handler_tasks.is_empty() && !self.handler_tasks.all_finished() {
+            anyhow::bail!("Cannot connect while previous WebSocket handler task is still running");
+        }
+
+        if !self.handler_tasks.is_open() || !self.handler_tasks.is_empty() {
+            self.handler_tasks.begin_shutdown();
+            self.handler_tasks
+                .finish_shutdown(Duration::from_secs(2), Duration::from_secs(2))
+                .await
+                .map_err(|e| anyhow::anyhow!("Previous WebSocket handler failed: {e}"))?;
+            self.handler_tasks.start_generation().map_err(|e| {
+                anyhow::anyhow!("Failed to start WebSocket handler task generation: {e}")
+            })?;
+        }
+        let handler_spawner = self.handler_tasks.spawner().map_err(|e| {
+            anyhow::anyhow!("Failed to acquire WebSocket handler task spawner: {e}")
+        })?;
+        let handler_abort = CancellationToken::new();
+        *self.handler_abort.lock() = handler_abort.clone();
+        let mut rollback = ConnectRollback {
+            handler_tasks: Arc::clone(&self.handler_tasks),
+            signal: Arc::clone(&self.signal),
+            handler_abort: handler_abort.clone(),
+            socket_control: self.socket_control.clone(),
+            armed: true,
+        };
+
+        // Reset signal so is_active()/is_closed() work after a previous close()
+        self.signal.store(false, Ordering::Release);
+
+        let (message_handler, raw_rx) = channel_message_handler();
+
+        // No-op ping handler: handler owns the WebSocketClient and responds to pings directly
+        // in the message loop for minimal latency (see handler.rs TEXT_PONG response)
+        // Inbound Ping frames are answered by the transport, so no ping handler is needed;
+        // the reader routes them away from the message channel and the handler never sees them.
+
+        let headers = create_standard_nautilus_headers();
+
+        let config = WebSocketConfig {
+            url: self.url.clone(),
+            headers,
+            heartbeat_interval_secs: self.heartbeat,
+            heartbeat_payload: Some(TEXT_PING.to_string()),
+            connect_timeout_ms: None,
+            reconnect_delay_initial_ms: None,
+            reconnect_delay_max_ms: None,
+            reconnect_backoff_factor: None,
+            reconnect_jitter_ms: None,
+            reconnect_max_attempts: None,
+            heartbeat_timeout_secs: None,
+            idle_timeout_ms: None,
+            writer_capacity: None,
+            backend: self.transport_backend,
+            proxy_url: self
+                .proxy_url
+                .as_ref()
+                .map(|value| value.expose_secret().to_owned()),
+            max_message_size_bytes: None,
+            max_frame_size_bytes: None,
+        };
+
+        let keyed_quotas = vec![
+            (
+                OKX_RATE_LIMIT_KEY_SUBSCRIPTION[0].to_string(),
+                *OKX_WS_SUBSCRIPTION_QUOTA,
+            ),
+            (OKX_RATE_LIMIT_KEY_ORDER[0].to_string(), *OKX_WS_ORDER_QUOTA),
+            (
+                OKX_RATE_LIMIT_KEY_BATCH_ORDER[0].to_string(),
+                *OKX_WS_BATCH_ORDER_QUOTA,
+            ),
+            (
+                OKX_RATE_LIMIT_KEY_CANCEL[0].to_string(),
+                *OKX_WS_ORDER_QUOTA,
+            ),
+            (
+                OKX_RATE_LIMIT_KEY_BATCH_CANCEL[0].to_string(),
+                *OKX_WS_BATCH_ORDER_QUOTA,
+            ),
+            (
+                OKX_RATE_LIMIT_KEY_MASS_CANCEL[0].to_string(),
+                *OKX_WS_MASS_CANCEL_QUOTA,
+            ),
+            (OKX_RATE_LIMIT_KEY_AMEND[0].to_string(), *OKX_WS_ORDER_QUOTA),
+            (
+                OKX_RATE_LIMIT_KEY_BATCH_AMEND[0].to_string(),
+                *OKX_WS_BATCH_ORDER_QUOTA,
+            ),
+            (
+                OKX_RATE_LIMIT_KEY_ALGO_ORDER[0].to_string(),
+                *OKX_WS_ALGO_ORDER_QUOTA,
+            ),
+            (
+                OKX_RATE_LIMIT_KEY_ALGO_CANCEL[0].to_string(),
+                *OKX_WS_ALGO_CANCEL_QUOTA,
+            ),
+        ];
+
+        let client = WebSocketClient::builder()
+            .config(config)
+            .message_handler(message_handler)
+            .keyed_quotas(keyed_quotas)
+            .default_quota(*OKX_WS_CONNECTION_QUOTA)
+            .maybe_state_sink(self.socket_control.as_ref().map(|control| control.sink()))
+            .connect()
+            .await?;
+
+        client.set_auth_tracker(self.auth_tracker.clone(), false);
+        let ws_client = Arc::new(client);
+        let connection_epoch = ws_client.connection_epoch();
+
+        let connection_mode = ws_client.connection_mode_atomic();
+        let reconnect_handle = ws_client.reconnect_handle();
+
+        let (msg_tx, rx) = tokio::sync::mpsc::unbounded_channel::<OKXWsMessage>();
+
+        self.out_rx = Some(Arc::new(rx));
+
+        let (cmd_tx, cmd_rx) = tokio::sync::mpsc::unbounded_channel::<HandlerCommand>();
+
+        // Queue initialization before clones can subscribe through the new sender
+        cmd_tx
+            .send(HandlerCommand::SetClient(Arc::clone(&ws_client)))
+            .map_err(|e| anyhow::anyhow!("Failed to send WebSocket client to handler: {e}"))?;
+
+        *self.cmd_tx.write().await = cmd_tx.clone();
+
+        // Clones observing active must already see the initialized sender
+        self.connection_mode.store(connection_mode);
+
+        let handler_task = {
+            let auth_tracker = self.auth_tracker.clone();
+            let signal = self.signal.clone();
+            let subscriptions_state = self.subscriptions_state.clone();
+            let clock = self.clock;
+            let credential = self.credential.clone();
+            let cmd_tx_for_reconnect = cmd_tx.clone();
+            let subscriptions = self.subscriptions.clone();
+            let ws_client = Arc::clone(&ws_client);
+            let auth_timeout_secs = self.auth_timeout_secs;
+            let mut reconnect_epoch = connection_epoch;
+            let handler_spawner_for_auth = handler_spawner.clone();
+            let mut has_reconnected = false;
+
+            async move {
+                let mut handler = OKXWsFeedHandler::new(
+                    signal.clone(),
+                    cmd_rx,
+                    raw_rx,
+                    msg_tx,
+                    auth_tracker.clone(),
+                    credential.is_some(),
+                    subscriptions_state.clone(),
+                    subscriptions.clone(),
+                    clock,
+                );
+
+                let resubscribe_all = || {
+                    subscriptions
+                        .retain(|topic, _| is_topic_subscribed(&subscriptions_state, topic));
+
+                    let args = subscription_args(&subscriptions, &subscriptions_state);
+
+                    for chunk in subscription_arg_batches(&args) {
+                        if let Err(e) = cmd_tx_for_reconnect.send(HandlerCommand::Subscribe {
+                            args: chunk.to_vec(),
+                        }) {
+                            log::error!("Failed to send resubscribe command: error={e}");
+                        }
+                    }
+                };
+
+                loop {
+                    let message = tokio::select! {
+                        biased;
+                        () = handler_abort.cancelled() => {
+                            log::debug!("Handler task aborted");
+                            break;
+                        }
+                        message = handler.next() => message,
+                    };
+
+                    match message {
+                        Some(OKXWsMessage::Reconnected) => {
+                            let epoch = ws_client.connection_epoch();
+
+                            if !advance_reconnect_epoch(
+                                &mut reconnect_epoch,
+                                epoch,
+                                signal.load(Ordering::Acquire),
+                                ws_client.is_active(),
+                            ) {
+                                continue;
+                            }
+
+                            auth_tracker.invalidate();
+                            has_reconnected = true;
+
+                            subscriptions_state.reset_after_reconnect();
+
+                            if let Some(credential) = credential.clone() {
+                                log::debug!("Re-authenticating after reconnection");
+                                let signal = signal.clone();
+                                let abort = handler_abort.clone();
+                                let ws_client = Arc::clone(&ws_client);
+                                let auth_tracker = auth_tracker.clone();
+
+                                if let Err(e) = handler_spawner_for_auth.spawn(async move {
+                                    reauthenticate_session(
+                                        credential,
+                                        auth_tracker,
+                                        ws_client,
+                                        epoch,
+                                        clock,
+                                        auth_timeout_secs,
+                                        signal,
+                                        abort,
+                                    )
+                                    .await;
+                                }) {
+                                    log::error!(
+                                        "Failed to spawn re-authentication task: error={e}"
+                                    );
+                                }
+                            }
+
+                            // Unauthenticated sessions resubscribe immediately after reconnection,
+                            // authenticated sessions wait for Authenticated message
+                            if credential.is_none() {
+                                log::debug!(
+                                    "No authentication required, resubscribing immediately"
+                                );
+                                resubscribe_all();
+                            }
+
+                            // Forward Reconnected to consumers so they can reset state
+                            if handler.send(OKXWsMessage::Reconnected).is_err() {
+                                log_receiver_dropped(&signal, "Reconnected");
+                                break;
+                            }
+                        }
+                        Some(OKXWsMessage::Authenticated) => {
+                            if has_reconnected {
+                                resubscribe_all();
+                            }
+                        }
+                        Some(msg) => {
+                            if handler.send(msg).is_err() {
+                                log_receiver_dropped(&signal, "message");
+                                break;
+                            }
+                        }
+                        None => {
+                            if handler.is_stopped() {
+                                log::debug!("Stop signal received, ending message processing");
+                                break;
+                            }
+                            log::debug!("WebSocket stream closed");
+                            break;
+                        }
+                    }
+                }
+
+                log::debug!("Handler task exiting");
+            }
+        };
+
+        if let Err(e) = handler_spawner.spawn(handler_task) {
+            self.out_rx = None;
+            anyhow::bail!("Failed to register WebSocket handler task: {e}");
+        }
+
+        if let Some(control) = &self.socket_control {
+            control.register(move || reconnect_handle.request_reconnect());
+        }
+        log::debug!("Sent WebSocket client to handler");
+
+        if self.credential.is_some()
+            && let Err(e) = self.authenticate(&ws_client, connection_epoch).await
+        {
+            self.handler_tasks.begin_shutdown();
+            self.request_close().await;
+            let shutdown_result = self.close_stream_task(Duration::from_secs(2)).await;
+
+            if let Some(control) = &self.socket_control {
+                control.deregister();
+            }
+            self.out_rx = None;
+
+            match shutdown_result {
+                Ok(()) => anyhow::bail!("Authentication failed: {e}"),
+                Err(shutdown_error) => anyhow::bail!(
+                    "Authentication failed: {e}; handler shutdown failed: {shutdown_error}"
+                ),
+            }
+        }
+
+        rollback.disarm();
+        Ok(())
+    }
+
+    /// Authenticates the WebSocket session with OKX.
+    async fn authenticate(
+        &self,
+        ws_client: &WebSocketClient,
+        connection_epoch: u64,
+    ) -> Result<(), Error> {
+        let credential = self.credential.as_ref().ok_or_else(|| {
+            Error::Io(std::io::Error::other(
+                "API credentials not available to authenticate",
+            ))
+        })?;
+
+        match authenticate_session(
+            credential,
+            &self.auth_tracker,
+            ws_client,
+            connection_epoch,
+            self.clock,
+            self.auth_timeout_secs,
+        )
+        .await
+        {
+            Ok(()) => Ok(()),
+            Err(e) if auth_attempt_superseded(&e) => {
+                // A reconnect retry may have taken over this attempt. Wait for
+                // that login instead of tearing down a live authenticated socket.
+                if self
+                    .auth_tracker
+                    .wait_for_authenticated(Duration::from_secs(self.auth_timeout_secs))
+                    .await
+                {
+                    Ok(())
+                } else {
+                    Err(e)
+                }
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Provides the internal data stream as a channel-based stream.
+    ///
+    /// # Panics
+    ///
+    /// Panics if:
+    /// - The websocket is not connected.
+    /// - `stream_data` has already been called somewhere else (stream receiver is then taken).
+    pub fn stream(&mut self) -> impl Stream<Item = OKXWsMessage> + 'static {
+        let rx = self
+            .out_rx
+            .take()
+            .expect("Data stream receiver already taken or not connected");
+        let mut rx = Arc::try_unwrap(rx).expect("Cannot take ownership - other references exist");
+        async_stream::stream! {
+            while let Some(data) = rx.recv().await {
+                yield data;
+            }
+        }
+    }
+
+    /// Wait until the WebSocket connection is active.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the connection times out.
+    pub async fn wait_until_active(&self, timeout_secs: f64) -> Result<(), OKXWsError> {
+        let timeout = time::Duration::from_secs_f64(timeout_secs);
+
+        time::timeout(timeout, async {
+            while !self.is_active() {
+                time::sleep(time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .map_err(|_| {
+            OKXWsError::ClientError(format!(
+                "WebSocket connection timeout after {timeout_secs} seconds"
+            ))
+        })?;
+
+        Ok(())
+    }
+
+    pub(crate) fn begin_shutdown(&self) {
+        self.handler_tasks.begin_shutdown();
+        self.signal.store(true, Ordering::Release);
+
+        let handler_abort = self.handler_abort.lock().clone();
+        handler_abort.cancel();
+    }
+
+    /// Signals the handler to close without joining its task.
+    pub(crate) async fn request_close(&self) {
+        self.signal.store(true, Ordering::Release);
+
+        if let Err(e) = self.cmd_tx.read().await.send(HandlerCommand::Disconnect) {
+            log::debug!("Handler channel closed before disconnect command was sent: {e}");
+        } else {
+            log::debug!("Sent disconnect command to handler");
+        }
+    }
+
+    /// Closes the client.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if disconnecting the websocket or cleaning up the
+    /// client fails.
+    pub async fn close(&mut self) -> Result<(), Error> {
+        let connect_lock = Arc::clone(&self.connect_lock);
+        let _connect_guard = connect_lock.lock().await;
+
+        self.close_locked().await
+    }
+
+    async fn close_locked(&self) -> Result<(), Error> {
+        log::debug!("Starting close process");
+
+        self.handler_tasks.begin_shutdown();
+        self.request_close().await;
+
+        let task_result = self.close_stream_task(Duration::from_secs(2)).await;
+
+        // Wipe per-base-pair refcounts so a subsequent reconnect can re-arm
+        // the index-tickers channel. Otherwise the stale count short-circuits
+        // every future `subscribe_index_prices` call and the feed stays dark.
+        self.index_pair_subscribers.clear();
+
+        if let Some(control) = &self.socket_control {
+            control.deregister();
+        }
+
+        log::debug!("Close process completed");
+
+        task_result
+    }
+
+    async fn close_stream_task(&self, timeout: Duration) -> Result<(), Error> {
+        match self.handler_tasks.finish_shutdown(timeout, timeout).await {
+            Ok(()) => Ok(()),
+            Err(error @ TaskShutdownError::Timeout { .. }) => Err(Error::Io(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                format!("Timed out joining WebSocket handler task after abort: {error}"),
+            ))),
+            Err(e) => Err(Error::Io(std::io::Error::other(format!(
+                "WebSocket handler shutdown failed: {e}"
+            )))),
+        }
+    }
+
+    /// Returns active subscription channels for an instrument.
+    pub fn get_subscriptions(&self, instrument_id: InstrumentId) -> Vec<OKXWsChannel> {
+        let symbol = instrument_id.symbol.inner();
+        self.subscriptions
+            .iter()
+            .filter(|arg| arg.inst_id == Some(symbol))
+            .filter(|arg| is_topic_subscribed(&self.subscriptions_state, arg.key()))
+            .map(|arg| arg.channel.clone())
+            .collect()
+    }
+
+    fn generate_unique_request_id(&self) -> String {
+        self.request_id_counter
+            .fetch_add(1, Ordering::SeqCst)
+            .to_string()
+    }
+
+    async fn subscribe(&self, args: Vec<OKXSubscriptionArg>) -> Result<(), OKXWsError> {
+        // Send the command first; only update local state on success
+        self.cmd_tx
+            .read()
+            .await
+            .send(HandlerCommand::Subscribe { args: args.clone() })
+            .map_err(|e| {
+                OKXWsError::ClientError(format!("Failed to send subscribe command: {e}"))
+            })?;
+
+        self.record_subscriptions(&args);
+        Ok(())
+    }
+
+    fn record_subscriptions(&self, args: &[OKXSubscriptionArg]) {
+        for arg in args {
+            let topic = topic_from_subscription_arg(arg);
+            let entry = self
+                .subscriptions
+                .entry(topic.clone())
+                .or_insert_with(|| arg.clone());
+            self.subscriptions_state.mark_subscribe(&topic);
+            drop(entry);
+        }
+    }
+
+    async fn unsubscribe(&self, args: Vec<OKXSubscriptionArg>) -> Result<(), OKXWsError> {
+        self.cmd_tx
+            .read()
+            .await
+            .send(HandlerCommand::Unsubscribe { args: args.clone() })
+            .map_err(|e| {
+                OKXWsError::ClientError(format!("Failed to send unsubscribe command: {e}"))
+            })?;
+
+        for arg in &args {
+            let topic = topic_from_subscription_arg(arg);
+            self.subscriptions_state.mark_unsubscribe(&topic);
+        }
+
+        Ok(())
+    }
+
+    async fn subscribe_inst_id(
+        &self,
+        channel: OKXWsChannel,
+        inst_id: Ustr,
+    ) -> Result<(), OKXWsError> {
+        self.subscribe(vec![OKXSubscriptionArg {
+            channel,
+            inst_type: None,
+            inst_family: None,
+            inst_id: Some(inst_id),
+        }])
+        .await
+    }
+
+    async fn unsubscribe_inst_id(
+        &self,
+        channel: OKXWsChannel,
+        inst_id: Ustr,
+    ) -> Result<(), OKXWsError> {
+        self.unsubscribe(vec![OKXSubscriptionArg {
+            channel,
+            inst_type: None,
+            inst_family: None,
+            inst_id: Some(inst_id),
+        }])
+        .await
+    }
+
+    /// Unsubscribes from all active subscriptions in batched messages.
+    ///
+    /// Collects all confirmed subscriptions and sends unsubscribe requests in batches,
+    /// which is significantly more efficient than individual unsubscribes during disconnect.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the unsubscribe request fails to send.
+    pub async fn unsubscribe_all(&self) -> Result<(), OKXWsError> {
+        let all_args = subscription_args(&self.subscriptions, &self.subscriptions_state);
+
+        if all_args.is_empty() {
+            log::debug!("No active subscriptions to unsubscribe from");
+            return Ok(());
+        }
+
+        log::debug!("Batched unsubscribe from {} channels", all_args.len());
+
+        for chunk in subscription_arg_batches(&all_args) {
+            self.unsubscribe(chunk.to_vec()).await?;
+        }
+
+        // The index-pair refcount mirrors live subscriptions; after a bulk
+        // unsubscribe the venue knows nothing, so any retained count would
+        // wedge the next `subscribe_index_prices`.
+        self.index_pair_subscribers.clear();
+
+        Ok(())
+    }
+
+    /// Subscribes to instrument updates for a specific instrument type.
+    ///
+    /// Provides updates when instrument specifications change.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the subscription request fails.
+    ///
+    /// # References
+    ///
+    /// <https://www.okx.com/docs-v5/en/#public-data-websocket-instruments-channel>.
+    pub async fn subscribe_instruments(
+        &self,
+        instrument_type: OKXInstrumentType,
+    ) -> Result<(), OKXWsError> {
+        let arg = OKXSubscriptionArg {
+            channel: OKXWsChannel::Instruments,
+            inst_type: Some(instrument_type),
+            inst_family: None,
+            inst_id: None,
+        };
+        self.subscribe(vec![arg]).await
+    }
+
+    /// Subscribes to instrument updates for a specific instrument.
+    ///
+    /// Since OKX doesn't support subscribing to individual instruments via `instId`,
+    /// this method subscribes to the entire instrument type. OKX handles duplicate
+    /// subscriptions gracefully and pushes a fresh snapshot on each subscribe.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the subscription request fails.
+    ///
+    /// # References
+    ///
+    /// <https://www.okx.com/docs-v5/en/#public-data-websocket-instruments-channel>.
+    pub async fn subscribe_instrument(
+        &self,
+        instrument_id: InstrumentId,
+    ) -> Result<(), OKXWsError> {
+        let inst_type = okx_instrument_type_from_symbol(instrument_id.symbol.as_str());
+        log::debug!("Subscribing to instrument type {inst_type:?} for {instrument_id}");
+        self.subscribe_instruments(inst_type).await
+    }
+
+    /// Subscribes to order book data for an instrument.
+    ///
+    /// This is a convenience method that calls [`Self::subscribe_book_with_depth`] with depth 0,
+    /// which automatically selects the appropriate channel based on VIP level.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the subscription request fails.
+    pub async fn subscribe_book(&self, instrument_id: InstrumentId) -> anyhow::Result<()> {
+        self.subscribe_book_with_depth(instrument_id, 0).await
+    }
+
+    /// Subscribes to the Retail Price Improvement order book channel.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the subscription request fails.
+    pub async fn subscribe_book_rpi(&self, instrument_id: InstrumentId) -> Result<(), OKXWsError> {
+        self.subscribe_inst_id(OKXWsChannel::BooksRpi, instrument_id.symbol.inner())
+            .await
+    }
+
+    pub(crate) async fn subscribe_book_channel(
+        &self,
+        instrument_id: InstrumentId,
+        channel: OKXBookChannel,
+        cancel: CancellationToken,
+        gate: SnapshotGate,
+    ) -> Result<(), OKXWsError> {
+        let (completion, receiver) = tokio::sync::oneshot::channel();
+        let sender = self.cmd_tx.read().await;
+
+        if cancel.is_cancelled() {
+            return Ok(());
+        }
+
+        let subscription = OKXSubscriptionArg {
+            channel: ws_channel_for_book(channel),
+            inst_type: None,
+            inst_family: None,
+            inst_id: Some(instrument_id.symbol.inner()),
+        };
+
+        self.record_subscriptions(std::slice::from_ref(&subscription));
+        sender
+            .send(HandlerCommand::SubscribeBook {
+                subscription,
+                cancel: cancel.clone(),
+                gate,
+                completion,
+            })
+            .map_err(|e| OKXWsError::HandlerUnavailable(e.to_string()))?;
+
+        drop(sender);
+        tokio::select! {
+            biased;
+            () = cancel.cancelled() => Ok(()),
+            result = receiver => result.map_err(|e| OKXWsError::HandlerUnavailable(e.to_string()))?,
+        }
+    }
+
+    /// Requests a fresh snapshot by replacing the current incremental book subscription.
+    pub(crate) async fn resubscribe_book_channel(
+        &self,
+        instrument_id: InstrumentId,
+        channel: OKXBookChannel,
+        cancel: CancellationToken,
+        gate: SnapshotGate,
+    ) -> Result<(), OKXWsError> {
+        let (completion, receiver) = tokio::sync::oneshot::channel();
+        let sender = self.cmd_tx.read().await;
+
+        if cancel.is_cancelled() {
+            return Err(OKXWsError::ClientError("Book recovery canceled".into()));
+        }
+
+        sender
+            .send(HandlerCommand::Resubscribe {
+                subscription: OKXSubscriptionArg {
+                    channel: ws_channel_for_book(channel),
+                    inst_type: None,
+                    inst_family: None,
+                    inst_id: Some(instrument_id.symbol.inner()),
+                },
+                cancel,
+                gate,
+                completion,
+            })
+            .map_err(|e| OKXWsError::HandlerUnavailable(e.to_string()))?;
+
+        drop(sender);
+        receiver
+            .await
+            .map_err(|e| OKXWsError::HandlerUnavailable(e.to_string()))?
+    }
+
+    /// Subscribes to 5-level order book snapshot data for an instrument.
+    ///
+    /// Updates every 100ms when there are changes.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the subscription request fails.
+    ///
+    /// # References
+    ///
+    /// <https://www.okx.com/docs-v5/en/#order-book-trading-market-data-ws-order-book-5-depth-channel>.
+    pub async fn subscribe_book_depth5(
+        &self,
+        instrument_id: InstrumentId,
+    ) -> Result<(), OKXWsError> {
+        self.subscribe_inst_id(OKXWsChannel::Books5, instrument_id.symbol.inner())
+            .await
+    }
+
+    /// Subscribes to 50-level tick-by-tick order book data for an instrument.
+    ///
+    /// Provides real-time updates whenever order book changes.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the subscription request fails.
+    ///
+    /// # References
+    ///
+    /// <https://www.okx.com/docs-v5/en/#order-book-trading-market-data-ws-order-book-50-depth-tbt-channel>.
+    pub async fn subscribe_book50_l2_tbt(
+        &self,
+        instrument_id: InstrumentId,
+    ) -> Result<(), OKXWsError> {
+        self.subscribe_inst_id(OKXWsChannel::Books50Tbt, instrument_id.symbol.inner())
+            .await
+    }
+
+    /// Subscribes to tick-by-tick full depth (400 levels) order book data for an instrument.
+    ///
+    /// Provides real-time updates with all depth levels whenever order book changes.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the subscription request fails.
+    ///
+    /// # References
+    ///
+    /// <https://www.okx.com/docs-v5/en/#order-book-trading-market-data-ws-order-book-400-depth-tbt-channel>.
+    pub async fn subscribe_book_l2_tbt(
+        &self,
+        instrument_id: InstrumentId,
+    ) -> Result<(), OKXWsError> {
+        self.subscribe_inst_id(OKXWsChannel::BooksTbt, instrument_id.symbol.inner())
+            .await
+    }
+
+    /// Subscribes to order book data with automatic channel selection based on VIP level and depth.
+    ///
+    /// Selects the optimal channel based on user's VIP tier and requested depth:
+    /// - depth 50: Requires VIP4+, subscribes to `books50-l2-tbt`
+    /// - depth 0 or 400:
+    ///   - VIP4+: subscribes to `books-l2-tbt` (400 depth, fastest)
+    ///   - Below VIP4: subscribes to `books` (standard depth)
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if:
+    /// - Subscription request fails.
+    /// - Depth is 50 but VIP level is below 4.
+    pub async fn subscribe_book_with_depth(
+        &self,
+        instrument_id: InstrumentId,
+        depth: u16,
+    ) -> anyhow::Result<()> {
+        let vip = self.vip_level();
+
+        if !matches!(depth, 0 | 50 | 400) {
+            anyhow::bail!("Invalid depth {depth}, must be 0, 50, or 400");
+        }
+
+        if depth == 50 && vip < OKXVipLevel::Vip4 {
+            anyhow::bail!("VIP level {vip} insufficient for 50 depth subscription (requires VIP4)");
+        }
+
+        let channel = select_book_channel(depth as usize, vip);
+        self.subscribe_inst_id(ws_channel_for_book(channel), instrument_id.symbol.inner())
+            .await?;
+        Ok(())
+    }
+
+    /// Subscribes to best bid/ask quote data for an instrument.
+    ///
+    /// Provides tick-by-tick updates of the best bid and ask prices using the bbo-tbt channel.
+    /// Supports all instrument types: SPOT, MARGIN, SWAP, FUTURES, OPTION.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the subscription request fails.
+    ///
+    /// # References
+    ///
+    /// <https://www.okx.com/docs-v5/en/#order-book-trading-market-data-ws-best-bid-offer-channel>.
+    pub async fn subscribe_quotes(&self, instrument_id: InstrumentId) -> Result<(), OKXWsError> {
+        self.subscribe_inst_id(OKXWsChannel::BboTbt, instrument_id.symbol.inner())
+            .await
+    }
+
+    /// Subscribes to trade data for an instrument.
+    ///
+    /// When `aggregated` is `false`, subscribes to the `trades` channel, where one update can
+    /// aggregate several trades. When `aggregated` is `true`, subscribes to the `trades-all`
+    /// channel, where each update carries one trade.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the subscription request fails.
+    ///
+    /// # References
+    ///
+    /// <https://www.okx.com/docs-v5/en/#order-book-trading-market-data-ws-trades-channel>.
+    /// <https://www.okx.com/docs-v5/en/#order-book-trading-market-data-ws-all-trades-channel>.
+    pub async fn subscribe_trades(
+        &self,
+        instrument_id: InstrumentId,
+        aggregated: bool,
+    ) -> Result<(), OKXWsError> {
+        let channel = if aggregated {
+            OKXWsChannel::TradesAll
+        } else {
+            OKXWsChannel::Trades
+        };
+        self.subscribe_inst_id(channel, instrument_id.symbol.inner())
+            .await
+    }
+
+    /// Subscribes to 24hr rolling ticker data for an instrument.
+    ///
+    /// Updates every 100ms with trading statistics.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the subscription request fails.
+    ///
+    /// # References
+    ///
+    /// <https://www.okx.com/docs-v5/en/#order-book-trading-market-data-ws-tickers-channel>.
+    pub async fn subscribe_ticker(&self, instrument_id: InstrumentId) -> Result<(), OKXWsError> {
+        self.subscribe_inst_id(OKXWsChannel::Tickers, instrument_id.symbol.inner())
+            .await
+    }
+
+    /// Subscribes to mark price data for derivatives instruments.
+    ///
+    /// Updates every 200ms for perpetual swaps, or at settlement for futures.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the subscription request fails.
+    ///
+    /// # References
+    ///
+    /// <https://www.okx.com/docs-v5/en/#public-data-websocket-mark-price-channel>.
+    pub async fn subscribe_mark_prices(
+        &self,
+        instrument_id: InstrumentId,
+    ) -> Result<(), OKXWsError> {
+        self.subscribe_inst_id(OKXWsChannel::MarkPrice, instrument_id.symbol.inner())
+            .await
+    }
+
+    /// Subscribes to index price data for an instrument.
+    ///
+    /// Updates every second with the underlying index price.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the subscription request fails.
+    ///
+    /// # References
+    ///
+    /// <https://www.okx.com/docs-v5/en/#public-data-websocket-index-tickers-channel>.
+    pub async fn subscribe_index_prices(
+        &self,
+        instrument_id: InstrumentId,
+    ) -> Result<(), OKXWsError> {
+        // Index-tickers channel requires base pair format (e.g., BTC-USDT)
+        let symbol = instrument_id.symbol.inner();
+        let (base, quote) = parse_base_quote_from_symbol(symbol.as_str())
+            .map_err(|e| OKXWsError::ClientError(e.to_string()))?;
+        let base_pair = Ustr::from(&format!("{base}-{quote}"));
+
+        // Hold the transition lock across both the refcount update and the
+        // venue send so a concurrent `unsubscribe_index_prices` cannot
+        // observe a transient 0 state between our decrement and the venue
+        // unsubscribe, or vice versa. Without this, contract rolls can
+        // leave the venue unsubscribed while the local count says active.
+        let _guard = self.index_pair_transition.lock().await;
+
+        // Bump the per-base-pair refcount so a later unsubscribe can decide
+        // whether it is the last subscriber. Only the 0→1 transition fires
+        // a venue subscribe; subsequent callers piggy-back on the existing
+        // channel.
+        let is_first = {
+            let mut count = self.index_pair_subscribers.entry(base_pair).or_insert(0);
+            *count += 1;
+            *count == 1
+        };
+
+        if !is_first {
+            return Ok(());
+        }
+
+        let arg = OKXSubscriptionArg {
+            channel: OKXWsChannel::IndexTickers,
+            inst_type: None,
+            inst_family: None,
+            inst_id: Some(base_pair),
+        };
+
+        match self.subscribe(vec![arg]).await {
+            Ok(()) => Ok(()),
+            Err(e) => {
+                // When the venue subscribe fails there is no live channel,
+                // even though other local callers may have piggy-backed on
+                // the in-flight attempt (they saw `!is_first` and returned
+                // `Ok`). Removing the entry entirely ensures the next
+                // caller re-enters the 0→1 branch and re-arms the venue
+                // subscription; a mere decrement would leave the map at 1+
+                // without a matching feed and every later subscribe would
+                // short-circuit into a silent no-op.
+                self.index_pair_subscribers.remove(&base_pair);
+                Err(e)
+            }
+        }
+    }
+
+    /// Subscribes to option summary data for an instrument family.
+    ///
+    /// Streams greeks (delta, gamma, vega, theta), implied volatility, and other
+    /// option metrics for all instruments in the specified family.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the subscription request fails.
+    ///
+    /// # References
+    ///
+    /// <https://www.okx.com/docs-v5/en/#public-data-websocket-option-summary-channel>.
+    pub async fn subscribe_option_summary(&self, inst_family: Ustr) -> Result<(), OKXWsError> {
+        let arg = OKXSubscriptionArg {
+            channel: OKXWsChannel::OptionSummary,
+            inst_type: None,
+            inst_family: Some(inst_family),
+            inst_id: None,
+        };
+        self.subscribe(vec![arg]).await
+    }
+
+    /// Subscribes to event contract market updates.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the subscription request fails.
+    ///
+    /// # References
+    ///
+    /// <https://www.okx.com/docs-v5/en/#public-data-websocket-event-contract-markets-channel>.
+    pub async fn subscribe_event_contract_markets(&self) -> Result<(), OKXWsError> {
+        let arg = OKXSubscriptionArg {
+            channel: OKXWsChannel::EventContractMarkets,
+            inst_type: Some(OKXInstrumentType::Events),
+            inst_family: None,
+            inst_id: None,
+        };
+        self.subscribe(vec![arg]).await
+    }
+
+    /// Returns a reference to the option greeks subscription map.
+    ///
+    /// The map stores the set of greeks conventions to emit for each subscribed instrument.
+    pub fn option_greeks_subs(&self) -> &Arc<AtomicMap<InstrumentId, AHashSet<OKXGreeksType>>> {
+        &self.option_greeks_subs
+    }
+
+    /// Adds an instrument to the option greeks subscription filter, emitting both
+    /// Black-Scholes and price-adjusted greeks.
+    pub fn add_option_greeks_sub(&self, instrument_id: InstrumentId) {
+        let both: AHashSet<OKXGreeksType> =
+            [OKXGreeksType::Bs, OKXGreeksType::Pa].into_iter().collect();
+        self.option_greeks_subs.insert(instrument_id, both);
+    }
+
+    /// Adds an instrument to the option greeks subscription filter with an explicit
+    /// set of greeks conventions to emit. An empty set is treated as "emit both".
+    pub fn add_option_greeks_sub_with_conventions(
+        &self,
+        instrument_id: InstrumentId,
+        conventions: AHashSet<OKXGreeksType>,
+    ) {
+        let set = if conventions.is_empty() {
+            [OKXGreeksType::Bs, OKXGreeksType::Pa].into_iter().collect()
+        } else {
+            conventions
+        };
+        self.option_greeks_subs.insert(instrument_id, set);
+    }
+
+    /// Removes an instrument from the option greeks subscription filter.
+    pub fn remove_option_greeks_sub(&self, instrument_id: &InstrumentId) {
+        self.option_greeks_subs.remove(instrument_id);
+    }
+
+    /// Subscribes to funding rate data for perpetual swap instruments.
+    ///
+    /// Updates when funding rate changes or at funding intervals.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the subscription request fails.
+    ///
+    /// # References
+    ///
+    /// <https://www.okx.com/docs-v5/en/#public-data-websocket-funding-rate-channel>.
+    pub async fn subscribe_funding_rates(
+        &self,
+        instrument_id: InstrumentId,
+    ) -> Result<(), OKXWsError> {
+        self.subscribe_inst_id(OKXWsChannel::FundingRate, instrument_id.symbol.inner())
+            .await
+    }
+
+    /// Subscribes to candlestick/bar data for an instrument.
+    ///
+    /// Supports various time intervals from 1s to 3M.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the subscription request fails.
+    ///
+    /// # References
+    ///
+    /// <https://www.okx.com/docs-v5/en/#order-book-trading-market-data-ws-candlesticks-channel>.
+    pub async fn subscribe_bars(&self, bar_type: BarType) -> Result<(), OKXWsError> {
+        // Use regular trade-price candlesticks which work for all instrument types
+        let channel = bar_spec_as_okx_channel(bar_type.spec())
+            .map_err(|e| OKXWsError::ClientError(e.to_string()))?;
+        self.subscribe_inst_id(channel, bar_type.instrument_id().symbol.inner())
+            .await
+    }
+
+    /// Unsubscribes from instrument updates for a specific instrument type.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the subscription request fails.
+    pub async fn unsubscribe_instruments(
+        &self,
+        instrument_type: OKXInstrumentType,
+    ) -> Result<(), OKXWsError> {
+        let arg = OKXSubscriptionArg {
+            channel: OKXWsChannel::Instruments,
+            inst_type: Some(instrument_type),
+            inst_family: None,
+            inst_id: None,
+        };
+        self.unsubscribe(vec![arg]).await
+    }
+
+    /// Unsubscribe from instrument updates for a specific instrument.
+    ///
+    /// No-op: the instruments channel is per-type (SWAP, FUTURES, etc.) and
+    /// other instruments of the same type may still need it. The channel
+    /// stays subscribed; overhead is negligible.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the unsubscription request fails.
+    #[allow(
+        clippy::unused_async,
+        clippy::unused_async_trait_impl,
+        reason = "async signature is kept for parity with the other unsubscribe methods and callers"
+    )]
+    pub async fn unsubscribe_instrument(
+        &self,
+        instrument_id: InstrumentId,
+    ) -> Result<(), OKXWsError> {
+        log::debug!("Instrument unsubscribe is a no-op (shared per-type channel): {instrument_id}");
+        Ok(())
+    }
+
+    /// Unsubscribe from full order book data for an instrument.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the subscription request fails.
+    pub async fn unsubscribe_book(&self, instrument_id: InstrumentId) -> Result<(), OKXWsError> {
+        self.unsubscribe_inst_id(OKXWsChannel::Books, instrument_id.symbol.inner())
+            .await
+    }
+
+    /// Unsubscribe from Retail Price Improvement order book data for an instrument.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the unsubscription request fails.
+    pub async fn unsubscribe_book_rpi(
+        &self,
+        instrument_id: InstrumentId,
+    ) -> Result<(), OKXWsError> {
+        self.unsubscribe_inst_id(OKXWsChannel::BooksRpi, instrument_id.symbol.inner())
+            .await
+    }
+
+    /// Unsubscribe from 5-level order book snapshot data for an instrument.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the subscription request fails.
+    pub async fn unsubscribe_book_depth5(
+        &self,
+        instrument_id: InstrumentId,
+    ) -> Result<(), OKXWsError> {
+        self.unsubscribe_inst_id(OKXWsChannel::Books5, instrument_id.symbol.inner())
+            .await
+    }
+
+    /// Unsubscribe from 50-level tick-by-tick order book data for an instrument.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the subscription request fails.
+    pub async fn unsubscribe_book50_l2_tbt(
+        &self,
+        instrument_id: InstrumentId,
+    ) -> Result<(), OKXWsError> {
+        self.unsubscribe_inst_id(OKXWsChannel::Books50Tbt, instrument_id.symbol.inner())
+            .await
+    }
+
+    /// Unsubscribe from tick-by-tick full depth order book data for an instrument.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the subscription request fails.
+    pub async fn unsubscribe_book_l2_tbt(
+        &self,
+        instrument_id: InstrumentId,
+    ) -> Result<(), OKXWsError> {
+        self.unsubscribe_inst_id(OKXWsChannel::BooksTbt, instrument_id.symbol.inner())
+            .await
+    }
+
+    /// Unsubscribe from best bid/ask quote data for an instrument.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the subscription request fails.
+    pub async fn unsubscribe_quotes(&self, instrument_id: InstrumentId) -> Result<(), OKXWsError> {
+        self.unsubscribe_inst_id(OKXWsChannel::BboTbt, instrument_id.symbol.inner())
+            .await
+    }
+
+    /// Unsubscribe from 24hr rolling ticker data for an instrument.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the subscription request fails.
+    pub async fn unsubscribe_ticker(&self, instrument_id: InstrumentId) -> Result<(), OKXWsError> {
+        self.unsubscribe_inst_id(OKXWsChannel::Tickers, instrument_id.symbol.inner())
+            .await
+    }
+
+    /// Unsubscribe from mark price data for a derivatives instrument.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the subscription request fails.
+    pub async fn unsubscribe_mark_prices(
+        &self,
+        instrument_id: InstrumentId,
+    ) -> Result<(), OKXWsError> {
+        self.unsubscribe_inst_id(OKXWsChannel::MarkPrice, instrument_id.symbol.inner())
+            .await
+    }
+
+    /// Unsubscribe from index price data for the base pair derived from
+    /// `instrument_id`.
+    ///
+    /// Refcounting is handled internally so any caller (Rust data client,
+    /// Python wrapper, etc.) can pair every `subscribe_index_prices` with
+    /// exactly one `unsubscribe_index_prices`. The OKX `index-tickers`
+    /// channel is keyed by base pair (e.g. `BTC-USDT`), so the venue
+    /// unsubscribe only fires when the last subscriber for that pair drops.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the unsubscription request fails.
+    pub async fn unsubscribe_index_prices(
+        &self,
+        instrument_id: InstrumentId,
+    ) -> Result<(), OKXWsError> {
+        let symbol = instrument_id.symbol.inner();
+        let (base, quote) = parse_base_quote_from_symbol(symbol.as_str())
+            .map_err(|e| OKXWsError::ClientError(e.to_string()))?;
+        let base_pair = Ustr::from(&format!("{base}-{quote}"));
+
+        // Serialize with any concurrent `subscribe_index_prices` on the same
+        // base pair. See the subscribe path for the race this prevents.
+        let _guard = self.index_pair_transition.lock().await;
+
+        let is_last = {
+            let Some(mut count) = self.index_pair_subscribers.get_mut(&base_pair) else {
+                // No matching subscriber recorded; nothing to do.
+                return Ok(());
+            };
+            *count = count.saturating_sub(1);
+            *count == 0
+        };
+
+        if !is_last {
+            return Ok(());
+        }
+
+        self.index_pair_subscribers
+            .remove_if(&base_pair, |_, count| *count == 0);
+
+        let arg = OKXSubscriptionArg {
+            channel: OKXWsChannel::IndexTickers,
+            inst_type: None,
+            inst_family: None,
+            inst_id: Some(base_pair),
+        };
+        self.unsubscribe(vec![arg]).await
+    }
+
+    /// Unsubscribe from option summary data for an instrument family.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the unsubscription request fails.
+    pub async fn unsubscribe_option_summary(&self, inst_family: Ustr) -> Result<(), OKXWsError> {
+        let arg = OKXSubscriptionArg {
+            channel: OKXWsChannel::OptionSummary,
+            inst_type: None,
+            inst_family: Some(inst_family),
+            inst_id: None,
+        };
+        self.unsubscribe(vec![arg]).await
+    }
+
+    /// Unsubscribes from event contract market updates.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the unsubscription request fails.
+    pub async fn unsubscribe_event_contract_markets(&self) -> Result<(), OKXWsError> {
+        let arg = OKXSubscriptionArg {
+            channel: OKXWsChannel::EventContractMarkets,
+            inst_type: Some(OKXInstrumentType::Events),
+            inst_family: None,
+            inst_id: None,
+        };
+        self.unsubscribe(vec![arg]).await
+    }
+
+    /// Unsubscribe from funding rate data for a perpetual swap instrument.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the subscription request fails.
+    pub async fn unsubscribe_funding_rates(
+        &self,
+        instrument_id: InstrumentId,
+    ) -> Result<(), OKXWsError> {
+        self.unsubscribe_inst_id(OKXWsChannel::FundingRate, instrument_id.symbol.inner())
+            .await
+    }
+
+    /// Unsubscribe from trade data for an instrument.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the subscription request fails.
+    pub async fn unsubscribe_trades(
+        &self,
+        instrument_id: InstrumentId,
+        aggregated: bool,
+    ) -> Result<(), OKXWsError> {
+        let channel = if aggregated {
+            OKXWsChannel::TradesAll
+        } else {
+            OKXWsChannel::Trades
+        };
+        self.unsubscribe_inst_id(channel, instrument_id.symbol.inner())
+            .await
+    }
+
+    /// Unsubscribe from candlestick/bar data for an instrument.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the subscription request fails.
+    pub async fn unsubscribe_bars(&self, bar_type: BarType) -> Result<(), OKXWsError> {
+        let channel = bar_spec_as_okx_channel(bar_type.spec())
+            .map_err(|e| OKXWsError::ClientError(e.to_string()))?;
+        self.unsubscribe_inst_id(channel, bar_type.instrument_id().symbol.inner())
+            .await
+    }
+
+    /// Subscribes to order updates for the given instrument type.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the subscription request fails.
+    pub async fn subscribe_orders(
+        &self,
+        instrument_type: OKXInstrumentType,
+    ) -> Result<(), OKXWsError> {
+        let arg = OKXSubscriptionArg {
+            channel: OKXWsChannel::Orders,
+            inst_type: Some(instrument_type),
+            inst_family: None,
+            inst_id: None,
+        };
+        self.subscribe(vec![arg]).await
+    }
+
+    /// Unsubscribes from order updates for the given instrument type.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the subscription request fails.
+    pub async fn unsubscribe_orders(
+        &self,
+        instrument_type: OKXInstrumentType,
+    ) -> Result<(), OKXWsError> {
+        let arg = OKXSubscriptionArg {
+            channel: OKXWsChannel::Orders,
+            inst_type: Some(instrument_type),
+            inst_family: None,
+            inst_id: None,
+        };
+        self.unsubscribe(vec![arg]).await
+    }
+
+    /// Subscribes to Nitro spread order updates.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the subscription request fails.
+    pub async fn subscribe_spread_orders(&self) -> Result<(), OKXWsError> {
+        let arg = OKXSubscriptionArg {
+            channel: OKXWsChannel::SprdOrders,
+            inst_type: None,
+            inst_family: None,
+            inst_id: None,
+        };
+        self.subscribe(vec![arg]).await
+    }
+
+    /// Unsubscribes from Nitro spread order updates.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the subscription request fails.
+    pub async fn unsubscribe_spread_orders(&self) -> Result<(), OKXWsError> {
+        let arg = OKXSubscriptionArg {
+            channel: OKXWsChannel::SprdOrders,
+            inst_type: None,
+            inst_family: None,
+            inst_id: None,
+        };
+        self.unsubscribe(vec![arg]).await
+    }
+
+    /// Subscribes to best bid/offer quotes for a spread instrument (`sprd-bbo-tbt`).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the subscription request fails.
+    pub async fn subscribe_spread_quotes(
+        &self,
+        instrument_id: InstrumentId,
+    ) -> Result<(), OKXWsError> {
+        self.subscribe_inst_id(OKXWsChannel::SprdBboTbt, instrument_id.symbol.inner())
+            .await
+    }
+
+    /// Subscribes to 5-level book snapshots for a spread instrument (`sprd-books5`).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the subscription request fails.
+    pub async fn subscribe_spread_book(
+        &self,
+        instrument_id: InstrumentId,
+    ) -> Result<(), OKXWsError> {
+        self.subscribe_inst_id(OKXWsChannel::SprdBooks5, instrument_id.symbol.inner())
+            .await
+    }
+
+    /// Subscribes to public trades for a spread instrument (`sprd-public-trades`).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the subscription request fails.
+    pub async fn subscribe_spread_trades(
+        &self,
+        instrument_id: InstrumentId,
+    ) -> Result<(), OKXWsError> {
+        self.subscribe_inst_id(OKXWsChannel::SprdPublicTrades, instrument_id.symbol.inner())
+            .await
+    }
+
+    /// Unsubscribes from spread quotes (`sprd-bbo-tbt`).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the unsubscribe request fails.
+    pub async fn unsubscribe_spread_quotes(
+        &self,
+        instrument_id: InstrumentId,
+    ) -> Result<(), OKXWsError> {
+        self.unsubscribe_inst_id(OKXWsChannel::SprdBboTbt, instrument_id.symbol.inner())
+            .await
+    }
+
+    /// Unsubscribes from spread book snapshots (`sprd-books5`).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the unsubscribe request fails.
+    pub async fn unsubscribe_spread_book(
+        &self,
+        instrument_id: InstrumentId,
+    ) -> Result<(), OKXWsError> {
+        self.unsubscribe_inst_id(OKXWsChannel::SprdBooks5, instrument_id.symbol.inner())
+            .await
+    }
+
+    /// Unsubscribes from spread public trades (`sprd-public-trades`).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the unsubscribe request fails.
+    pub async fn unsubscribe_spread_trades(
+        &self,
+        instrument_id: InstrumentId,
+    ) -> Result<(), OKXWsError> {
+        self.unsubscribe_inst_id(OKXWsChannel::SprdPublicTrades, instrument_id.symbol.inner())
+            .await
+    }
+
+    /// Subscribes to algo order updates for the given instrument type.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the subscription request fails.
+    pub async fn subscribe_orders_algo(
+        &self,
+        instrument_type: OKXInstrumentType,
+    ) -> Result<(), OKXWsError> {
+        let arg = OKXSubscriptionArg {
+            channel: OKXWsChannel::OrdersAlgo,
+            inst_type: Some(instrument_type),
+            inst_family: None,
+            inst_id: None,
+        };
+        self.subscribe(vec![arg]).await
+    }
+
+    /// Unsubscribes from algo order updates for the given instrument type.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the subscription request fails.
+    pub async fn unsubscribe_orders_algo(
+        &self,
+        instrument_type: OKXInstrumentType,
+    ) -> Result<(), OKXWsError> {
+        let arg = OKXSubscriptionArg {
+            channel: OKXWsChannel::OrdersAlgo,
+            inst_type: Some(instrument_type),
+            inst_family: None,
+            inst_id: None,
+        };
+        self.unsubscribe(vec![arg]).await
+    }
+
+    /// Subscribes to advance algo order updates (trailing stops, iceberg, twap).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the subscription request fails.
+    pub async fn subscribe_algo_advance(
+        &self,
+        instrument_type: OKXInstrumentType,
+    ) -> Result<(), OKXWsError> {
+        let arg = OKXSubscriptionArg {
+            channel: OKXWsChannel::AlgoAdvance,
+            inst_type: Some(instrument_type),
+            inst_family: None,
+            inst_id: None,
+        };
+        self.subscribe(vec![arg]).await
+    }
+
+    /// Unsubscribes from advance algo order updates.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the subscription request fails.
+    pub async fn unsubscribe_algo_advance(
+        &self,
+        instrument_type: OKXInstrumentType,
+    ) -> Result<(), OKXWsError> {
+        let arg = OKXSubscriptionArg {
+            channel: OKXWsChannel::AlgoAdvance,
+            inst_type: Some(instrument_type),
+            inst_family: None,
+            inst_id: None,
+        };
+        self.unsubscribe(vec![arg]).await
+    }
+
+    /// Subscribes to account balance updates.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the subscription request fails.
+    pub async fn subscribe_account(&self) -> Result<(), OKXWsError> {
+        let arg = OKXSubscriptionArg {
+            channel: OKXWsChannel::Account,
+            inst_type: None,
+            inst_family: None,
+            inst_id: None,
+        };
+        self.subscribe(vec![arg]).await
+    }
+
+    /// Unsubscribes from account balance updates.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the subscription request fails.
+    pub async fn unsubscribe_account(&self) -> Result<(), OKXWsError> {
+        let arg = OKXSubscriptionArg {
+            channel: OKXWsChannel::Account,
+            inst_type: None,
+            inst_family: None,
+            inst_id: None,
+        };
+        self.unsubscribe(vec![arg]).await
+    }
+
+    /// Subscribes to position updates for a specific instrument type.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the subscription request fails.
+    ///
+    /// # References
+    ///
+    /// <https://www.okx.com/docs-v5/en/#websocket-api-private-channel-positions-channel>
+    pub async fn subscribe_positions(
+        &self,
+        inst_type: OKXInstrumentType,
+    ) -> Result<(), OKXWsError> {
+        let arg = OKXSubscriptionArg {
+            channel: OKXWsChannel::Positions,
+            inst_type: Some(inst_type),
+            inst_family: None,
+            inst_id: None,
+        };
+        self.subscribe(vec![arg]).await
+    }
+
+    /// Unsubscribes from position updates for a specific instrument type.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the subscription request fails.
+    pub async fn unsubscribe_positions(
+        &self,
+        inst_type: OKXInstrumentType,
+    ) -> Result<(), OKXWsError> {
+        let arg = OKXSubscriptionArg {
+            channel: OKXWsChannel::Positions,
+            inst_type: Some(inst_type),
+            inst_family: None,
+            inst_id: None,
+        };
+        self.unsubscribe(vec![arg]).await
+    }
+
+    /// Subscribes to liquidation risk warnings for the given instrument type.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the subscription request fails.
+    ///
+    /// # References
+    ///
+    /// <https://www.okx.com/docs-v5/en/#trading-account-websocket-liquidation-warning-channel>
+    pub async fn subscribe_liquidation_warning(
+        &self,
+        instrument_type: OKXInstrumentType,
+    ) -> Result<(), OKXWsError> {
+        let arg = OKXSubscriptionArg {
+            channel: OKXWsChannel::LiquidationWarning,
+            inst_type: Some(instrument_type),
+            inst_family: None,
+            inst_id: None,
+        };
+        self.subscribe(vec![arg]).await
+    }
+
+    /// Unsubscribes from liquidation risk warnings for the given instrument type.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the unsubscription request fails.
+    pub async fn unsubscribe_liquidation_warning(
+        &self,
+        instrument_type: OKXInstrumentType,
+    ) -> Result<(), OKXWsError> {
+        let arg = OKXSubscriptionArg {
+            channel: OKXWsChannel::LiquidationWarning,
+            inst_type: Some(instrument_type),
+            inst_family: None,
+            inst_id: None,
+        };
+        self.unsubscribe(vec![arg]).await
+    }
+
+    /// Place multiple orders in a single batch via WebSocket.
+    ///
+    /// # References
+    ///
+    /// <https://www.okx.com/docs-v5/en/#order-book-trading-websocket-batch-orders>
+    async fn ws_batch_place_orders(
+        &self,
+        args: Vec<Value>,
+        client_order_ids: Vec<ClientOrderId>,
+    ) -> Result<(), OKXWsError> {
+        let request_id = self.generate_unique_request_id();
+        let request = OKXWsRequest::<Value> {
+            id: Some(request_id.clone()),
+            op: super::enums::OKXWsOperation::BatchOrders,
+            exp_time: self.order_request_exp_time(),
+            args,
+        };
+
+        let payload = serde_json::to_string(&request)
+            .map_err(|e| OKXWsError::JsonError(format!("Failed to serialize batch orders: {e}")))?;
+
+        let cmd = HandlerCommand::Send {
+            payload,
+            rate_limit_keys: Some(OKX_RATE_LIMIT_KEY_BATCH_ORDER.to_vec()),
+            request_id: Some(request_id),
+            client_order_ids,
+            op: Some(super::enums::OKXWsOperation::BatchOrders),
+        };
+
+        self.send_cmd(cmd).await
+    }
+
+    /// Cancel multiple orders in a single batch via WebSocket.
+    ///
+    /// # References
+    ///
+    /// <https://www.okx.com/docs-v5/en/#order-book-trading-websocket-batch-cancel-orders>
+    async fn ws_batch_cancel_orders(
+        &self,
+        args: Vec<Value>,
+        client_order_ids: Vec<ClientOrderId>,
+        causation_ids: Vec<(ClientOrderId, UUID4)>,
+    ) -> Result<(), OKXWsError> {
+        let request_id = self.generate_unique_request_id();
+        let request = OKXWsRequest::<Value> {
+            id: Some(request_id.clone()),
+            op: super::enums::OKXWsOperation::BatchCancelOrders,
+            exp_time: None,
+            args,
+        };
+
+        let payload = serde_json::to_string(&request)
+            .map_err(|e| OKXWsError::JsonError(format!("Failed to serialize batch cancel: {e}")))?;
+
+        if !causation_ids.is_empty() {
+            self.pending_command_ids
+                .insert(request_id.clone(), causation_ids);
+        }
+
+        let cmd = HandlerCommand::Send {
+            payload,
+            rate_limit_keys: Some(OKX_RATE_LIMIT_KEY_BATCH_CANCEL.to_vec()),
+            request_id: Some(request_id.clone()),
+            client_order_ids,
+            op: Some(super::enums::OKXWsOperation::BatchCancelOrders),
+        };
+
+        let result = self.send_cmd(cmd).await;
+        if result.is_err() {
+            self.pending_command_ids.remove(&request_id);
+        }
+
+        result
+    }
+
+    /// Amend multiple orders in a single batch via WebSocket.
+    ///
+    /// # References
+    ///
+    /// <https://www.okx.com/docs-v5/en/#order-book-trading-websocket-batch-amend-orders>
+    async fn ws_batch_amend_orders(
+        &self,
+        args: Vec<Value>,
+        client_order_ids: Vec<ClientOrderId>,
+    ) -> Result<(), OKXWsError> {
+        let request_id = self.generate_unique_request_id();
+        let request = OKXWsRequest::<Value> {
+            id: Some(request_id.clone()),
+            op: super::enums::OKXWsOperation::BatchAmendOrders,
+            exp_time: self.order_request_exp_time(),
+            args,
+        };
+
+        let payload = serde_json::to_string(&request)
+            .map_err(|e| OKXWsError::JsonError(format!("Failed to serialize batch amend: {e}")))?;
+
+        let cmd = HandlerCommand::Send {
+            payload,
+            rate_limit_keys: Some(OKX_RATE_LIMIT_KEY_BATCH_AMEND.to_vec()),
+            request_id: Some(request_id),
+            client_order_ids,
+            op: Some(super::enums::OKXWsOperation::BatchAmendOrders),
+        };
+
+        self.send_cmd(cmd).await
+    }
+
+    /// Submits an order, automatically routing conditional orders to the algo endpoint.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the order parameters are invalid or if the request
+    /// cannot be sent to the websocket client.
+    ///
+    /// # References
+    ///
+    /// - Regular orders: <https://www.okx.com/docs-v5/en/#order-book-trading-trade-ws-place-order>
+    /// - Algo orders: <https://www.okx.com/docs-v5/en/#order-book-trading-algo-trading-post-place-algo-order>
+    #[expect(clippy::too_many_arguments)]
+    pub async fn submit_order(
+        &self,
+        trader_id: TraderId,
+        strategy_id: StrategyId,
+        instrument_id: InstrumentId,
+        td_mode: OKXTradeMode,
+        client_order_id: ClientOrderId,
+        order_side: OrderSide,
+        order_type: OrderType,
+        quantity: Quantity,
+        time_in_force: Option<TimeInForce>,
+        price: Option<Price>,
+        trigger_price: Option<Price>,
+        post_only: Option<bool>,
+        reduce_only: Option<bool>,
+        quote_quantity: Option<bool>,
+        position_side: Option<PositionSide>,
+        attach_algo_ords: Option<Vec<WsAttachAlgoOrdParams>>,
+        px_usd: Option<String>,
+        px_vol: Option<String>,
+        outcome: Option<String>,
+        slippage_pct: Option<String>,
+        rpi: Option<bool>,
+        rpi_taker_access: Option<bool>,
+        rpi_px_round: Option<bool>,
+    ) -> Result<(), OKXWsError> {
+        let rpi = rpi.unwrap_or(false);
+
+        if !OKX_SUPPORTED_ORDER_TYPES.contains(&order_type) {
+            return Err(OKXWsError::ClientError(format!(
+                "Unsupported order type: {order_type:?}",
+            )));
+        }
+
+        validate_order_time_in_force(time_in_force).map_err(OKXWsError::ClientError)?;
+
+        let mut builder = WsPostOrderParamsBuilder::default();
+
+        let inst_id_code = self
+            .get_inst_id_code(&instrument_id.symbol.inner())
+            .ok_or_else(|| {
+                OKXWsError::ClientError(format!(
+                    "No instIdCode cached for {instrument_id}, cannot submit order"
+                ))
+            })?;
+        builder.inst_id_code(inst_id_code);
+
+        builder.td_mode(td_mode);
+        builder.cl_ord_id(client_order_id.as_str());
+
+        let (instrument_type, quote_currency) = {
+            let instruments = self.instruments_cache.load();
+            let symbol = instrument_id.symbol.inner();
+            let instrument = instruments.get(&symbol).ok_or_else(|| {
+                OKXWsError::ClientError(format!("Unknown instrument {instrument_id}"))
+            })?;
+            let instrument_type = okx_instrument_type(instrument)
+                .map_err(|e| OKXWsError::ClientError(e.to_string()))?;
+            (instrument_type, instrument.quote_currency())
+        };
+
+        // OKX options only support limit-style orders
+        if instrument_type == OKXInstrumentType::Option
+            && matches!(order_type, OrderType::Market | OrderType::MarketToLimit)
+        {
+            return Err(OKXWsError::ClientError(
+                "Market orders are not supported for OKX options, use Limit orders instead"
+                    .to_string(),
+            ));
+        }
+
+        match instrument_type {
+            OKXInstrumentType::Spot | OKXInstrumentType::Margin => {
+                // SPOT: ccy parameter is required by OKX for spot trading
+                builder.ccy(quote_currency.to_string());
+            }
+            OKXInstrumentType::Swap | OKXInstrumentType::Futures => {
+                // SWAP/FUTURES: use quote currency for margin (required by OKX)
+                builder.ccy(quote_currency.to_string());
+
+                // For derivatives, posSide is required by OKX
+                // Use Net for one-way mode (default for NETTING OMS)
+                if position_side.is_none() {
+                    builder.pos_side(OKXPositionSide::Net);
+                }
+            }
+            OKXInstrumentType::Option => {
+                builder.ccy(quote_currency.to_string());
+
+                if position_side.is_none() {
+                    builder.pos_side(OKXPositionSide::Net);
+                }
+            }
+            OKXInstrumentType::Events => {}
+            _ => {
+                builder.ccy(quote_currency.to_string());
+
+                if position_side.is_none() {
+                    builder.pos_side(OKXPositionSide::Net);
+                }
+            }
+        }
+
+        if let Some(reduce_only) = okx_reduce_only_wire_value(
+            instrument_type,
+            td_mode,
+            order_side,
+            position_side,
+            reduce_only,
+        )
+        .map_err(OKXWsError::ClientError)?
+        {
+            builder.reduce_only(reduce_only);
+        }
+
+        if let Some(attach_algo_ords) = attach_algo_ords {
+            builder.attach_algo_ords(attach_algo_ords);
+        }
+
+        if let Some(tgt_ccy) =
+            okx_market_target_currency(instrument_type, order_side, order_type, quote_quantity)
+                .map_err(|e| OKXWsError::ClientError(e.to_string()))?
+        {
+            builder.tgt_ccy(tgt_ccy);
+        }
+
+        builder.side(order_side);
+
+        if let Some(pos_side) = position_side {
+            builder.pos_side(pos_side);
+        }
+
+        // OKX implements FOK/IOC as order types rather than separate time-in-force
+        // Market + FOK is unsupported (FOK requires a limit price)
+        // optimal_limit_ioc is only supported for SWAP/FUTURES, not SPOT or OPTION
+        validate_regular_order_params(
+            instrument_type,
+            order_type,
+            time_in_force,
+            post_only.unwrap_or(false),
+            rpi,
+            outcome.as_deref(),
+        )
+        .map_err(OKXWsError::ClientError)?;
+
+        let (okx_ord_type, price) = if rpi {
+            (OKXOrderType::Rpi, price)
+        } else if post_only.unwrap_or(false) {
+            (OKXOrderType::PostOnly, price)
+        } else if let Some(tif) = time_in_force {
+            match (order_type, tif) {
+                (OrderType::Market, TimeInForce::Ioc) => {
+                    // optimal_limit_ioc only works for SWAP/FUTURES
+                    if matches!(
+                        instrument_type,
+                        OKXInstrumentType::Spot | OKXInstrumentType::Option
+                    ) {
+                        (OKXOrderType::Market, price)
+                    } else {
+                        (OKXOrderType::OptimalLimitIoc, price)
+                    }
+                }
+                (OrderType::Limit, TimeInForce::Fok) => (OKXOrderType::Fok, price),
+                (OrderType::Limit, TimeInForce::Ioc) => (OKXOrderType::Ioc, price),
+                _ => (OKXOrderType::from(order_type), price),
+            }
+        } else {
+            (OKXOrderType::from(order_type), price)
+        };
+
+        log::debug!(
+            "Order type mapping: order_type={order_type:?}, time_in_force={time_in_force:?}, post_only={post_only:?} -> okx_ord_type={okx_ord_type:?}"
+        );
+
+        if let Some(outcome) = outcome {
+            builder.outcome(outcome);
+        }
+
+        if let Some(slippage) = slippage_pct {
+            builder.slippage_pct(slippage);
+        }
+
+        if let Some(rpi_taker_access) = rpi_taker_access {
+            builder.rpi_taker_access(rpi_taker_access);
+        }
+
+        if let Some(rpi_px_round) = rpi_px_round {
+            builder.rpi_px_round(rpi_px_round);
+        }
+
+        if let Some(trade_quote_ccy) =
+            self.resolve_spot_trade_quote_ccy(instrument_type, instrument_id.symbol.inner())?
+        {
+            builder.trade_quote_ccy(trade_quote_ccy);
+        }
+
+        builder.ord_type(okx_ord_type);
+        builder.sz(quantity.to_string());
+
+        // For options: pxUsd/pxVol are mutually exclusive with px
+        if let Some(usd) = px_usd {
+            builder.px_usd(usd);
+        } else if let Some(vol) = px_vol {
+            builder.px_vol(vol);
+        } else if let Some(tp) = trigger_price {
+            builder.px(tp.to_string());
+        } else if let Some(p) = price {
+            builder.px(p.to_string());
+        }
+
+        builder.tag(OKX_NAUTILUS_BROKER_ID);
+
+        let params = builder
+            .build()
+            .map_err(|e| OKXWsError::ClientError(format!("Build order params error: {e}")))?;
+
+        let request_id = self.generate_unique_request_id();
+        let request = OKXWsRequest {
+            id: Some(request_id.clone()),
+            op: super::enums::OKXWsOperation::Order,
+            exp_time: self.order_request_exp_time(),
+            args: vec![params],
+        };
+
+        let payload = serde_json::to_string(&request)
+            .map_err(|e| OKXWsError::JsonError(format!("Failed to serialize order: {e}")))?;
+
+        let cl_ord_key = client_order_id.to_string();
+        self.pending_orders.insert(
+            cl_ord_key.clone(),
+            PendingOrderInfo {
+                trader_id,
+                strategy_id,
+                instrument_id,
+            },
+        );
+
+        let cmd = HandlerCommand::Send {
+            payload,
+            rate_limit_keys: Some(OKX_RATE_LIMIT_KEY_ORDER.to_vec()),
+            request_id: Some(request_id),
+            client_order_ids: vec![client_order_id],
+            op: Some(super::enums::OKXWsOperation::Order),
+        };
+
+        let result = self.send_cmd(cmd).await;
+
+        if result.is_err() {
+            self.pending_orders.remove(&cl_ord_key);
+        }
+
+        result
+    }
+
+    /// Place a new order via WebSocket.
+    ///
+    /// # References
+    ///
+    /// <https://www.okx.com/docs-v5/en/#order-book-trading-websocket-place-order>
+    /// Modifies an existing order.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the amend parameters are invalid or if the
+    /// websocket request fails to send.
+    ///
+    /// # References
+    ///
+    /// <https://www.okx.com/docs-v5/en/#order-book-trading-trade-ws-amend-order>.
+    #[expect(clippy::too_many_arguments)]
+    pub async fn modify_order(
+        &self,
+        trader_id: TraderId,
+        strategy_id: StrategyId,
+        instrument_id: InstrumentId,
+        client_order_id: Option<ClientOrderId>,
+        price: Option<Price>,
+        quantity: Option<Quantity>,
+        venue_order_id: Option<VenueOrderId>,
+        new_px_usd: Option<String>,
+        new_px_vol: Option<String>,
+        rpi_taker_access: Option<bool>,
+        rpi_px_round: Option<bool>,
+    ) -> Result<(), OKXWsError> {
+        self.modify_order_with_causation(
+            trader_id,
+            strategy_id,
+            instrument_id,
+            client_order_id,
+            price,
+            quantity,
+            venue_order_id,
+            new_px_usd,
+            new_px_vol,
+            rpi_taker_access,
+            rpi_px_round,
+            None,
+        )
+        .await
+    }
+
+    #[expect(clippy::too_many_arguments)]
+    pub(crate) async fn modify_order_with_causation(
+        &self,
+        trader_id: TraderId,
+        strategy_id: StrategyId,
+        instrument_id: InstrumentId,
+        client_order_id: Option<ClientOrderId>,
+        price: Option<Price>,
+        quantity: Option<Quantity>,
+        venue_order_id: Option<VenueOrderId>,
+        new_px_usd: Option<String>,
+        new_px_vol: Option<String>,
+        rpi_taker_access: Option<bool>,
+        rpi_px_round: Option<bool>,
+        causation_id: Option<UUID4>,
+    ) -> Result<(), OKXWsError> {
+        let mut builder = WsAmendOrderParamsBuilder::default();
+
+        let inst_id_code = self
+            .get_inst_id_code(&instrument_id.symbol.inner())
+            .ok_or_else(|| {
+                OKXWsError::ClientError(format!(
+                    "No instIdCode cached for {instrument_id}, cannot amend order"
+                ))
+            })?;
+        builder.inst_id_code(inst_id_code);
+
+        if let Some(venue_order_id) = venue_order_id {
+            builder.ord_id(venue_order_id.as_str());
+        }
+
+        let cl_ord_key = client_order_id.map(|id| id.to_string());
+
+        if let Some(client_order_id) = client_order_id {
+            builder.cl_ord_id(client_order_id.as_str());
+            self.pending_amends.insert(
+                client_order_id.to_string(),
+                PendingOrderInfo {
+                    trader_id,
+                    strategy_id,
+                    instrument_id,
+                },
+            );
+        }
+
+        // For options: newPxUsd/newPxVol are mutually exclusive with newPx
+        if let Some(usd) = new_px_usd {
+            builder.new_px_usd(usd);
+        } else if let Some(vol) = new_px_vol {
+            builder.new_px_vol(vol);
+        } else if let Some(price) = price {
+            builder.new_px(price.to_string());
+        }
+
+        if let Some(quantity) = quantity {
+            builder.new_sz(quantity.to_string());
+        }
+
+        if let Some(rpi_taker_access) = rpi_taker_access {
+            builder.rpi_taker_access(rpi_taker_access);
+        }
+
+        if let Some(rpi_px_round) = rpi_px_round {
+            builder.rpi_px_round(rpi_px_round);
+        }
+
+        let params = builder
+            .build()
+            .map_err(|e| OKXWsError::ClientError(format!("Build amend params error: {e}")))?;
+
+        let request_id = self.generate_unique_request_id();
+        let request = OKXWsRequest {
+            id: Some(request_id.clone()),
+            op: super::enums::OKXWsOperation::AmendOrder,
+            exp_time: self.order_request_exp_time(),
+            args: vec![params],
+        };
+
+        let payload = serde_json::to_string(&request)
+            .map_err(|e| OKXWsError::JsonError(format!("Failed to serialize amend: {e}")))?;
+
+        if let (Some(client_order_id), Some(causation_id)) = (client_order_id, causation_id) {
+            self.pending_command_ids
+                .insert(request_id.clone(), vec![(client_order_id, causation_id)]);
+        }
+
+        let cmd = HandlerCommand::Send {
+            payload,
+            rate_limit_keys: Some(OKX_RATE_LIMIT_KEY_AMEND.to_vec()),
+            request_id: Some(request_id.clone()),
+            client_order_ids: client_order_id.into_iter().collect(),
+            op: Some(super::enums::OKXWsOperation::AmendOrder),
+        };
+
+        let result = self.send_cmd(cmd).await;
+
+        if result.is_err() {
+            self.pending_command_ids.remove(&request_id);
+        }
+
+        if let (Err(_), Some(key)) = (&result, &cl_ord_key) {
+            self.pending_amends.remove(key);
+        }
+
+        result
+    }
+
+    /// Cancels an existing order.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the cancel parameters are invalid or if the
+    /// cancellation request fails to send.
+    ///
+    /// # References
+    ///
+    /// <https://www.okx.com/docs-v5/en/#order-book-trading-trade-ws-cancel-order>.
+    pub async fn cancel_order(
+        &self,
+        trader_id: TraderId,
+        strategy_id: StrategyId,
+        instrument_id: InstrumentId,
+        client_order_id: Option<ClientOrderId>,
+        venue_order_id: Option<VenueOrderId>,
+    ) -> Result<(), OKXWsError> {
+        self.cancel_order_with_causation(
+            trader_id,
+            strategy_id,
+            instrument_id,
+            client_order_id,
+            venue_order_id,
+            None,
+        )
+        .await
+    }
+
+    pub(crate) async fn cancel_order_with_causation(
+        &self,
+        trader_id: TraderId,
+        strategy_id: StrategyId,
+        instrument_id: InstrumentId,
+        client_order_id: Option<ClientOrderId>,
+        venue_order_id: Option<VenueOrderId>,
+        causation_id: Option<UUID4>,
+    ) -> Result<(), OKXWsError> {
+        let mut builder = WsCancelOrderParamsBuilder::default();
+
+        let inst_id_code = self
+            .get_inst_id_code(&instrument_id.symbol.inner())
+            .ok_or_else(|| {
+                OKXWsError::ClientError(format!(
+                    "No instIdCode cached for {instrument_id}, cannot cancel order"
+                ))
+            })?;
+        builder.inst_id_code(inst_id_code);
+
+        if let Some(venue_order_id) = venue_order_id {
+            builder.ord_id(venue_order_id.as_str());
+        }
+
+        let cl_ord_key = client_order_id.map(|id| id.to_string());
+
+        if let Some(client_order_id) = client_order_id {
+            builder.cl_ord_id(client_order_id.as_str());
+            self.pending_cancels.insert(
+                client_order_id.to_string(),
+                PendingOrderInfo {
+                    trader_id,
+                    strategy_id,
+                    instrument_id,
+                },
+            );
+        }
+
+        let params = builder
+            .build()
+            .map_err(|e| OKXWsError::ClientError(format!("Build cancel params error: {e}")))?;
+
+        let request_id = self.generate_unique_request_id();
+        let request = OKXWsRequest {
+            id: Some(request_id.clone()),
+            op: super::enums::OKXWsOperation::CancelOrder,
+            exp_time: None,
+            args: vec![params],
+        };
+
+        let payload = serde_json::to_string(&request)
+            .map_err(|e| OKXWsError::JsonError(format!("Failed to serialize cancel: {e}")))?;
+
+        if let (Some(client_order_id), Some(causation_id)) = (client_order_id, causation_id) {
+            self.pending_command_ids
+                .insert(request_id.clone(), vec![(client_order_id, causation_id)]);
+        }
+
+        let cmd = HandlerCommand::Send {
+            payload,
+            rate_limit_keys: Some(OKX_RATE_LIMIT_KEY_CANCEL.to_vec()),
+            request_id: Some(request_id.clone()),
+            client_order_ids: client_order_id.into_iter().collect(),
+            op: Some(super::enums::OKXWsOperation::CancelOrder),
+        };
+
+        let result = self.send_cmd(cmd).await;
+
+        if result.is_err() {
+            self.pending_command_ids.remove(&request_id);
+        }
+
+        if let (Err(_), Some(key)) = (&result, &cl_ord_key) {
+            self.pending_cancels.remove(key);
+        }
+
+        result
+    }
+
+    /// Mass cancels all orders for a given instrument via WebSocket.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if instrument metadata cannot be resolved or if the
+    /// cancel request fails to send.
+    ///
+    /// # References
+    /// <https://www.okx.com/docs-v5/en/#order-book-trading-websocket-mass-cancel-order>
+    pub async fn mass_cancel_orders(&self, instrument_id: InstrumentId) -> Result<(), OKXWsError> {
+        let (inst_type, inst_family) = {
+            let instrument = self
+                .instruments_cache
+                .get_cloned(&instrument_id.symbol.inner())
+                .ok_or_else(|| {
+                    OKXWsError::ClientError(format!("Unknown instrument {instrument_id}"))
+                })?;
+
+            let inst_type = okx_instrument_type(&instrument)
+                .map_err(|e| OKXWsError::ClientError(e.to_string()))?;
+
+            let symbol = instrument.symbol().inner();
+            let inst_family = match &instrument {
+                InstrumentAny::CurrencyPair(_) => symbol.as_str().to_string(),
+                InstrumentAny::CryptoPerpetual(_) => symbol
+                    .as_str()
+                    .strip_suffix("-SWAP")
+                    .unwrap_or(symbol.as_str())
+                    .to_string(),
+                InstrumentAny::CryptoFuture(_) => {
+                    let s = symbol.as_str();
+                    if let Some(idx) = s.rfind('-') {
+                        s[..idx].to_string()
+                    } else {
+                        s.to_string()
+                    }
+                }
+                _ => {
+                    return Err(OKXWsError::ClientError(
+                        "Unsupported instrument type for mass cancel".to_string(),
+                    ));
+                }
+            };
+
+            (inst_type, inst_family)
+        };
+
+        let params = WsMassCancelParams {
+            inst_type,
+            inst_family: Ustr::from(&inst_family),
+        };
+
+        let request_id = self.generate_unique_request_id();
+        let request = OKXWsRequest {
+            id: Some(request_id.clone()),
+            op: super::enums::OKXWsOperation::MassCancel,
+            exp_time: None,
+            args: vec![
+                serde_json::to_value(params).map_err(|e| OKXWsError::JsonError(e.to_string()))?,
+            ],
+        };
+
+        let payload = serde_json::to_string(&request)
+            .map_err(|e| OKXWsError::JsonError(format!("Failed to serialize mass cancel: {e}")))?;
+
+        let cmd = HandlerCommand::Send {
+            payload,
+            rate_limit_keys: Some(OKX_RATE_LIMIT_KEY_MASS_CANCEL.to_vec()),
+            request_id: Some(request_id),
+            client_order_ids: Vec::new(),
+            op: Some(super::enums::OKXWsOperation::MassCancel),
+        };
+
+        self.send_cmd(cmd).await
+    }
+
+    /// Submits multiple orders.
+    ///
+    /// The quantity-unit flag follows `reduce_only` in each tuple. `Some(true)` requests quote
+    /// units and `Some(false)` requests base units for spot market orders.
+    /// `None` uses venue defaults.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if any batch order parameters are invalid or if the
+    /// batch request fails to send.
+    #[expect(clippy::type_complexity)]
+    pub async fn batch_submit_orders(
+        &self,
+        orders: Vec<(
+            OKXInstrumentType,
+            InstrumentId,
+            OKXTradeMode,
+            ClientOrderId,
+            OrderSide,
+            Option<PositionSide>,
+            OrderType,
+            Quantity,
+            Option<Price>,
+            Option<Price>,
+            Option<bool>,
+            Option<bool>,
+            Option<bool>,
+            Option<String>,
+            Option<bool>,
+            Option<bool>,
+            Option<bool>,
+        )>,
+    ) -> Result<(), OKXWsError> {
+        let client_order_ids: Vec<ClientOrderId> = orders.iter().map(|o| o.3).collect();
+        let args: Vec<Value> = {
+            let mut args = Vec::with_capacity(orders.len());
+            let inst_id_codes = self.inst_id_code_cache.load();
+            let instruments = self.instruments_cache.load();
+
+            for (
+                inst_type,
+                inst_id,
+                td_mode,
+                cl_ord_id,
+                ord_side,
+                pos_side,
+                ord_type,
+                qty,
+                pr,
+                tp,
+                post_only,
+                reduce_only,
+                quote_quantity,
+                outcome,
+                rpi,
+                rpi_taker_access,
+                rpi_px_round,
+            ) in orders
+            {
+                let rpi = rpi.unwrap_or(false);
+                let mut builder = WsPostOrderParamsBuilder::default();
+
+                let (inst_id_symbol, inst_id_code) = Self::inst_id_symbol_and_code_from_snapshot(
+                    &inst_id_codes,
+                    &inst_id,
+                    "submit",
+                )?;
+                builder.inst_id_code(inst_id_code);
+
+                builder.td_mode(td_mode);
+                builder.cl_ord_id(cl_ord_id.as_str());
+                builder.side(ord_side);
+
+                if inst_type != OKXInstrumentType::Events
+                    && let Some(instrument) = instruments.get(&inst_id_symbol)
+                {
+                    builder.ccy(instrument.quote_currency().to_string());
+                }
+
+                if let Some(ps) = pos_side {
+                    builder.pos_side(OKXPositionSide::from(ps));
+                } else if matches!(
+                    inst_type,
+                    OKXInstrumentType::Swap
+                        | OKXInstrumentType::Futures
+                        | OKXInstrumentType::Option
+                ) {
+                    builder.pos_side(OKXPositionSide::Net);
+                }
+
+                if rpi && ord_type != OrderType::Limit {
+                    return Err(OKXWsError::ClientError(
+                        "OKX RPI batch orders require limit orders".to_string(),
+                    ));
+                }
+
+                let okx_ord_type = if rpi {
+                    OKXOrderType::Rpi
+                } else if post_only.unwrap_or(false) {
+                    OKXOrderType::PostOnly
+                } else {
+                    match ord_type {
+                        OrderType::Market => OKXOrderType::Market,
+                        OrderType::Limit => OKXOrderType::Limit,
+                        OrderType::MarketToLimit => OKXOrderType::Ioc,
+                        _ => {
+                            return Err(OKXWsError::ClientError(format!(
+                                "Unsupported order type for batch submit: {ord_type:?}"
+                            )));
+                        }
+                    }
+                };
+
+                builder.ord_type(okx_ord_type);
+                builder.sz(qty.to_string());
+                let tgt_ccy =
+                    okx_market_target_currency(inst_type, ord_side, ord_type, quote_quantity)
+                        .map_err(|e| OKXWsError::ClientError(e.to_string()))?;
+
+                if let Some(p) = pr {
+                    builder.px(p.to_string());
+                } else if let Some(p) = tp {
+                    builder.px(p.to_string());
+                }
+
+                if let Some(reduce_only) =
+                    okx_reduce_only_wire_value(inst_type, td_mode, ord_side, pos_side, reduce_only)
+                        .map_err(OKXWsError::ClientError)?
+                {
+                    builder.reduce_only(reduce_only);
+                }
+
+                if inst_type == OKXInstrumentType::Events && outcome.is_none() {
+                    return Err(OKXWsError::ClientError(
+                        "OKX event contract orders require `outcome`".to_string(),
+                    ));
+                }
+
+                if let Some(outcome) = outcome {
+                    builder.outcome(outcome);
+                }
+
+                if let Some(rpi_taker_access) = rpi_taker_access {
+                    builder.rpi_taker_access(rpi_taker_access);
+                }
+
+                if let Some(rpi_px_round) = rpi_px_round {
+                    builder.rpi_px_round(rpi_px_round);
+                }
+
+                if let Some(trade_quote_ccy) =
+                    self.resolve_spot_trade_quote_ccy(inst_type, inst_id_symbol)?
+                {
+                    builder.trade_quote_ccy(trade_quote_ccy);
+                }
+
+                builder.tag(OKX_NAUTILUS_BROKER_ID);
+
+                let mut params = builder.build().map_err(|e| {
+                    OKXWsError::ClientError(format!("Build order params error: {e}"))
+                })?;
+
+                params.tgt_ccy = tgt_ccy;
+                let val = serde_json::to_value(params)
+                    .map_err(|e| OKXWsError::JsonError(e.to_string()))?;
+                args.push(val);
+            }
+            args
+        };
+
+        self.ws_batch_place_orders(args, client_order_ids).await
+    }
+
+    /// Modifies multiple orders.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if amend parameters are invalid or if the batch request
+    /// fails to send.
+    #[expect(clippy::type_complexity)]
+    pub async fn batch_modify_orders(
+        &self,
+        orders: Vec<(
+            OKXInstrumentType,
+            InstrumentId,
+            ClientOrderId,
+            Option<String>,
+            Option<Price>,
+            Option<Quantity>,
+            Option<bool>,
+            Option<bool>,
+        )>,
+    ) -> Result<(), OKXWsError> {
+        let client_order_ids: Vec<ClientOrderId> = orders.iter().map(|o| o.2).collect();
+        let args: Vec<Value> = {
+            let mut args = Vec::with_capacity(orders.len());
+            let inst_id_codes = self.inst_id_code_cache.load();
+
+            for (
+                _inst_type,
+                inst_id,
+                cl_ord_id,
+                request_id,
+                pr,
+                sz,
+                rpi_taker_access,
+                rpi_px_round,
+            ) in orders
+            {
+                let mut builder = WsAmendOrderParamsBuilder::default();
+
+                let (_, inst_id_code) =
+                    Self::inst_id_symbol_and_code_from_snapshot(&inst_id_codes, &inst_id, "amend")?;
+                builder.inst_id_code(inst_id_code);
+
+                builder.cl_ord_id(cl_ord_id.as_str());
+
+                if let Some(request_id) = request_id {
+                    builder.req_id(request_id);
+                }
+
+                if let Some(p) = pr {
+                    builder.new_px(p.to_string());
+                }
+
+                if let Some(q) = sz {
+                    builder.new_sz(q.to_string());
+                }
+
+                if let Some(rpi_taker_access) = rpi_taker_access {
+                    builder.rpi_taker_access(rpi_taker_access);
+                }
+
+                if let Some(rpi_px_round) = rpi_px_round {
+                    builder.rpi_px_round(rpi_px_round);
+                }
+
+                let params = builder.build().map_err(|e| {
+                    OKXWsError::ClientError(format!("Build amend batch params error: {e}"))
+                })?;
+                let val = serde_json::to_value(params)
+                    .map_err(|e| OKXWsError::JsonError(e.to_string()))?;
+                args.push(val);
+            }
+            args
+        };
+
+        self.ws_batch_amend_orders(args, client_order_ids).await
+    }
+
+    /// Cancels multiple orders.
+    ///
+    /// Supports up to 20 orders per batch.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if cancel parameters are invalid or if the batch
+    /// request fails to send.
+    ///
+    /// # References
+    ///
+    /// <https://www.okx.com/docs-v5/en/#order-book-trading-websocket-batch-cancel-orders>
+    pub async fn batch_cancel_orders(
+        &self,
+        orders: Vec<(InstrumentId, Option<ClientOrderId>, Option<VenueOrderId>)>,
+    ) -> Result<(), OKXWsError> {
+        self.batch_cancel_orders_with_causation(orders, Vec::new())
+            .await
+    }
+
+    pub(crate) async fn batch_cancel_orders_with_causation(
+        &self,
+        orders: Vec<(InstrumentId, Option<ClientOrderId>, Option<VenueOrderId>)>,
+        causation_ids: Vec<(ClientOrderId, UUID4)>,
+    ) -> Result<(), OKXWsError> {
+        let client_order_ids: Vec<ClientOrderId> = orders
+            .iter()
+            .filter_map(|(_, cl_ord_id, _)| *cl_ord_id)
+            .collect();
+        let args: Vec<Value> = {
+            let mut args = Vec::with_capacity(orders.len());
+            let inst_id_codes = self.inst_id_code_cache.load();
+
+            for (inst_id, cl_ord_id, ord_id) in orders {
+                let mut builder = WsCancelOrderParamsBuilder::default();
+
+                let (_, inst_id_code) = Self::inst_id_symbol_and_code_from_snapshot(
+                    &inst_id_codes,
+                    &inst_id,
+                    "cancel",
+                )?;
+                builder.inst_id_code(inst_id_code);
+
+                if let Some(c) = cl_ord_id {
+                    builder.cl_ord_id(c.as_str());
+                }
+
+                if let Some(o) = ord_id {
+                    builder.ord_id(o.as_str());
+                }
+
+                let params = builder.build().map_err(|e| {
+                    OKXWsError::ClientError(format!("Build cancel batch params error: {e}"))
+                })?;
+                let val = serde_json::to_value(params)
+                    .map_err(|e| OKXWsError::JsonError(e.to_string()))?;
+                args.push(val);
+            }
+            args
+        };
+
+        self.ws_batch_cancel_orders(args, client_order_ids, causation_ids)
+            .await
+    }
+
+    /// Rejects algo placement on the WebSocket transport; use the HTTP client instead.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if called: OKX does not accept this client's `order-algo` operation.
+    #[expect(clippy::too_many_arguments)]
+    #[expect(
+        clippy::unused_async,
+        clippy::unused_async_trait_impl,
+        reason = "Preserves the published async API while rejecting an unsupported operation"
+    )]
+    pub async fn submit_algo_order(
+        &self,
+        _trader_id: TraderId,
+        _strategy_id: StrategyId,
+        _instrument_id: InstrumentId,
+        _td_mode: OKXTradeMode,
+        _client_order_id: ClientOrderId,
+        _order_side: OrderSide,
+        _order_type: OrderType,
+        _quantity: Quantity,
+        _trigger_price: Option<Price>,
+        _trigger_type: Option<TriggerType>,
+        _limit_price: Option<Price>,
+        _reduce_only: Option<bool>,
+        _callback_ratio: Option<String>,
+        _callback_spread: Option<String>,
+        _activation_price: Option<Price>,
+    ) -> Result<(), OKXWsError> {
+        Err(OKXWsError::ClientError(
+            "OKX algo placement requires HTTP; use OKXHttpClient::place_algo_order_with_domain_types"
+                .to_string(),
+        ))
+    }
+
+    /// Cancels an algo order.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if cancel parameters are invalid or if the request
+    /// fails to send.
+    ///
+    /// # References
+    ///
+    /// <https://www.okx.com/docs-v5/en/#order-book-trading-algo-trading-post-cancel-algo-order>
+    pub async fn cancel_algo_order(
+        &self,
+        _trader_id: TraderId,
+        _strategy_id: StrategyId,
+        instrument_id: InstrumentId,
+        client_order_id: Option<ClientOrderId>,
+        algo_order_id: Option<String>,
+    ) -> Result<(), OKXWsError> {
+        let mut builder = super::messages::WsCancelAlgoOrderParamsBuilder::default();
+
+        let inst_id_code = self
+            .get_inst_id_code(&instrument_id.symbol.inner())
+            .ok_or_else(|| {
+                OKXWsError::ClientError(format!(
+                    "No instIdCode cached for {instrument_id}, cannot cancel algo order"
+                ))
+            })?;
+        builder.inst_id_code(inst_id_code);
+
+        if let Some(algo_id) = algo_order_id {
+            builder.algo_id(algo_id);
+        }
+
+        if let Some(cl_ord_id) = client_order_id {
+            builder.algo_cl_ord_id(cl_ord_id.to_string());
+        }
+
+        let params = builder
+            .build()
+            .map_err(|e| OKXWsError::ClientError(format!("Build cancel algo params error: {e}")))?;
+
+        let request_id = self.generate_unique_request_id();
+        let request = OKXWsRequest {
+            id: Some(request_id.clone()),
+            op: super::enums::OKXWsOperation::CancelAlgos,
+            exp_time: None,
+            args: vec![params],
+        };
+
+        let payload = serde_json::to_string(&request)
+            .map_err(|e| OKXWsError::JsonError(format!("Failed to serialize cancel algo: {e}")))?;
+
+        let cmd = HandlerCommand::Send {
+            payload,
+            rate_limit_keys: Some(OKX_RATE_LIMIT_KEY_ALGO_CANCEL.to_vec()),
+            request_id: Some(request_id),
+            client_order_ids: client_order_id.into_iter().collect(),
+            op: Some(super::enums::OKXWsOperation::CancelAlgos),
+        };
+
+        self.send_cmd(cmd).await
+    }
+
+    /// Sends a command to the handler.
+    async fn send_cmd(&self, cmd: HandlerCommand) -> Result<(), OKXWsError> {
+        self.cmd_tx
+            .read()
+            .await
+            .send(cmd)
+            .map_err(|e| OKXWsError::HandlerUnavailable(e.to_string()))
+    }
+}
+
+fn authentication_timestamp(now: UnixNanos) -> String {
+    now.as_seconds().to_string()
+}
+
+fn subscription_args(
+    subscriptions: &DashMap<String, OKXSubscriptionArg>,
+    subscriptions_state: &SubscriptionState,
+) -> Vec<OKXSubscriptionArg> {
+    let mut args: Vec<_> = subscriptions_state
+        .all_topics()
+        .iter()
+        .filter_map(|topic| subscriptions.get(topic).map(|arg| arg.value().clone()))
+        .collect();
+    args.sort_unstable_by_key(topic_from_subscription_arg);
+    args
+}
+
+fn subscription_arg_batches(
+    args: &[OKXSubscriptionArg],
+) -> impl Iterator<Item = &[OKXSubscriptionArg]> {
+    args.chunks(OKX_WS_SUBSCRIPTION_ARGS_MAX_PER_MESSAGE)
+}
+
+fn advance_reconnect_epoch(
+    reconnect_epoch: &mut u64,
+    epoch: u64,
+    stopping: bool,
+    active: bool,
+) -> bool {
+    if stopping || !active || epoch == *reconnect_epoch {
+        return false;
+    }
+
+    *reconnect_epoch = epoch;
+    true
+}
+
+fn auth_attempt_superseded(error: &Error) -> bool {
+    error.to_string().contains("superseded")
+        || matches!(error, Error::Io(e) if matches!(
+            e.get_ref().and_then(|e| e.downcast_ref::<SendError>()),
+            Some(SendError::ConnectionChanged),
+        ))
+}
+
+async fn authenticate_session(
+    credential: &Credential,
+    auth_tracker: &AuthTracker,
+    ws_client: &WebSocketClient,
+    connection_epoch: u64,
+    clock: &'static AtomicTime,
+    auth_timeout_secs: u64,
+) -> Result<(), Error> {
+    if !ws_client.is_active() || ws_client.connection_epoch() != connection_epoch {
+        return Err(Error::Io(std::io::Error::other(
+            SendError::ConnectionChanged,
+        )));
+    }
+
+    let rx = auth_tracker.begin();
+    let timestamp = authentication_timestamp(clock.get_time_ns());
+    let signature = credential.sign(&timestamp, "GET", "/users/self/verify", "");
+
+    let auth_message = OKXAuthentication {
+        op: "login",
+        args: vec![OKXAuthenticationArg {
+            api_key: SecretString::from(credential.api_key()),
+            passphrase: SecretString::from(credential.api_passphrase()),
+            timestamp,
+            sign: SecretString::from(signature),
+        }],
+    };
+
+    let payload = serde_json::to_string(&auth_message)
+        .map(SecretString::from)
+        .map_err(|e| {
+            Error::Io(std::io::Error::other(format!(
+                "Failed to serialize auth message: {e}"
+            )))
+        })?;
+
+    ws_client
+        .send_text_on_connection(
+            payload.expose_secret().to_owned(),
+            Some(OKX_RATE_LIMIT_KEY_SUBSCRIPTION.as_slice()),
+            connection_epoch,
+        )
+        .await
+        .map_err(|e| Error::Io(std::io::Error::other(e)))?;
+
+    match auth_tracker
+        .wait_for_result::<OKXWsError>(Duration::from_secs(auth_timeout_secs), rx)
+        .await
+    {
+        Ok(()) => {
+            log::debug!("WebSocket authenticated");
+            Ok(())
+        }
+        Err(e) => {
+            let auth_error = Error::Io(std::io::Error::other(e.to_string()));
+            if !auth_attempt_superseded(&auth_error) {
+                log::warn!("WebSocket authentication failed: error={e}");
+            }
+
+            Err(auth_error)
+        }
+    }
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    reason = "reconnect authentication uses the existing session and shutdown state"
+)]
+async fn reauthenticate_session(
+    credential: Credential,
+    auth_tracker: AuthTracker,
+    ws_client: Arc<WebSocketClient>,
+    connection_epoch: u64,
+    clock: &'static AtomicTime,
+    auth_timeout_secs: u64,
+    signal: Arc<AtomicBool>,
+    abort: CancellationToken,
+) {
+    if signal.load(Ordering::Acquire) || abort.is_cancelled() {
+        return;
+    }
+
+    if ws_client.connection_epoch() != connection_epoch || !ws_client.is_active() {
+        return;
+    }
+
+    let result = tokio::select! {
+        biased;
+        () = abort.cancelled() => return,
+        result = authenticate_session(
+            &credential,
+            &auth_tracker,
+            &ws_client,
+            connection_epoch,
+            clock,
+            auth_timeout_secs,
+        ) => result,
+    };
+
+    match result {
+        Ok(()) => log::debug!("Re-authenticated after reconnection"),
+        Err(e) => {
+            if signal.load(Ordering::Acquire)
+                || abort.is_cancelled()
+                || ws_client.connection_epoch() != connection_epoch
+                || auth_tracker.is_authenticated()
+            {
+                return;
+            }
+
+            log::warn!("Re-authentication failed, reconnecting: {e}");
+            let _ = ws_client.reconnect_handle().request_reconnect();
+        }
+    }
+}
+
+pub(crate) fn ws_channel_for_book(channel: OKXBookChannel) -> OKXWsChannel {
+    match channel {
+        OKXBookChannel::Book => OKXWsChannel::Books,
+        OKXBookChannel::BookL2Tbt => OKXWsChannel::BooksTbt,
+        OKXBookChannel::Books50L2Tbt => OKXWsChannel::Books50Tbt,
+        OKXBookChannel::BooksRpi => OKXWsChannel::BooksRpi,
+        OKXBookChannel::SprdBooks5 => OKXWsChannel::SprdBooks5,
+    }
+}
+
+fn log_receiver_dropped(signal: &AtomicBool, item: &str) {
+    if signal.load(Ordering::Acquire) {
+        log::debug!("Receiver dropped after stop signal while forwarding {item}");
+    } else {
+        log::error!("Failed to send {item} through channel: receiver dropped");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use futures_util::StreamExt;
+    use nautilus_core::time::get_atomic_clock_realtime;
+    use nautilus_live::{SocketReconnectRegistry, SocketReconnectRequestOutcome};
+    use nautilus_model::identifiers::ClientId;
+    use nautilus_network::RECONNECTED;
+    use rstest::rstest;
+    use tokio_tungstenite::tungstenite::Message;
+
+    use super::*;
+    use crate::{
+        common::{
+            consts::{OKX_POST_ONLY_CANCEL_SOURCE, OKX_VENUE},
+            enums::{
+                OKXExecType, OKXOrderCategory, OKXOrderStatus, OKXPriceType, OKXQuickMarginType,
+                OKXSelfTradePreventionMode, OKXSide,
+            },
+        },
+        websocket::{
+            handler::is_post_only_auto_cancel,
+            messages::{OKXOrderMsg, OKXWsFrame},
+        },
+    };
+
+    struct DropSignal(Option<tokio::sync::oneshot::Sender<()>>);
+
+    impl Drop for DropSignal {
+        fn drop(&mut self) {
+            if let Some(sender) = self.0.take() {
+                let _ = sender.send(());
+            }
+        }
+    }
+
+    struct BlockingDrop(Arc<(parking_lot::Mutex<bool>, parking_lot::Condvar)>);
+
+    impl Drop for BlockingDrop {
+        fn drop(&mut self) {
+            let (lock, condvar) = &*self.0;
+            let mut released = lock.lock();
+            condvar.wait_while(&mut released, |released| !*released);
+        }
+    }
+
+    #[rstest]
+    #[case(OKXBookChannel::Book, OKXWsChannel::Books)]
+    #[case(OKXBookChannel::BookL2Tbt, OKXWsChannel::BooksTbt)]
+    #[case(OKXBookChannel::Books50L2Tbt, OKXWsChannel::Books50Tbt)]
+    #[case(OKXBookChannel::BooksRpi, OKXWsChannel::BooksRpi)]
+    #[case(OKXBookChannel::SprdBooks5, OKXWsChannel::SprdBooks5)]
+    fn test_ws_channel_for_book(#[case] channel: OKXBookChannel, #[case] expected: OKXWsChannel) {
+        assert_eq!(ws_channel_for_book(channel), expected);
+    }
+
+    #[rstest]
+    fn test_timestamp_format_for_websocket_auth() {
+        let now = UnixNanos::new(1_700_000_000_999_999_999);
+
+        assert_eq!(authentication_timestamp(now), "1700000000");
+    }
+
+    #[rstest]
+    #[case(None, None)]
+    #[case(Some(u64::MAX), Some(u64::MAX.to_string()))]
+    fn test_order_request_exp_time(#[case] ttl_ms: Option<u64>, #[case] expected: Option<String>) {
+        let client = OKXWebSocketClient::default().with_order_request_ttl_ms(ttl_ms);
+
+        assert_eq!(client.order_request_exp_time(), expected);
+    }
+
+    #[rstest]
+    fn test_subscription_args_are_sorted_by_topic() {
+        let client = OKXWebSocketClient::default();
+
+        let args = [
+            OKXSubscriptionArg {
+                channel: OKXWsChannel::Instruments,
+                inst_type: Some(OKXInstrumentType::Swap),
+                inst_family: None,
+                inst_id: None,
+            },
+            OKXSubscriptionArg {
+                channel: OKXWsChannel::Instruments,
+                inst_type: Some(OKXInstrumentType::Spot),
+                inst_family: None,
+                inst_id: None,
+            },
+            OKXSubscriptionArg {
+                channel: OKXWsChannel::OpenInterest,
+                inst_type: None,
+                inst_family: Some(Ustr::from("BTC-USD")),
+                inst_id: None,
+            },
+            OKXSubscriptionArg {
+                channel: OKXWsChannel::Tickers,
+                inst_type: None,
+                inst_family: None,
+                inst_id: Some(Ustr::from("ETH-USDT")),
+            },
+            OKXSubscriptionArg {
+                channel: OKXWsChannel::Tickers,
+                inst_type: None,
+                inst_family: None,
+                inst_id: Some(Ustr::from("BTC-USDT")),
+            },
+            OKXSubscriptionArg {
+                channel: OKXWsChannel::Status,
+                inst_type: None,
+                inst_family: None,
+                inst_id: None,
+            },
+        ];
+
+        client.record_subscriptions(&args);
+
+        let topics = subscription_args(&client.subscriptions, &client.subscriptions_state)
+            .iter()
+            .map(topic_from_subscription_arg)
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            topics,
+            [
+                "Instruments:Spot",
+                "Instruments:Swap",
+                "OpenInterest:BTC-USD",
+                "Status",
+                "Tickers:BTC-USDT",
+                "Tickers:ETH-USDT",
+            ]
+        );
+    }
+
+    #[rstest]
+    #[case::channel_unknown(false, true)]
+    #[case::symbol_unknown(true, false)]
+    #[case::both_unknown(false, false)]
+    fn subscription_lookup_does_not_intern_unknown_values(
+        #[case] channel_known: bool,
+        #[case] symbol_known: bool,
+    ) {
+        let state = SubscriptionState::new(OKX_WS_TOPIC_DELIMITER);
+        state.mark_subscribe("Trades:BTC-USDT");
+
+        let channel = if channel_known {
+            "Trades".to_string()
+        } else {
+            format!("unknown_okx_channel_{}", UUID4::new())
+        };
+
+        let symbol = if symbol_known {
+            "BTC-USDT".to_string()
+        } else {
+            format!("unknown_okx_symbol_{}", UUID4::new())
+        };
+
+        let topic = format!("{channel}:{symbol}");
+        let channel_before = Ustr::from_existing(&channel);
+        let symbol_before = Ustr::from_existing(&symbol);
+
+        let subscribed = is_topic_subscribed(&state, &topic);
+
+        assert!(is_topic_subscribed(&state, "Trades:BTC-USDT"));
+        assert!(!subscribed);
+        assert_eq!(channel_before.is_some(), channel_known);
+        assert_eq!(symbol_before.is_some(), symbol_known);
+        assert_eq!(Ustr::from_existing(&channel), channel_before);
+        assert_eq!(Ustr::from_existing(&symbol), symbol_before);
+        assert_eq!(state.all_topics(), vec!["Trades:BTC-USDT".to_string()]);
+    }
+
+    #[rstest]
+    fn pending_unsubscribe_is_excluded_from_replay_arguments() {
+        let client = OKXWebSocketClient::default();
+
+        let canceled = OKXSubscriptionArg {
+            channel: OKXWsChannel::Trades,
+            inst_type: None,
+            inst_family: None,
+            inst_id: Some(Ustr::from("BTC-USDT")),
+        };
+
+        let retained = OKXSubscriptionArg {
+            inst_id: Some(Ustr::from("ETH-USDT")),
+            ..canceled.clone()
+        };
+
+        client.record_subscriptions(&[canceled.clone(), retained.clone()]);
+        let topic = topic_from_subscription_arg(&canceled);
+        client.subscriptions_state.mark_unsubscribe(&topic);
+
+        client.subscriptions_state.reset_after_reconnect();
+        let args = subscription_args(&client.subscriptions, &client.subscriptions_state);
+
+        assert!(client.subscriptions.contains_key(&topic));
+        assert_eq!(args.len(), 1);
+        assert_eq!(args[0].channel, retained.channel);
+        assert_eq!(args[0].inst_id, retained.inst_id);
+        assert_eq!(args[0].inst_type, None);
+        assert_eq!(args[0].inst_family, None);
+    }
+
+    #[tokio::test]
+    async fn subscribe_during_connect_reaches_initialized_handler() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (received_tx, received_rx) = tokio::sync::oneshot::channel();
+
+        let server = tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.unwrap();
+            let mut socket = tokio_tungstenite::accept_async(socket).await.unwrap();
+            if let Some(Ok(message)) = socket.next().await {
+                let _ = received_tx.send(message);
+
+                while matches!(socket.next().await, Some(Ok(_))) {}
+            }
+        });
+
+        let mut ws_client = OKXWebSocketClient::new(
+            Some(format!("ws://{addr}")),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            TransportBackend::default(),
+            None,
+        )
+        .unwrap();
+        let observer = ws_client.clone();
+        let sender = Arc::clone(&ws_client.cmd_tx);
+        let publication = sender.read().await;
+        let mut connect = Box::pin(ws_client.connect());
+
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                assert!(futures_util::poll!(connect.as_mut()).is_pending());
+
+                if sender.try_read().is_err() {
+                    break;
+                }
+
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("connect must wait to publish its sender");
+
+        let active_before_publication = observer.is_active();
+        let mut subscribe =
+            Box::pin(observer.subscribe_inst_id(OKXWsChannel::Trades, Ustr::from("BTC-USDT")));
+        assert!(futures_util::poll!(subscribe.as_mut()).is_pending());
+
+        // Queue a writer behind Subscribe to hold any later SetClient read lock
+        let mut barrier = Box::pin(sender.write());
+        assert!(futures_util::poll!(barrier.as_mut()).is_pending());
+        drop(publication);
+        let connect_result = futures_util::poll!(connect.as_mut());
+        subscribe.await.expect("concurrent subscribe command");
+        let barrier = barrier.await;
+        let received = tokio::time::timeout(Duration::from_secs(2), received_rx).await;
+        drop(barrier);
+
+        if let std::task::Poll::Ready(result) = connect_result {
+            result.expect("connect failed");
+        } else {
+            connect.as_mut().await.expect("connect failed");
+        }
+
+        drop(connect);
+        ws_client.close().await.expect("close failed");
+        server.await.expect("server task failed");
+
+        assert!(
+            !active_before_publication,
+            "active before sender publication"
+        );
+        let message = received.expect("subscription must reach server").unwrap();
+
+        let Message::Text(text) = message else {
+            panic!("expected text subscription")
+        };
+
+        let payload: serde_json::Value = serde_json::from_str(text.as_str()).unwrap();
+        assert_eq!(
+            payload,
+            serde_json::json!({
+                "op": "subscribe",
+                "args": [{ "channel": "trades", "instId": "BTC-USDT" }],
+            })
+        );
+    }
+
+    #[rstest]
+    #[tokio::test]
+    async fn begin_shutdown_stops_handler_before_bounded_close() {
+        let client_id = ClientId::from("OKX-TEST");
+        let endpoint = Ustr::from("okx-test-stream");
+        let registry = SocketReconnectRegistry::default();
+        let control =
+            SocketControl::with_registry(client_id, Some(*OKX_VENUE), endpoint, &registry);
+        let _sink = control.sink();
+        control.register(|| SocketReconnectRequestOutcome::Accepted);
+        let mut client = OKXWebSocketClient::default().with_socket_control(control);
+        client
+            .connection_mode
+            .load()
+            .store(ConnectionMode::Active.as_u8(), Ordering::SeqCst);
+        let (drop_tx, drop_rx) = tokio::sync::oneshot::channel();
+        let signal = DropSignal(Some(drop_tx));
+        let handler_abort = CancellationToken::new();
+        *client.handler_abort.lock() = handler_abort.clone();
+        client
+            .handler_tasks
+            .spawn(async move {
+                let _signal = signal;
+                handler_abort.cancelled().await;
+            })
+            .expect("handler task should register");
+
+        assert!(registry.handle(client_id, endpoint).is_some());
+        client.begin_shutdown();
+
+        tokio::time::timeout(Duration::from_secs(1), drop_rx)
+            .await
+            .expect("begin shutdown must drop the handler task")
+            .expect("drop signal");
+        assert!(client.is_closed());
+        assert!(!client.handler_tasks.is_open());
+        assert!(registry.handle(client_id, endpoint).is_some());
+
+        client.close().await.expect("bounded close");
+        assert!(!client.has_task());
+        assert!(registry.handle(client_id, endpoint).is_none());
+    }
+
+    #[rstest]
+    #[tokio::test]
+    async fn connect_rollback_closes_handler_admission_and_deregisters_socket() {
+        let client_id = ClientId::from("OKX-CONNECT-ROLLBACK");
+        let endpoint = Ustr::from("okx-connect-rollback");
+        let registry = SocketReconnectRegistry::default();
+        let control =
+            SocketControl::with_registry(client_id, Some(*OKX_VENUE), endpoint, &registry);
+        control.register(|| SocketReconnectRequestOutcome::Accepted);
+        let handler_tasks = Arc::new(TaskGroup::new());
+        let signal = Arc::new(AtomicBool::new(false));
+        let handler_abort = CancellationToken::new();
+
+        let rollback = ConnectRollback {
+            handler_tasks: Arc::clone(&handler_tasks),
+            signal: Arc::clone(&signal),
+            handler_abort: handler_abort.clone(),
+            socket_control: Some(Arc::new(control)),
+            armed: true,
+        };
+
+        drop(rollback);
+
+        assert!(!handler_tasks.is_open());
+        assert!(signal.load(Ordering::Acquire));
+        assert!(handler_abort.is_cancelled());
+        assert!(registry.handle(client_id, endpoint).is_none());
+        handler_tasks
+            .finish_shutdown(Duration::ZERO, Duration::from_secs(1))
+            .await
+            .expect("empty handler scope should drain");
+    }
+
+    #[rstest]
+    #[tokio::test]
+    async fn request_close_signals_before_handler_shutdown() {
+        let mut client = OKXWebSocketClient::default();
+        let (cmd_tx, mut cmd_rx) = tokio::sync::mpsc::unbounded_channel();
+        client.cmd_tx = Arc::new(tokio::sync::RwLock::new(cmd_tx));
+        client.signal.store(false, Ordering::Release);
+
+        client.request_close().await;
+
+        assert!(client.signal.load(Ordering::Acquire));
+        assert!(matches!(cmd_rx.try_recv(), Ok(HandlerCommand::Disconnect)));
+    }
+
+    #[rstest]
+    #[tokio::test]
+    async fn close_joins_handler_shared_with_clone() {
+        let mut client = OKXWebSocketClient::default();
+        let (drop_tx, drop_rx) = tokio::sync::oneshot::channel();
+        let signal = DropSignal(Some(drop_tx));
+        client
+            .handler_tasks
+            .spawn(async move {
+                let _signal = signal;
+                std::future::pending::<()>().await;
+            })
+            .expect("handler task should register");
+        let retained = client.clone();
+
+        client.close().await.expect("close with retained clone");
+
+        tokio::time::timeout(Duration::from_secs(1), drop_rx)
+            .await
+            .expect("close must drop the handler task")
+            .expect("drop signal");
+        assert!(!client.has_task());
+        assert!(!retained.has_task());
+    }
+
+    #[rstest]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn timeout_retains_unfinished_handler_task() {
+        let mut client = OKXWebSocketClient::default();
+        let release = Arc::new((parking_lot::Mutex::new(false), parking_lot::Condvar::new()));
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let blocking_drop = BlockingDrop(Arc::clone(&release));
+        client
+            .handler_tasks
+            .spawn(async move {
+                let _blocking_drop = blocking_drop;
+                started_tx.send(()).expect("started receiver");
+                std::future::pending::<()>().await;
+            })
+            .expect("handler task should register");
+        started_rx.await.expect("blocking task started");
+        client.begin_shutdown();
+
+        let result = client.close_stream_task(Duration::from_millis(10)).await;
+        let retained = client.has_task();
+        let reconnect_result = client.connect().await;
+
+        let (lock, condvar) = &*release;
+        *lock.lock() = true;
+        condvar.notify_all();
+
+        client
+            .close_stream_task(Duration::from_secs(1))
+            .await
+            .expect("blocking handler task terminated");
+
+        assert!(result.is_err());
+        assert!(retained);
+        assert_eq!(
+            reconnect_result
+                .expect_err("reconnect with unfinished handler")
+                .to_string(),
+            "Cannot connect while previous WebSocket handler task is still running"
+        );
+        assert!(!client.has_task());
+    }
+
+    #[rstest]
+    fn test_feed_handler_reconnection_detection() {
+        let msg = Message::Text(RECONNECTED.to_string().into());
+        let result = OKXWsFeedHandler::parse_raw_message(msg);
+        assert!(matches!(result, Some(OKXWsFrame::Reconnected)));
+    }
+
+    #[rstest]
+    fn test_feed_handler_normal_message_processing() {
+        let ping_msg = Message::Text(TEXT_PING.to_string().into());
+        let result = OKXWsFeedHandler::parse_raw_message(ping_msg);
+        assert!(matches!(result, Some(OKXWsFrame::Ping)));
+
+        let sub_msg = r#"{
+            "event": "subscribe",
+            "arg": {
+                "channel": "tickers",
+                "instType": "SPOT"
+            },
+            "connId": "a4d3ae55"
+        }"#;
+
+        let sub_result =
+            OKXWsFeedHandler::parse_raw_message(Message::Text(sub_msg.to_string().into()));
+        assert!(matches!(sub_result, Some(OKXWsFrame::Subscription { .. })));
+    }
+
+    #[rstest]
+    fn test_feed_handler_close_message() {
+        let result = OKXWsFeedHandler::parse_raw_message(Message::Close(None));
+        assert!(result.is_none());
+    }
+
+    #[rstest]
+    fn test_reconnection_message_constant() {
+        assert_eq!(RECONNECTED, "__RECONNECTED__");
+    }
+
+    #[rstest]
+    fn resubscribe_batches_subscription_args_into_venue_message_size() {
+        let args: Vec<_> = (0..300)
+            .map(|i| OKXSubscriptionArg {
+                channel: OKXWsChannel::Tickers,
+                inst_type: None,
+                inst_family: None,
+                inst_id: Some(Ustr::from(&format!("INST-{i}"))),
+            })
+            .collect();
+
+        let batches: Vec<_> = subscription_arg_batches(&args).collect();
+
+        assert_eq!(OKX_WS_SUBSCRIPTION_ARGS_MAX_PER_MESSAGE, 256);
+        assert_eq!(batches.len(), 2);
+        assert_eq!(batches[0].len(), 256);
+        assert_eq!(batches[1].len(), 44);
+    }
+
+    #[rstest]
+    #[case::buffered_notifications(false)]
+    #[case::notification_during_install(true)]
+    fn buffered_reconnects_advance_only_the_active_epoch(#[case] install_window: bool) {
+        let mut reconnect_epoch = 0;
+        if install_window {
+            let advanced = advance_reconnect_epoch(&mut reconnect_epoch, 2, false, false);
+            assert!(!advanced);
+            assert_eq!(reconnect_epoch, 0);
+        }
+
+        let first = advance_reconnect_epoch(&mut reconnect_epoch, 2, false, true);
+        let duplicate = advance_reconnect_epoch(&mut reconnect_epoch, 2, false, true);
+        let next = advance_reconnect_epoch(&mut reconnect_epoch, 3, false, true);
+
+        assert!(first);
+        assert!(!duplicate);
+        assert!(next);
+        assert_eq!(reconnect_epoch, 3);
+    }
+
+    #[rstest]
+    fn stopped_reconnect_does_not_advance_the_epoch() {
+        let mut reconnect_epoch = 1;
+        let advanced = advance_reconnect_epoch(&mut reconnect_epoch, 2, true, true);
+
+        assert!(!advanced);
+        assert_eq!(reconnect_epoch, 1);
+    }
+
+    #[rstest]
+    #[tokio::test]
+    async fn authenticate_session_sends_login_and_completes_on_success() {
+        let (ws_client, mut received, server) = connect_auth_socket().await;
+        let auth_tracker = AuthTracker::new();
+        let credential = Credential::new("key".into(), "secret".into(), "pass".into());
+        let clock = Box::leak(Box::new(AtomicTime::new(
+            false,
+            UnixNanos::new(1_700_000_000_999_999_999),
+        )));
+        let timestamp = authentication_timestamp(clock.get_time_ns());
+        let signature = credential.sign(&timestamp, "GET", "/users/self/verify", "");
+        let tracker = auth_tracker.clone();
+
+        let task = {
+            let ws_client = Arc::clone(&ws_client);
+
+            tokio::spawn(async move {
+                authenticate_session(
+                    &credential,
+                    &auth_tracker,
+                    &ws_client,
+                    ws_client.connection_epoch(),
+                    clock,
+                    5,
+                )
+                .await
+            })
+        };
+
+        let frame = tokio::time::timeout(Duration::from_secs(5), received.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        let payload: Value = serde_json::from_str(frame.to_text().unwrap()).unwrap();
+        tracker.succeed();
+        task.await.unwrap().unwrap();
+        ws_client.disconnect().await;
+        server.abort();
+
+        assert_eq!(payload.as_object().unwrap().len(), 2);
+        assert_eq!(payload["op"], "login");
+        assert_eq!(payload["args"].as_array().unwrap().len(), 1);
+        assert_eq!(payload["args"][0].as_object().unwrap().len(), 4);
+        assert_eq!(payload["args"][0]["apiKey"], "key");
+        assert_eq!(payload["args"][0]["passphrase"], "pass");
+        assert_eq!(payload["args"][0]["timestamp"], timestamp);
+        assert_eq!(payload["args"][0]["sign"], signature);
+    }
+
+    #[rstest]
+    #[tokio::test]
+    async fn authenticate_session_rejects_mismatched_epoch_without_resetting_tracker() {
+        let (ws_client, mut received, server) = connect_auth_socket().await;
+        let auth_tracker = AuthTracker::new();
+        auth_tracker.succeed();
+        let credential = Credential::new("key".into(), "secret".into(), "pass".into());
+
+        let error = authenticate_session(
+            &credential,
+            &auth_tracker,
+            &ws_client,
+            ws_client.connection_epoch() + 1,
+            get_atomic_clock_realtime(),
+            5,
+        )
+        .await
+        .unwrap_err();
+        let authenticated = auth_tracker.is_authenticated();
+        let frame = received.try_recv();
+        ws_client.disconnect().await;
+        server.abort();
+
+        assert!(matches!(error, Error::Io(e) if matches!(
+            e.get_ref().and_then(|e| e.downcast_ref::<SendError>()),
+            Some(SendError::ConnectionChanged),
+        )));
+        assert!(authenticated);
+        assert!(matches!(
+            frame,
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+        ));
+    }
+
+    #[rstest]
+    fn auth_attempt_superseded_matches_tracker_message() {
+        let error = Error::Io(std::io::Error::other("Authentication attempt superseded"));
+        assert!(auth_attempt_superseded(&error));
+        let changed = Error::Io(std::io::Error::other(SendError::ConnectionChanged));
+        assert!(auth_attempt_superseded(&changed));
+        let other = Error::Io(std::io::Error::other("Authentication timed out"));
+        assert!(!auth_attempt_superseded(&other));
+    }
+
+    #[rstest]
+    #[tokio::test]
+    async fn reauthenticate_session_starts_fresh_attempt_when_tracker_is_authenticated() {
+        let (ws_client, mut rx, server) = connect_auth_socket().await;
+        let auth_tracker = AuthTracker::new();
+        auth_tracker.succeed();
+        let tracker = auth_tracker.clone();
+
+        let task = {
+            let ws_client = Arc::clone(&ws_client);
+
+            tokio::spawn(reauthenticate_session(
+                Credential::new("key".into(), "secret".into(), "pass".into()),
+                auth_tracker,
+                Arc::clone(&ws_client),
+                ws_client.connection_epoch(),
+                get_atomic_clock_realtime(),
+                5,
+                Arc::new(AtomicBool::new(false)),
+                CancellationToken::new(),
+            ))
+        };
+
+        let received = tokio::time::timeout(Duration::from_secs(1), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        let authenticated_before_ack = tracker.is_authenticated();
+        tracker.succeed();
+        task.await.unwrap();
+        ws_client.disconnect().await;
+        server.abort();
+
+        let payload: Value = serde_json::from_str(received.to_text().unwrap()).unwrap();
+        assert_eq!(payload["op"], "login");
+        assert!(!authenticated_before_ack);
+        assert!(tracker.is_authenticated());
+    }
+
+    #[rstest]
+    #[tokio::test]
+    async fn reauthenticate_session_stops_when_aborted() {
+        let (ws_client, mut rx, server) = connect_auth_socket().await;
+        let abort = CancellationToken::new();
+        abort.cancel();
+
+        tokio::time::timeout(
+            Duration::from_millis(200),
+            reauthenticate_session(
+                Credential::new("key".into(), "secret".into(), "pass".into()),
+                AuthTracker::new(),
+                Arc::clone(&ws_client),
+                ws_client.connection_epoch(),
+                get_atomic_clock_realtime(),
+                5,
+                Arc::new(AtomicBool::new(false)),
+                abort,
+            ),
+        )
+        .await
+        .expect("aborted authentication must return without waiting");
+        let received = rx.try_recv();
+        ws_client.disconnect().await;
+        server.abort();
+        assert!(matches!(
+            received,
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+        ));
+    }
+
+    async fn connect_auth_socket() -> (
+        Arc<WebSocketClient>,
+        tokio::sync::mpsc::UnboundedReceiver<Message>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+
+        let server = tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.unwrap();
+            let mut socket = tokio_tungstenite::accept_async(socket).await.unwrap();
+            while let Some(Ok(frame)) = socket.next().await {
+                if tx.send(frame).is_err() {
+                    break;
+                }
+            }
+        });
+
+        let config = WebSocketConfig::builder()
+            .url(format!("ws://{addr}"))
+            .build()
+            .unwrap();
+        let ws_client = WebSocketClient::builder()
+            .config(config)
+            .message_handler(Arc::new(|_| {}))
+            .connect()
+            .await
+            .unwrap();
+        (Arc::new(ws_client), rx, server)
+    }
+
+    #[rstest]
+    fn test_multiple_reconnection_signals() {
+        for _ in 0..3 {
+            let msg = Message::Text(RECONNECTED.to_string().into());
+            let result = OKXWsFeedHandler::parse_raw_message(msg);
+            assert!(matches!(result, Some(OKXWsFrame::Reconnected)));
+        }
+    }
+
+    fn sample_canceled_order_msg() -> OKXOrderMsg {
+        OKXOrderMsg {
+            acc_fill_sz: Some("0".to_string()),
+            avg_px: "0".to_string(),
+            c_time: 0,
+            cancel_source: None,
+            cancel_source_reason: None,
+            category: OKXOrderCategory::Normal,
+            ccy: Ustr::from("USDT"),
+            cl_ord_id: "order-1".to_string(),
+            algo_cl_ord_id: None,
+            attach_algo_cl_ord_id: None,
+            attach_algo_ords: Vec::new(),
+            outcome: None,
+            fee: None,
+            fee_ccy: Ustr::from("USDT"),
+            fill_px: "0".to_string(),
+            fill_sz: "0".to_string(),
+            fill_time: 0,
+            inst_id: Ustr::from("ETH-USDT-SWAP"),
+            inst_type: OKXInstrumentType::Swap,
+            lever: "1".to_string(),
+            ord_id: Ustr::from("123456"),
+            ord_type: OKXOrderType::Limit,
+            pnl: "0".to_string(),
+            pos_side: OKXPositionSide::Net,
+            px: "0".to_string(),
+            reduce_only: "false".to_string(),
+            side: OKXSide::Buy,
+            state: OKXOrderStatus::Canceled,
+            exec_type: OKXExecType::None,
+            sz: "1".to_string(),
+            td_mode: OKXTradeMode::Cross,
+            tgt_ccy: None,
+            trade_id: String::new(),
+            algo_id: None,
+            fill_fee: None,
+            fill_fee_ccy: None,
+            fill_mark_px: None,
+            fill_mark_vol: None,
+            fill_px_vol: None,
+            fill_px_usd: None,
+            fill_fwd_px: None,
+            fill_notional_usd: None,
+            fill_pnl: None,
+            is_tp_limit: None,
+            linked_algo_ord: None,
+            notional_usd: None,
+            px_type: OKXPriceType::None,
+            px_usd: None,
+            px_vol: None,
+            quick_mgn_type: OKXQuickMarginType::None,
+            rebate: None,
+            rebate_ccy: None,
+            sl_ord_px: None,
+            sl_trigger_px: None,
+            sl_trigger_px_type: None,
+            source: None,
+            stp_id: None,
+            stp_mode: OKXSelfTradePreventionMode::None,
+            tag: None,
+            tp_ord_px: None,
+            tp_trigger_px: None,
+            tp_trigger_px_type: None,
+            amend_result: None,
+            req_id: None,
+            code: None,
+            msg: None,
+            u_time: 0,
+        }
+    }
+
+    #[rstest]
+    fn test_is_post_only_auto_cancel_detects_cancel_source() {
+        let mut msg = sample_canceled_order_msg();
+        msg.cancel_source = Some(OKX_POST_ONLY_CANCEL_SOURCE.to_string());
+
+        assert!(is_post_only_auto_cancel(&msg));
+    }
+
+    #[rstest]
+    fn test_is_post_only_auto_cancel_detects_reason() {
+        let mut msg = sample_canceled_order_msg();
+        msg.cancel_source_reason = Some("POST_ONLY would take liquidity".to_string());
+
+        assert!(is_post_only_auto_cancel(&msg));
+    }
+
+    #[rstest]
+    fn test_is_post_only_auto_cancel_false_without_markers() {
+        let msg = sample_canceled_order_msg();
+
+        assert!(!is_post_only_auto_cancel(&msg));
+    }
+
+    #[rstest]
+    fn test_is_post_only_auto_cancel_false_for_order_type_only() {
+        let mut msg = sample_canceled_order_msg();
+        msg.ord_type = OKXOrderType::PostOnly;
+
+        assert!(!is_post_only_auto_cancel(&msg));
+    }
+}

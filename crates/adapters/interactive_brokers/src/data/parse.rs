@@ -1,0 +1,861 @@
+// -------------------------------------------------------------------------------------------------
+//  Copyright (C) 2015-2026 Nautech Systems Pty Ltd. All rights reserved.
+//  https://nautechsystems.io
+//
+//  Licensed under the GNU Lesser General Public License Version 3.0 (the "License");
+//  You may not use this file except in compliance with the License.
+//  You may obtain a copy of the License at https://www.gnu.org/licenses/lgpl-3.0.en.html
+//
+//  Unless required by applicable law or agreed to in writing, software
+//  distributed under the License is distributed on an "AS IS" BASIS,
+//  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+//  See the License for the specific language governing permissions and
+//  limitations under the License.
+// -------------------------------------------------------------------------------------------------
+
+//! Parsing utilities for converting Interactive Brokers data to Nautilus types.
+
+use ibapi::contracts::{OptionComputation, tick_types::TickType};
+use nautilus_core::UnixNanos;
+use nautilus_model::{
+    data::{
+        Bar, BarType, IndexPriceUpdate, QuoteTick, TradeTick, greeks::OptionGreekValues,
+        option_chain::OptionGreeks,
+    },
+    enums::{AggressorSide, BookAction, GreeksConvention},
+    identifiers::{InstrumentId, TradeId},
+    types::{Price, Quantity},
+};
+use thiserror::Error;
+
+use super::convert::IbPriceConverter;
+
+#[derive(Debug, PartialEq, Error)]
+#[error("quantity size={size} cannot be represented with precision={precision}")]
+struct QuantityPrecisionError {
+    size: f64,
+    precision: u8,
+}
+
+fn checked_quantity(size: f64, precision: u8) -> anyhow::Result<Quantity> {
+    let quantity = Quantity::new_checked(size, precision)
+        .map_err(|e| anyhow::anyhow!("invalid quantity size={size}: {e}"))?;
+    if !is_representable_size(quantity, size, precision) {
+        anyhow::bail!(QuantityPrecisionError { size, precision });
+    }
+
+    Ok(quantity)
+}
+
+/// Returns whether `quantity`, built from `size` at `precision`, kept `size` without rounding.
+///
+/// The tolerance grows with the size: `Quantity::as_f64` divides a 128-bit raw by the fixed
+/// scalar, so it can be an ulp or two off the size (2.3e-10 for 1975139), which a fixed
+/// tolerance rejects.
+pub(super) fn is_representable_size(quantity: Quantity, size: f64, precision: u8) -> bool {
+    let tolerance =
+        (10_f64.powi(-i32::from(precision)) * 1e-9).max(size.abs() * 4.0 * f64::EPSILON);
+    (quantity.as_f64() - size).abs() <= tolerance
+}
+
+/// Generates the stable fallback trade ID used when IB omits an execution identifier.
+pub(crate) fn generate_ib_trade_id(ts_event: UnixNanos, price: f64, size: f64) -> TradeId {
+    let ts_secs = ts_event.as_i64() / 1_000_000_000;
+    TradeId::new(format!("{ts_secs}-{price}-{size}"))
+}
+
+/// Parse IB tick price and size data into a QuoteTick.
+///
+/// This builds a quote from individual tick updates. You typically need to accumulate
+/// bid/ask prices and sizes from multiple tick updates before creating a QuoteTick.
+///
+/// # Errors
+///
+/// Returns an error if price or size conversion fails.
+#[allow(clippy::too_many_arguments)]
+pub fn parse_quote_tick(
+    instrument_id: InstrumentId,
+    bid_price: Option<f64>,
+    ask_price: Option<f64>,
+    bid_size: Option<f64>,
+    ask_size: Option<f64>,
+    prices: IbPriceConverter,
+    size_precision: u8,
+    ts_event: UnixNanos,
+    ts_init: UnixNanos,
+) -> anyhow::Result<QuoteTick> {
+    let bid = bid_price.map(|p| prices.bid_price(p)).transpose()?;
+    let ask = ask_price.map(|p| prices.ask_price(p)).transpose()?;
+    let bid_qty = bid_size
+        .map(|s| checked_quantity(s, size_precision))
+        .transpose()?;
+    let ask_qty = ask_size
+        .map(|s| checked_quantity(s, size_precision))
+        .transpose()?;
+
+    Ok(QuoteTick::new(
+        instrument_id,
+        bid.unwrap_or_else(|| Price::zero(prices.precision())),
+        ask.unwrap_or_else(|| Price::zero(prices.precision())),
+        bid_qty.unwrap_or_else(|| Quantity::zero(size_precision)),
+        ask_qty.unwrap_or_else(|| Quantity::zero(size_precision)),
+        ts_event,
+        ts_init,
+    ))
+}
+
+/// Parse IB trade tick data into a TradeTick.
+///
+/// # Errors
+///
+/// Returns an error if price or size conversion fails.
+#[allow(clippy::too_many_arguments)]
+pub fn parse_trade_tick(
+    instrument_id: InstrumentId,
+    price: f64,
+    size: f64,
+    prices: IbPriceConverter,
+    size_precision: u8,
+    ts_event: UnixNanos,
+    ts_init: UnixNanos,
+    trade_id: Option<TradeId>,
+) -> anyhow::Result<TradeTick> {
+    let trade_price = prices
+        .price(price)
+        .map_err(|e| anyhow::anyhow!("invalid trade price={price}: {e}"))?;
+    let trade_size = checked_quantity(size, size_precision)?;
+    let aggressor_side = AggressorSide::NoAggressor; // IB doesn't provide this directly
+    let trade_id = trade_id.unwrap_or_else(|| generate_ib_trade_id(ts_event, price, size));
+
+    TradeTick::new_checked(
+        instrument_id,
+        trade_price,
+        trade_size,
+        aggressor_side,
+        trade_id,
+        ts_event,
+        ts_init,
+    )
+    .map_err(|e| anyhow::anyhow!("invalid trade tick: {e}"))
+}
+
+pub(super) fn log_tick_parse_error(kind: &str, instrument_id: InstrumentId, e: &anyhow::Error) {
+    if e.is::<QuantityPrecisionError>() {
+        tracing::debug!("Dropping IB {kind} tick for {instrument_id}: {e}");
+    } else {
+        tracing::warn!("Failed to parse IB {kind} tick for {instrument_id}: {e}");
+    }
+}
+
+/// Parse IB index price data into an [`IndexPriceUpdate`].
+///
+/// # Errors
+///
+/// Returns an error if the price conversion fails.
+pub fn parse_index_price(
+    instrument_id: InstrumentId,
+    price: f64,
+    prices: IbPriceConverter,
+    ts_event: UnixNanos,
+    ts_init: UnixNanos,
+) -> anyhow::Result<IndexPriceUpdate> {
+    Ok(IndexPriceUpdate::new(
+        instrument_id,
+        prices.price(price)?,
+        ts_event,
+        ts_init,
+    ))
+}
+
+/// Parse an IB option computation into Nautilus option greeks when the tick carries model greeks.
+#[must_use]
+pub fn parse_option_computation_to_option_greeks(
+    instrument_id: InstrumentId,
+    computation: &OptionComputation,
+    ts_event: UnixNanos,
+    ts_init: UnixNanos,
+) -> Option<OptionGreeks> {
+    match computation.field {
+        TickType::ModelOption | TickType::DelayedModelOption => Some(OptionGreeks {
+            instrument_id,
+            greeks: OptionGreekValues {
+                delta: computation.delta.unwrap_or_default(),
+                gamma: computation.gamma.unwrap_or_default(),
+                vega: computation.vega.unwrap_or_default(),
+                theta: computation.theta.unwrap_or_default(),
+                rho: 0.0, // IB does not publish rho in tickOptionComputation
+            },
+            convention: GreeksConvention::BlackScholes,
+            mark_iv: computation.implied_volatility,
+            bid_iv: None,
+            ask_iv: None,
+            underlying_price: computation.underlying_price,
+            open_interest: None,
+            ts_event,
+            ts_init,
+        }),
+        _ => None,
+    }
+}
+
+/// Parse open interest from an IB tick type when present.
+#[must_use]
+pub fn parse_option_open_interest(tick_type: &TickType, value: f64) -> Option<f64> {
+    match tick_type {
+        TickType::OpenInterest
+        | TickType::OptionCallOpenInterest
+        | TickType::OptionPutOpenInterest => Some(value),
+        _ => None,
+    }
+}
+
+/// Parse IB real-time bar data into a Bar.
+///
+/// # Errors
+///
+/// Returns an error if price or size conversion fails.
+#[allow(clippy::too_many_arguments)]
+pub fn parse_realtime_bar(
+    bar_type: BarType,
+    open: f64,
+    high: f64,
+    low: f64,
+    close: f64,
+    volume: f64,
+    prices: IbPriceConverter,
+    size_precision: u8,
+    ts_event: UnixNanos,
+    ts_init: UnixNanos,
+) -> anyhow::Result<Bar> {
+    let price_type = bar_type.spec().price_type;
+    let open_price = prices.bar_price(price_type, open)?;
+    let high_price = prices.bar_price(price_type, high)?;
+    let low_price = prices.bar_price(price_type, low)?;
+    let close_price = prices.bar_price(price_type, close)?;
+    let bar_volume = Quantity::new(volume, size_precision);
+
+    Ok(Bar::new(
+        bar_type,
+        open_price,
+        high_price,
+        low_price,
+        close_price,
+        bar_volume,
+        ts_event,
+        ts_init,
+    ))
+}
+
+/// Parse IB market depth operation to BookAction.
+#[must_use]
+pub fn parse_market_depth_operation(operation: i32) -> Option<BookAction> {
+    match operation {
+        0 => Some(BookAction::Add),
+        1 => Some(BookAction::Update),
+        2 => Some(BookAction::Delete),
+        _ => None,
+    }
+}
+
+// Note: ib_timestamp_to_unix_nanos moved to convert.rs
+
+#[cfg(test)]
+mod tests {
+    use ibapi::contracts::{OptionComputation, tick_types::TickType};
+    use nautilus_core::UnixNanos;
+    use nautilus_model::{
+        data::{BarSpecification, BarType},
+        enums::{AggregationSource, BarAggregation, PriceType},
+        identifiers::{InstrumentId, Symbol, Venue},
+        instruments::Instrument,
+    };
+    use rstest::rstest;
+    use rust_decimal::Decimal;
+
+    use super::*;
+    use crate::stubs::currency_pair;
+
+    fn create_test_instrument_id() -> InstrumentId {
+        InstrumentId::new(Symbol::from("AAPL"), Venue::from("NASDAQ"))
+    }
+
+    #[rstest]
+    fn test_parse_quote_tick_with_all_fields() {
+        let instrument_id = create_test_instrument_id();
+        let result = parse_quote_tick(
+            instrument_id,
+            Some(150.25),
+            Some(150.30),
+            Some(100.0),
+            Some(200.0),
+            IbPriceConverter::new(2),
+            0,
+            UnixNanos::new(0),
+            UnixNanos::new(0),
+        );
+        assert!(result.is_ok());
+        let quote = result.unwrap();
+        assert_eq!(quote.bid_price.as_f64(), 150.25);
+        assert_eq!(quote.ask_price.as_f64(), 150.30);
+        assert_eq!(quote.bid_size.as_f64(), 100.0);
+        assert_eq!(quote.ask_size.as_f64(), 200.0);
+    }
+
+    #[rstest]
+    fn test_parse_quote_tick_with_partial_fields() {
+        let instrument_id = create_test_instrument_id();
+        let result = parse_quote_tick(
+            instrument_id,
+            Some(150.25),
+            None,
+            Some(100.0),
+            None,
+            IbPriceConverter::new(2),
+            0,
+            UnixNanos::new(0),
+            UnixNanos::new(0),
+        );
+        assert!(result.is_ok());
+        let quote = result.unwrap();
+        assert_eq!(quote.bid_price.as_f64(), 150.25);
+        assert_eq!(quote.ask_price.as_f64(), 0.0); // Should default to zero
+        assert_eq!(quote.bid_size.as_f64(), 100.0);
+        assert_eq!(quote.ask_size.as_f64(), 0.0); // Should default to zero
+    }
+
+    #[rstest]
+    fn test_parse_quote_tick_with_no_fields() {
+        let instrument_id = create_test_instrument_id();
+        let result = parse_quote_tick(
+            instrument_id,
+            None,
+            None,
+            None,
+            None,
+            IbPriceConverter::new(2),
+            0,
+            UnixNanos::new(0),
+            UnixNanos::new(0),
+        );
+        assert!(result.is_ok());
+        let quote = result.unwrap();
+        assert_eq!(quote.bid_price.as_f64(), 0.0);
+        assert_eq!(quote.ask_price.as_f64(), 0.0);
+    }
+
+    #[rstest]
+    fn test_parse_trade_tick_with_trade_id() {
+        let instrument_id = create_test_instrument_id();
+        let trade_id = TradeId::from("TRADE-001");
+        let result = parse_trade_tick(
+            instrument_id,
+            150.25,
+            100.0,
+            IbPriceConverter::new(2),
+            0,
+            UnixNanos::new(0),
+            UnixNanos::new(0),
+            Some(trade_id),
+        );
+        assert!(result.is_ok());
+        let trade = result.unwrap();
+        assert_eq!(trade.price.as_f64(), 150.25);
+        assert_eq!(trade.size.as_f64(), 100.0);
+        assert_eq!(trade.trade_id, trade_id);
+    }
+
+    #[rstest]
+    fn test_parse_trade_tick_without_trade_id() {
+        let instrument_id = create_test_instrument_id();
+        let result = parse_trade_tick(
+            instrument_id,
+            150.25,
+            100.0,
+            IbPriceConverter::new(2),
+            0,
+            UnixNanos::new(1000),
+            UnixNanos::new(1000),
+            None,
+        );
+        assert!(result.is_ok());
+        let trade = result.unwrap();
+        assert_eq!(trade.price.as_f64(), 150.25);
+        assert_eq!(trade.size.as_f64(), 100.0);
+        // Trade ID should be auto-generated
+        assert!(!trade.trade_id.to_string().is_empty());
+    }
+
+    #[rstest]
+    fn test_parse_trade_tick_rejects_unrepresentable_size() {
+        let instrument_id = create_test_instrument_id();
+        let result = parse_trade_tick(
+            instrument_id,
+            150.25,
+            0.5,
+            IbPriceConverter::new(2),
+            0,
+            UnixNanos::new(1000),
+            UnixNanos::new(1000),
+            None,
+        );
+
+        let e = result.unwrap_err();
+        assert_eq!(
+            e.downcast_ref::<QuantityPrecisionError>(),
+            Some(&QuantityPrecisionError {
+                size: 0.5,
+                precision: 0
+            })
+        );
+    }
+
+    #[rstest]
+    #[case(0.63462, 0)]
+    #[case(1.025, 2)]
+    #[case(1_975_139.005, 2)]
+    fn test_quantity_precision_error_preserves_size(#[case] size: f64, #[case] precision: u8) {
+        let e = checked_quantity(size, precision).unwrap_err();
+        assert_eq!(
+            e.downcast_ref::<QuantityPrecisionError>(),
+            Some(&QuantityPrecisionError { size, precision })
+        );
+    }
+
+    #[rstest]
+    #[case(1_975_139.0, 2)]
+    #[case(1_975_139.25, 2)]
+    #[case(123_456_789.0, 0)]
+    fn test_checked_quantity_accepts_large_sizes(#[case] size: f64, #[case] precision: u8) {
+        let quantity = checked_quantity(size, precision).unwrap();
+
+        assert_eq!(quantity, Quantity::new(size, precision));
+    }
+
+    #[rstest]
+    #[case(-1.0)]
+    #[case(f64::NAN)]
+    #[case(f64::INFINITY)]
+    fn test_invalid_quantities_are_not_expected_precision_drops(#[case] size: f64) {
+        let e = checked_quantity(size, 0).unwrap_err();
+        assert!(!e.is::<QuantityPrecisionError>());
+    }
+
+    #[rstest]
+    fn test_parse_trade_tick_rejects_zero_size() {
+        let result = parse_trade_tick(
+            create_test_instrument_id(),
+            150.25,
+            0.0,
+            IbPriceConverter::new(2),
+            0,
+            UnixNanos::new(1000),
+            UnixNanos::new(1000),
+            None,
+        );
+
+        assert_eq!(
+            result.unwrap_err().to_string(),
+            "invalid trade tick: invalid `Quantity` for 'size' not positive, was 0",
+        );
+    }
+
+    #[rstest]
+    fn test_parse_quote_tick_rejects_unrepresentable_size() {
+        let instrument_id = create_test_instrument_id();
+        let result = parse_quote_tick(
+            instrument_id,
+            Some(150.25),
+            Some(150.30),
+            Some(0.5),
+            Some(200.0),
+            IbPriceConverter::new(2),
+            0,
+            UnixNanos::new(0),
+            UnixNanos::new(0),
+        );
+
+        assert!(result.is_err());
+    }
+
+    #[rstest]
+    fn test_parse_index_price_with_price_magnifier() {
+        let instrument_id = create_test_instrument_id();
+        let result = parse_index_price(
+            instrument_id,
+            452525.0,
+            IbPriceConverter::new(2).with_price_magnifier(100),
+            UnixNanos::new(0),
+            UnixNanos::new(0),
+        );
+        assert!(result.is_ok());
+        let index_price = result.unwrap();
+        assert_eq!(index_price.value.as_f64(), 4525.25);
+    }
+
+    #[rstest]
+    fn test_parse_index_price_without_price_magnifier() {
+        let instrument_id = create_test_instrument_id();
+        let result = parse_index_price(
+            instrument_id,
+            4525.25,
+            IbPriceConverter::new(2),
+            UnixNanos::new(0),
+            UnixNanos::new(0),
+        );
+        assert!(result.is_ok());
+        let index_price = result.unwrap();
+        assert_eq!(index_price.value.as_f64(), 4525.25);
+    }
+
+    #[rstest]
+    fn test_parse_realtime_bar() {
+        let instrument_id = create_test_instrument_id();
+
+        let bar_type = BarType::new(
+            instrument_id,
+            BarSpecification::new(1, BarAggregation::Minute, PriceType::Last),
+            AggregationSource::External,
+        );
+        let result = parse_realtime_bar(
+            bar_type,
+            150.0,
+            151.0,
+            149.0,
+            150.5,
+            1000.0,
+            IbPriceConverter::new(2),
+            0,
+            UnixNanos::new(0),
+            UnixNanos::new(0),
+        );
+        assert!(result.is_ok());
+        let bar = result.unwrap();
+        assert_eq!(bar.open.as_f64(), 150.0);
+        assert_eq!(bar.high.as_f64(), 151.0);
+        assert_eq!(bar.low.as_f64(), 149.0);
+        assert_eq!(bar.close.as_f64(), 150.5);
+        assert_eq!(bar.volume.as_f64(), 1000.0);
+    }
+
+    #[rstest]
+    fn test_parse_market_depth_operation_insert() {
+        let action = parse_market_depth_operation(0);
+        assert_eq!(action, Some(BookAction::Add));
+    }
+
+    #[rstest]
+    fn test_parse_market_depth_operation_update() {
+        let action = parse_market_depth_operation(1);
+        assert_eq!(action, Some(BookAction::Update));
+    }
+
+    #[rstest]
+    fn test_parse_market_depth_operation_delete() {
+        let action = parse_market_depth_operation(2);
+        assert_eq!(action, Some(BookAction::Delete));
+    }
+
+    #[rstest]
+    fn test_parse_market_depth_operation_unknown() {
+        let action = parse_market_depth_operation(99);
+        assert_eq!(action, None);
+    }
+
+    #[rstest]
+    fn test_parse_quote_tick_precision() {
+        let instrument_id = create_test_instrument_id();
+        let result = parse_quote_tick(
+            instrument_id,
+            Some(150.255),
+            Some(150.305),
+            Some(100.0),
+            Some(200.0),
+            IbPriceConverter::new(2), // Price precision: 2 decimal places
+            0,                        // Size precision: 0 decimal places
+            UnixNanos::new(0),
+            UnixNanos::new(0),
+        );
+        assert!(result.is_ok());
+        let quote = result.unwrap();
+        // Prices should be rounded to 2 decimal places
+        assert_eq!(quote.bid_price.as_f64(), 150.26); // Rounded up
+        assert_eq!(quote.ask_price.as_f64(), 150.31); // Rounded up
+    }
+
+    #[rstest]
+    fn test_parse_option_computation_to_option_greeks_from_model_tick() {
+        let instrument_id = create_test_instrument_id();
+
+        let greeks = parse_option_computation_to_option_greeks(
+            instrument_id,
+            &OptionComputation {
+                field: TickType::ModelOption,
+                implied_volatility: Some(0.25),
+                delta: Some(0.55),
+                gamma: Some(0.02),
+                vega: Some(0.15),
+                theta: Some(-0.05),
+                underlying_price: Some(155.0),
+                ..Default::default()
+            },
+            UnixNanos::new(10),
+            UnixNanos::new(11),
+        )
+        .unwrap();
+
+        assert_eq!(greeks.instrument_id, instrument_id);
+        assert_eq!(greeks.delta, 0.55);
+        assert_eq!(greeks.gamma, 0.02);
+        assert_eq!(greeks.vega, 0.15);
+        assert_eq!(greeks.theta, -0.05);
+        assert_eq!(greeks.rho, 0.0);
+        assert_eq!(greeks.mark_iv, Some(0.25));
+        assert_eq!(greeks.underlying_price, Some(155.0));
+        assert_eq!(greeks.open_interest, None);
+        assert_eq!(greeks.ts_event, UnixNanos::new(10));
+        assert_eq!(greeks.ts_init, UnixNanos::new(11));
+    }
+
+    #[rstest]
+    fn test_parse_option_computation_to_option_greeks_ignores_non_model_tick() {
+        let instrument_id = create_test_instrument_id();
+
+        let greeks = parse_option_computation_to_option_greeks(
+            instrument_id,
+            &OptionComputation {
+                field: TickType::BidOption,
+                implied_volatility: Some(0.24),
+                ..Default::default()
+            },
+            UnixNanos::new(10),
+            UnixNanos::new(11),
+        );
+
+        assert!(greeks.is_none());
+    }
+
+    #[rstest]
+    fn test_parse_option_open_interest_supports_option_interest_tick_types() {
+        assert_eq!(
+            parse_option_open_interest(&TickType::OptionCallOpenInterest, 1234.0),
+            Some(1234.0)
+        );
+        assert_eq!(
+            parse_option_open_interest(&TickType::OptionPutOpenInterest, 5678.0),
+            Some(5678.0)
+        );
+        assert_eq!(
+            parse_option_open_interest(&TickType::OpenInterest, 42.0),
+            Some(42.0)
+        );
+        assert_eq!(parse_option_open_interest(&TickType::Bid, 42.0), None);
+    }
+
+    #[rstest]
+    fn test_parse_quote_tick_rounds_fx_prices_to_increment() {
+        let instrument = currency_pair("EUR", "USD", 5, "0.00005");
+
+        let quote = parse_quote_tick(
+            instrument.id(),
+            Some(1.12097),
+            Some(1.12098),
+            Some(1_000_000.0),
+            Some(2_000_000.0),
+            IbPriceConverter::for_instrument(&instrument, 1),
+            0,
+            UnixNanos::new(0),
+            UnixNanos::new(0),
+        )
+        .unwrap();
+
+        assert_eq!(quote.bid_price, Price::from("1.12095"));
+        assert_eq!(quote.ask_price, Price::from("1.12100"));
+    }
+
+    #[rstest]
+    #[case(1.12098, 1.12099, "1.12095", "1.12100")]
+    #[case(1.12097, 1.12097, "1.12095", "1.12100")]
+    #[case(1.12100, 1.12105, "1.12100", "1.12105")]
+    fn test_parse_quote_tick_rounds_fx_bid_down_and_ask_up(
+        #[case] ib_bid: f64,
+        #[case] ib_ask: f64,
+        #[case] bid: &str,
+        #[case] ask: &str,
+    ) {
+        let instrument = currency_pair("EUR", "USD", 5, "0.00005");
+
+        let quote = parse_quote_tick(
+            instrument.id(),
+            Some(ib_bid),
+            Some(ib_ask),
+            Some(1_000_000.0),
+            Some(2_000_000.0),
+            IbPriceConverter::for_instrument(&instrument, 1),
+            0,
+            UnixNanos::new(0),
+            UnixNanos::new(0),
+        )
+        .unwrap();
+
+        assert_eq!(quote.bid_price, Price::from(bid));
+        assert_eq!(quote.ask_price, Price::from(ask));
+    }
+
+    #[rstest]
+    fn test_parse_quote_tick_never_locks_or_crosses_fx_quote_across_sub_pip_offsets() {
+        let instrument = currency_pair("EUR", "USD", 5, "0.00005");
+        let increment = Price::from("0.00005").as_decimal();
+        let to_ib = |units: i64| -> f64 {
+            format!("{}.{:05}", units / 100_000, units % 100_000)
+                .parse()
+                .unwrap()
+        };
+
+        // Every bid below every ask over 40 steps of 0.00001, two pips
+        for bid_units in 112_000_i64..=112_040 {
+            for ask_units in (bid_units + 1)..=112_041 {
+                let quote = parse_quote_tick(
+                    instrument.id(),
+                    Some(to_ib(bid_units)),
+                    Some(to_ib(ask_units)),
+                    Some(1.0),
+                    Some(1.0),
+                    IbPriceConverter::for_instrument(&instrument, 1),
+                    0,
+                    UnixNanos::new(0),
+                    UnixNanos::new(0),
+                )
+                .unwrap();
+
+                let (bid, ask) = (quote.bid_price.as_decimal(), quote.ask_price.as_decimal());
+                let (ib_bid, ib_ask) = (Decimal::new(bid_units, 5), Decimal::new(ask_units, 5));
+                let case = format!("bid={ib_bid} ask={ib_ask} published {bid}/{ask}");
+
+                assert!((bid % increment).is_zero(), "bid off grid: {case}");
+                assert!((ask % increment).is_zero(), "ask off grid: {case}");
+                assert!(bid <= ib_bid && ib_bid - bid < increment, "{case}");
+                assert!(ask >= ib_ask && ask - ib_ask < increment, "{case}");
+                assert!(bid < ask, "locked or crossed: {case}");
+            }
+        }
+    }
+
+    #[rstest]
+    fn test_parse_quote_tick_leaves_equity_quote_prices_unrounded() {
+        let quote = parse_quote_tick(
+            create_test_instrument_id(),
+            Some(150.25),
+            Some(150.31),
+            Some(100.0),
+            Some(200.0),
+            IbPriceConverter::new(2),
+            0,
+            UnixNanos::new(0),
+            UnixNanos::new(0),
+        )
+        .unwrap();
+
+        assert_eq!(quote.bid_price, Price::from("150.25"));
+        assert_eq!(quote.ask_price, Price::from("150.31"));
+    }
+
+    #[rstest]
+    #[case(PriceType::Bid, "1.12095", "1.12105", "1.12090", "1.12095")]
+    #[case(PriceType::Ask, "1.12100", "1.12110", "1.12095", "1.12100")]
+    #[case(PriceType::Mid, "1.12095", "1.12110", "1.12090", "1.12095")]
+    fn test_parse_realtime_bar_rounds_fx_prices_by_price_type(
+        #[case] price_type: PriceType,
+        #[case] open: &str,
+        #[case] high: &str,
+        #[case] low: &str,
+        #[case] close: &str,
+    ) {
+        let instrument = currency_pair("EUR", "USD", 5, "0.00005");
+        let bar_type = BarType::new(
+            instrument.id(),
+            BarSpecification::new(5, BarAggregation::Second, price_type),
+            AggregationSource::External,
+        );
+
+        let bar = parse_realtime_bar(
+            bar_type,
+            1.12097,
+            1.12109,
+            1.12091,
+            1.12096,
+            0.0,
+            IbPriceConverter::for_instrument(&instrument, 1),
+            0,
+            UnixNanos::new(0),
+            UnixNanos::new(0),
+        )
+        .unwrap();
+
+        assert_eq!(bar.open, Price::from(open));
+        assert_eq!(bar.high, Price::from(high));
+        assert_eq!(bar.low, Price::from(low));
+        assert_eq!(bar.close, Price::from(close));
+    }
+
+    #[rstest]
+    fn test_parse_quote_tick_divides_magnified_prices() {
+        let quote = parse_quote_tick(
+            create_test_instrument_id(),
+            Some(425.25),
+            Some(425.5),
+            Some(10.0),
+            Some(20.0),
+            IbPriceConverter::new(4).with_price_magnifier(100),
+            0,
+            UnixNanos::new(0),
+            UnixNanos::new(0),
+        )
+        .unwrap();
+
+        assert_eq!(quote.bid_price, Price::from("4.2525"));
+        assert_eq!(quote.ask_price, Price::from("4.2550"));
+    }
+
+    #[rstest]
+    fn test_parse_trade_tick_divides_magnified_price() {
+        let trade = parse_trade_tick(
+            create_test_instrument_id(),
+            425.25,
+            3.0,
+            IbPriceConverter::new(4).with_price_magnifier(100),
+            0,
+            UnixNanos::new(0),
+            UnixNanos::new(0),
+            Some(TradeId::from("TRADE-001")),
+        )
+        .unwrap();
+
+        assert_eq!(trade.price, Price::from("4.2525"));
+    }
+
+    #[rstest]
+    fn test_parse_realtime_bar_divides_magnified_prices() {
+        let bar_type = BarType::new(
+            create_test_instrument_id(),
+            BarSpecification::new(5, BarAggregation::Second, PriceType::Last),
+            AggregationSource::External,
+        );
+
+        let bar = parse_realtime_bar(
+            bar_type,
+            425.25,
+            430.0,
+            424.5,
+            428.5,
+            10.0,
+            IbPriceConverter::new(4).with_price_magnifier(100),
+            0,
+            UnixNanos::new(0),
+            UnixNanos::new(0),
+        )
+        .unwrap();
+
+        assert_eq!(bar.open, Price::from("4.2525"));
+        assert_eq!(bar.close, Price::from("4.2850"));
+    }
+}

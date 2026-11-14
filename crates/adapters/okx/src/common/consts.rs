@@ -1,0 +1,1074 @@
+// -------------------------------------------------------------------------------------------------
+//  Copyright (C) 2015-2026 Nautech Systems Pty Ltd. All rights reserved.
+//  https://nautechsystems.io
+//
+//  Licensed under the GNU Lesser General Public License Version 3.0 (the "License");
+//  You may not use this file except in compliance with the License.
+//  You may obtain a copy of the License at https://www.gnu.org/licenses/lgpl-3.0.en.html
+//
+//  Unless required by applicable law or agreed to in writing, software
+//  distributed under the License is distributed on an "AS IS" BASIS,
+//  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+//  See the License for the specific language governing permissions and
+//  limitations under the License.
+// -------------------------------------------------------------------------------------------------
+
+//! Core constants shared across the OKX adapter components.
+
+use std::sync::LazyLock;
+
+use ahash::AHashSet;
+use nautilus_model::{
+    enums::{OrderSide, OrderType, PositionSide, TimeInForce, TriggerType},
+    events::OrderDeniedReason,
+    identifiers::{ClientId, Venue},
+    instruments::{Instrument, InstrumentAny},
+};
+use ustr::Ustr;
+
+use super::enums::{
+    OKXBookChannel, OKXContractType, OKXInstrumentType, OKXTargetCurrency, OKXTradeMode,
+    OKXVipLevel,
+};
+
+/// Venue identifier string.
+pub const OKX: &str = "OKX";
+
+/// Static venue instance.
+pub static OKX_VENUE: LazyLock<Venue> = LazyLock::new(|| Venue::new(Ustr::from(OKX)));
+
+/// Static client ID instance.
+pub static OKX_CLIENT_ID: LazyLock<ClientId> = LazyLock::new(|| ClientId::new(Ustr::from(OKX)));
+
+/// See the [OKX integration program](https://www.okx.com/docs-v5/en/#overview-broker-program) for details.
+pub const OKX_NAUTILUS_BROKER_ID: &str = "5328c82e5542BCDE";
+
+/// Default lookback for terminal orders and fills during reconciliation.
+///
+/// Active orders and current positions are requested independently of this window. The three-day
+/// default matches the retention of `GET /api/v5/trade/fills`.
+pub const OKX_RECONCILIATION_LOOKBACK_DEFAULT_MINS: u64 = 3 * 24 * 60;
+
+/// Maximum lookback for terminal orders and fills during reconciliation.
+///
+/// Seven days is the longest complete window across the regular order history and spread trade
+/// history endpoints used for reconciliation.
+pub const OKX_RECONCILIATION_LOOKBACK_MAX_MINS: u64 = 7 * 24 * 60;
+
+// Use the canonical host with www to avoid cross-domain redirects which may
+// strip authentication headers in some HTTP clients and middleboxes.
+pub const OKX_HTTP_URL: &str = "https://www.okx.com";
+pub const OKX_WS_PUBLIC_URL: &str = "wss://ws.okx.com/ws/v5/public";
+pub const OKX_WS_PRIVATE_URL: &str = "wss://ws.okx.com/ws/v5/private";
+pub const OKX_WS_BUSINESS_URL: &str = "wss://ws.okx.com/ws/v5/business";
+pub const OKX_WS_DEMO_PUBLIC_URL: &str = "wss://wspap.okx.com/ws/v5/public";
+pub const OKX_WS_DEMO_PRIVATE_URL: &str = "wss://wspap.okx.com/ws/v5/private";
+pub const OKX_WS_DEMO_BUSINESS_URL: &str = "wss://wspap.okx.com/ws/v5/business";
+
+pub const OKX_WS_TOPIC_DELIMITER: char = ':';
+
+/// WebSocket heartbeat (ping/pong) interval in seconds.
+pub const OKX_WS_HEARTBEAT_SECS: u64 = 20;
+
+/// OKX success response code for WebSocket operations.
+pub const OKX_SUCCESS_CODE: &str = "0";
+
+/// OKX WebSocket code indicating a service upgrade and required reconnect.
+pub const OKX_SERVICE_UPGRADE_RECONNECT_CODE: &str = "64008";
+
+/// JSON field key for sub-error code in order operation responses.
+pub const OKX_FIELD_SCODE: &str = "sCode";
+
+/// JSON field key for sub-error message in order operation responses.
+pub const OKX_FIELD_SMSG: &str = "sMsg";
+
+/// JSON field key for detailed sub-error code in order operation responses.
+pub const OKX_FIELD_SUBCODE: &str = "subCode";
+
+/// JSON field key for client order ID in order operation responses.
+pub const OKX_FIELD_CLORDID: &str = "clOrdId";
+
+/// Maximum length of a `clOrdId` accepted by OKX.
+///
+/// OKX requires `clOrdId` to be 1-32 case-sensitive alphanumeric characters.
+/// See <https://www.okx.com/docs-v5/en/#order-book-trading-trade>.
+pub const OKX_MAX_CLORDID_LEN: usize = 32;
+
+/// Validates a `clOrdId` against OKX's length and charset rules.
+///
+/// # Errors
+///
+/// Returns an error if the ID exceeds [`OKX_MAX_CLORDID_LEN`] characters or contains
+/// non-alphanumeric characters (such as hyphens or underscores). The error gives a human-readable
+/// reason.
+pub fn validate_okx_client_order_id(cl_ord_id: &str) -> Result<(), String> {
+    let len = cl_ord_id.len();
+    if len > OKX_MAX_CLORDID_LEN {
+        return Err(format!(
+            "OKX requires clOrdId to be at most {OKX_MAX_CLORDID_LEN} characters, was {len} ({cl_ord_id:?}); \
+             set `use_uuid_client_order_ids=True` and `use_hyphens_in_client_order_ids=False` on the strategy config"
+        ));
+    }
+
+    if !cl_ord_id.bytes().all(|b| b.is_ascii_alphanumeric()) {
+        return Err(format!(
+            "OKX requires clOrdId to be alphanumeric only, was {cl_ord_id:?}; \
+             set `use_hyphens_in_client_order_ids=False` on the strategy config"
+        ));
+    }
+
+    Ok(())
+}
+
+/// Resolves the OKX wire representation for a Nautilus reduce-only instruction.
+///
+/// A closing `side` and `posSide` pair enforces the same intent in OKX long/short mode, where the
+/// literal `reduceOnly` field is not applicable.
+///
+/// # Errors
+///
+/// Returns an error if OKX cannot enforce reduce-only for the selected product or when a
+/// long/short-mode order would increase the selected position side.
+pub(crate) fn okx_reduce_only_wire_value(
+    instrument_type: OKXInstrumentType,
+    td_mode: OKXTradeMode,
+    order_side: OrderSide,
+    position_side: Option<PositionSide>,
+    reduce_only: Option<bool>,
+) -> Result<Option<bool>, String> {
+    if reduce_only != Some(true) {
+        return Ok(None);
+    }
+
+    match instrument_type {
+        OKXInstrumentType::Spot | OKXInstrumentType::Margin => {
+            if td_mode == OKXTradeMode::Cash {
+                Err("OKX cash orders do not support reduce-only instructions".to_string())
+            } else if instrument_type == OKXInstrumentType::Spot {
+                Err("OKX spot orders do not support reduce-only instructions".to_string())
+            } else {
+                Ok(Some(true))
+            }
+        }
+        OKXInstrumentType::Swap | OKXInstrumentType::Futures => match position_side {
+            None => Ok(Some(true)),
+            Some(PositionSide::Long) if order_side == OrderSide::Sell => Ok(None),
+            Some(PositionSide::Short) if order_side == OrderSide::Buy => Ok(None),
+            Some(position_side) => Err(format!(
+                "OKX {order_side} orders on the {position_side} side do not enforce reduce-only"
+            )),
+        },
+        OKXInstrumentType::Option | OKXInstrumentType::Events => Err(format!(
+            "OKX {instrument_type} orders do not support reduce-only instructions"
+        )),
+        OKXInstrumentType::Any => Ok(Some(true)),
+    }
+}
+
+/// Resolves quantity units for ordinary market orders.
+///
+/// # Errors
+///
+/// Returns an error if a margin order requests units other than its native side-dependent units.
+pub(crate) fn okx_market_target_currency(
+    instrument_type: OKXInstrumentType,
+    order_side: OrderSide,
+    order_type: OrderType,
+    quote_quantity: Option<bool>,
+) -> Result<Option<OKXTargetCurrency>, OrderDeniedReason> {
+    if order_type != OrderType::Market {
+        return Ok(None);
+    }
+
+    match instrument_type {
+        OKXInstrumentType::Spot => Ok(match quote_quantity {
+            Some(true) => Some(OKXTargetCurrency::QuoteCcy),
+            Some(false) if order_side == OrderSide::Buy => Some(OKXTargetCurrency::BaseCcy),
+            _ => None,
+        }),
+        OKXInstrumentType::Margin => {
+            let native_quote = order_side == OrderSide::Buy;
+            if quote_quantity.is_some_and(|quote| quote != native_quote) {
+                let unit = if native_quote { "quote" } else { "base" };
+                return Err(OrderDeniedReason::ValidationFailed {
+                    detail: format!(
+                        "OKXInstrumentType::Margin market {order_side} orders require {unit} quantity"
+                    ),
+                });
+            }
+
+            Ok(None)
+        }
+        _ => Ok(None),
+    }
+}
+
+/// Resolves explicit sizing for algo orders.
+///
+/// # Errors
+///
+/// Returns an error if the requested quantity denomination has no supported wire representation.
+pub(crate) fn okx_algo_target_currency(
+    instrument_type: OKXInstrumentType,
+    td_mode: OKXTradeMode,
+    order_side: OrderSide,
+    order_type: OrderType,
+    quote_quantity: bool,
+) -> Result<Option<OKXTargetCurrency>, OrderDeniedReason> {
+    if !OKX_CONDITIONAL_ORDER_TYPES.contains(&order_type) {
+        return Ok(None);
+    }
+
+    if instrument_type == OKXInstrumentType::Spot && order_side == OrderSide::Buy {
+        if matches!(
+            order_type,
+            OrderType::StopMarket | OrderType::MarketIfTouched
+        ) {
+            return Ok(Some(if quote_quantity {
+                OKXTargetCurrency::QuoteCcy
+            } else {
+                OKXTargetCurrency::BaseCcy
+            }));
+        }
+
+        if order_type == OrderType::TrailingStopMarket {
+            return if quote_quantity {
+                Ok(None)
+            } else {
+                Err(OrderDeniedReason::ValidationFailed {
+                    detail: format!(
+                        "OKX {instrument_type} {order_type} algo buys require quote quantity in {td_mode} mode"
+                    ),
+                })
+            };
+        }
+    }
+
+    if quote_quantity {
+        return Err(OrderDeniedReason::unsupported_quote_quantity());
+    }
+
+    Ok(None)
+}
+
+/// Validates a native algo order's trigger feed.
+///
+/// # Errors
+///
+/// Returns an error if OKX cannot represent the requested trigger feed.
+pub(crate) fn validate_algo_trigger_type(
+    instrument_type: OKXInstrumentType,
+    td_mode: OKXTradeMode,
+    order_type: OrderType,
+    trigger_type: Option<TriggerType>,
+) -> Result<(), String> {
+    if !OKX_CONDITIONAL_ORDER_TYPES.contains(&order_type) {
+        return Ok(());
+    }
+
+    let Some(trigger_type) = trigger_type else {
+        return Ok(());
+    };
+
+    let supported = match trigger_type {
+        TriggerType::Default | TriggerType::LastPrice => true,
+        TriggerType::MarkPrice | TriggerType::IndexPrice => {
+            (instrument_type != OKXInstrumentType::Spot || td_mode != OKXTradeMode::Cash)
+                && order_type != OrderType::TrailingStopMarket
+        }
+        _ => false,
+    };
+
+    if !supported {
+        return Err(format!(
+            "OKX {instrument_type} {order_type} algo orders do not support {trigger_type} triggers"
+        ));
+    }
+
+    Ok(())
+}
+
+pub(crate) fn validate_order_time_in_force(
+    time_in_force: Option<TimeInForce>,
+) -> Result<(), String> {
+    if let Some(tif) = time_in_force
+        && !OKX_SUPPORTED_TIME_IN_FORCE.contains(&tif)
+    {
+        return Err(format!("Unsupported time in force: {tif:?}"));
+    }
+
+    Ok(())
+}
+
+pub(crate) fn validate_regular_order_params(
+    instrument_type: OKXInstrumentType,
+    order_type: OrderType,
+    time_in_force: Option<TimeInForce>,
+    post_only: bool,
+    rpi: bool,
+    outcome: Option<&str>,
+) -> Result<(), String> {
+    if rpi && order_type != OrderType::Limit {
+        return Err("OKX RPI orders require a limit order".to_string());
+    }
+
+    if !rpi
+        && !post_only
+        && order_type == OrderType::Market
+        && time_in_force == Some(TimeInForce::Fok)
+    {
+        return Err("Market orders with FOK time-in-force are not supported by OKX. Use Limit order with FOK instead.".to_string());
+    }
+
+    if instrument_type == OKXInstrumentType::Events && outcome.is_none() {
+        return Err("OKX event contract orders require `outcome`".to_string());
+    }
+
+    Ok(())
+}
+
+/// OKX supported order time in force.
+///
+/// # Notes
+///
+/// - OKX implements IOC and FOK as order types rather than separate time-in-force parameters.
+/// - FOK is only supported with Limit orders (Market + FOK is not supported).
+/// - IOC with Market orders uses `OptimalLimitIoc`, with Limit orders uses Ioc.
+/// - GTD is not supported: OKX `expTime` is a request deadline, not an order expiry.
+pub const OKX_SUPPORTED_TIME_IN_FORCE: &[TimeInForce] = &[
+    TimeInForce::Gtc, // Good Till Cancel (default)
+    TimeInForce::Ioc, // Immediate or Cancel (mapped to OKXOrderType::Ioc or OptimalLimitIoc)
+    TimeInForce::Fok, // Fill or Kill (only with Limit orders, mapped to OKXOrderType::Fok)
+];
+
+/// OKX supported order types.
+///
+/// # Notes
+///
+/// - `PostOnly` is supported as a flag on limit orders.
+/// - Conditional orders (stop/trigger) are supported via algo orders.
+pub const OKX_SUPPORTED_ORDER_TYPES: &[OrderType] = &[
+    OrderType::Market,
+    OrderType::Limit,
+    OrderType::MarketToLimit,   // Mapped to IOC when no price is specified
+    OrderType::StopMarket,      // Supported via algo order API
+    OrderType::StopLimit,       // Supported via algo order API
+    OrderType::MarketIfTouched, // Supported via algo order API
+    OrderType::LimitIfTouched,  // Supported via algo order API
+    OrderType::TrailingStopMarket, // Supported via algo order API (move_order_stop)
+];
+
+/// Conditional order types that require the OKX algo order API.
+pub const OKX_CONDITIONAL_ORDER_TYPES: &[OrderType] = &[
+    OrderType::StopMarket,
+    OrderType::StopLimit,
+    OrderType::MarketIfTouched,
+    OrderType::LimitIfTouched,
+    OrderType::TrailingStopMarket,
+];
+
+/// Advance algo order types that require `cancel-advance-algos` for cancellation.
+/// These cannot be cancelled via the standard `cancel-algos` endpoint.
+pub const OKX_ADVANCE_ALGO_ORDER_TYPES: &[OrderType] = &[OrderType::TrailingStopMarket];
+
+/// OKX error codes that should trigger retries.
+///
+/// Only retry on temporary network/system issues. Retries never apply to
+/// order submission POSTs: OKX rejects a duplicate `clOrdId` only while the
+/// first order rests open, so a submit whose response was lost can already
+/// have filled, and retrying could place a second live order. Submits are
+/// sent once, and an ambiguous outcome resolves through stream updates and
+/// reconciliation.
+///
+/// # References
+///
+/// Based on OKX API documentation: <https://www.okx.com/docs-v5/en/#error-codes>
+pub static OKX_RETRY_ERROR_CODES: LazyLock<AHashSet<&'static str>> = LazyLock::new(|| {
+    let mut codes = AHashSet::new();
+
+    // Temporary system errors
+    codes.insert("50001"); // Service temporarily unavailable
+    codes.insert("50004"); // API endpoint request timeout (does not mean that the request was successful or failed, please check the request result)
+    codes.insert("50005"); // API is offline or unavailable
+    codes.insert("50013"); // System busy, please try again later
+    codes.insert("50026"); // System error, please try again later
+
+    // Rate limit errors (temporary)
+    codes.insert("50011"); // Request too frequent
+
+    // WebSocket connection issues (temporary)
+    codes.insert("60001"); // OK not received in time
+    codes.insert("60005"); // Connection closed as there was no data transmission in the last 30 seconds
+    codes.insert(OKX_SERVICE_UPGRADE_RECONNECT_CODE); // Service upgrade, please reconnect
+
+    codes
+});
+
+/// Determines if an OKX error code should trigger a retry.
+pub fn should_retry_error_code(error_code: &str) -> bool {
+    OKX_RETRY_ERROR_CODES.contains(error_code)
+}
+
+/// OKX error code returned when an order request timed out and the outcome is unknown.
+pub const OKX_ORDER_REQUEST_TIMEOUT_CODE: &str = "51149";
+
+/// OKX error code returned when a post-only order would immediately take liquidity.
+pub const OKX_POST_ONLY_ERROR_CODE: &str = "51019";
+
+/// OKX cancel source code used when a post-only order is auto-cancelled for taking liquidity.
+pub const OKX_POST_ONLY_CANCEL_SOURCE: &str = "31";
+
+/// Human-readable reason used when a post-only order is auto-cancelled for taking liquidity.
+pub const OKX_POST_ONLY_CANCEL_REASON: &str = "POST_ONLY would take liquidity";
+
+/// OKX error code returned when a market order's `slippagePct` would be exceeded by the
+/// projected fill, so the order is rejected.
+pub const OKX_SLIPPAGE_EXCEEDED_ERROR_CODE: &str = "54084";
+
+/// OKX error code returned when the supplied `slippagePct` value is outside the
+/// venue-permitted range.
+pub const OKX_SLIPPAGE_INVALID_ERROR_CODE: &str = "54085";
+
+/// Returns `true` if the OKX `sCode` identifies a slippage-related rejection emitted
+/// in response to the `slippagePct` parameter on market orders.
+#[must_use]
+pub fn is_slippage_rejection(error_code: &str) -> bool {
+    matches!(
+        error_code,
+        OKX_SLIPPAGE_EXCEEDED_ERROR_CODE | OKX_SLIPPAGE_INVALID_ERROR_CODE
+    )
+}
+
+/// Target currency literal for base currency.
+pub const OKX_TARGET_CCY_BASE: &str = "base_ccy";
+
+/// Target currency literal for quote currency.
+pub const OKX_TARGET_CCY_QUOTE: &str = "quote_ccy";
+
+/// `feature` value for `POST /api/v5/account/activate-feature` USDC order book trading.
+pub const OKX_FEATURE_USDC_ORDER_BOOK: &str = "1";
+
+/// Resolves the optional `tradeQuoteCcy` wire value for a SPOT order.
+///
+/// Non-spot orders omit the field. When `configured` is unset or blank, the venue
+/// default (the quote currency in `instId`) is used. When set, `available` must be
+/// non-empty and contain the value.
+///
+/// # Errors
+///
+/// Returns an error if `configured` is set and `available` is empty, or when `configured` is not
+/// present in `available`.
+pub fn spot_trade_quote_ccy_wire_value(
+    instrument_type: OKXInstrumentType,
+    configured: Option<&str>,
+    available: &[Ustr],
+) -> Result<Option<Ustr>, String> {
+    if instrument_type != OKXInstrumentType::Spot {
+        return Ok(None);
+    }
+
+    let Some(ccy) = configured.map(str::trim).filter(|value| !value.is_empty()) else {
+        return Ok(None);
+    };
+    let ccy = Ustr::from(ccy);
+
+    if available.is_empty() {
+        return Err(format!(
+            "tradeQuoteCcyList is unknown for this instrument; cannot validate tradeQuoteCcy '{ccy}'"
+        ));
+    }
+
+    if !available.contains(&ccy) {
+        let listed = available
+            .iter()
+            .map(Ustr::as_str)
+            .collect::<Vec<_>>()
+            .join(", ");
+        return Err(format!(
+            "tradeQuoteCcy '{ccy}' is not in tradeQuoteCcyList for this instrument, was [{listed}]"
+        ));
+    }
+
+    Ok(Some(ccy))
+}
+
+/// Resolves instrument families for a given instrument type.
+///
+/// Returns `Some(families)` when the type supports family filtering, or `None`
+/// to skip the instrument type entirely (Option without configured families).
+/// An empty vec means no family filter is needed (Spot, Margin), or all
+/// discoverable families should be loaded (Events).
+pub fn resolve_instrument_families(
+    configured: &Option<Vec<String>>,
+    inst_type: OKXInstrumentType,
+) -> Option<Vec<String>> {
+    match (configured, inst_type) {
+        (Some(families), OKXInstrumentType::Option) => Some(families.clone()),
+        (
+            Some(families),
+            OKXInstrumentType::Futures | OKXInstrumentType::Swap | OKXInstrumentType::Events,
+        ) => Some(families.clone()),
+        (None, OKXInstrumentType::Option) => {
+            log::warn!("Skipping OPTION type: instrument_families required but not configured");
+            None
+        }
+        _ => Some(vec![]),
+    }
+}
+
+/// Clamps a requested book depth to the nearest OKX-supported value.
+///
+/// OKX WebSocket channels support depths of 50 and 400. Depth 0 means
+/// auto-select based on VIP level. Any other value rounds up to the nearest
+/// supported depth so the subscription succeeds and the data engine can
+/// truncate to the originally requested depth.
+pub fn resolve_book_depth(raw_depth: usize) -> usize {
+    match raw_depth {
+        0 | 400 => raw_depth,
+        1..=50 => 50,
+        _ => 400,
+    }
+}
+
+pub(crate) fn select_book_channel(depth: usize, vip: OKXVipLevel) -> OKXBookChannel {
+    match depth {
+        50 if vip >= OKXVipLevel::Vip4 => OKXBookChannel::Books50L2Tbt,
+        0 | 400 if vip >= OKXVipLevel::Vip4 => OKXBookChannel::BookL2Tbt,
+        0 | 50 | 400 => OKXBookChannel::Book,
+        _ => unreachable!("book depth must be resolved before channel selection"),
+    }
+}
+
+pub(crate) fn contract_filter_with_config_types(
+    contract_types: Option<&Vec<OKXContractType>>,
+    instrument: &InstrumentAny,
+) -> bool {
+    match contract_types {
+        None => true,
+        Some(filter) if filter.is_empty() => true,
+        Some(filter) => {
+            let is_inverse = instrument.is_inverse();
+            (is_inverse && filter.contains(&OKXContractType::Inverse))
+                || (!is_inverse && filter.contains(&OKXContractType::Linear))
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use rstest::rstest;
+
+    use super::*;
+
+    #[rstest]
+    #[case::market_fok(false, Err("Market orders with FOK time-in-force are not supported by OKX. Use Limit order with FOK instead.".to_string()))]
+    #[case::post_only_precedence(true, Ok(()))]
+    fn test_validate_regular_order_params_preserves_post_only_precedence(
+        #[case] post_only: bool,
+        #[case] expected: Result<(), String>,
+    ) {
+        assert_eq!(
+            validate_regular_order_params(
+                OKXInstrumentType::Swap,
+                OrderType::Market,
+                Some(TimeInForce::Fok),
+                post_only,
+                false,
+                None
+            ),
+            expected
+        );
+    }
+
+    #[rstest]
+    #[case::buy_quote(OrderSide::Buy, Some(true))]
+    #[case::sell_base(OrderSide::Sell, Some(false))]
+    #[case::buy_default(OrderSide::Buy, None)]
+    #[case::sell_default(OrderSide::Sell, None)]
+    fn test_market_target_currency_preserves_native_margin_units(
+        #[case] side: OrderSide,
+        #[case] quote_quantity: Option<bool>,
+    ) {
+        assert_eq!(
+            okx_market_target_currency(
+                OKXInstrumentType::Margin,
+                side,
+                OrderType::Market,
+                quote_quantity,
+            ),
+            Ok(None),
+        );
+    }
+
+    #[rstest]
+    #[case::spot_limit(OKXInstrumentType::Spot, OrderType::Limit)]
+    #[case::spot_market_to_limit(OKXInstrumentType::Spot, OrderType::MarketToLimit)]
+    #[case::swap_market(OKXInstrumentType::Swap, OrderType::Market)]
+    #[case::event_market(OKXInstrumentType::Events, OrderType::Market)]
+    fn test_market_target_currency_omits_unrelated_units(
+        #[case] instrument_type: OKXInstrumentType,
+        #[case] order_type: OrderType,
+    ) {
+        assert_eq!(
+            okx_market_target_currency(instrument_type, OrderSide::Buy, order_type, Some(true)),
+            Ok(None),
+        );
+    }
+
+    #[rstest]
+    #[case::auto_default(0, OKXVipLevel::Vip0, OKXBookChannel::Book)]
+    #[case::auto_vip3(0, OKXVipLevel::Vip3, OKXBookChannel::Book)]
+    #[case::auto_vip4(0, OKXVipLevel::Vip4, OKXBookChannel::BookL2Tbt)]
+    #[case::auto_vip5(0, OKXVipLevel::Vip5, OKXBookChannel::BookL2Tbt)]
+    #[case::depth_50_vip3(50, OKXVipLevel::Vip3, OKXBookChannel::Book)]
+    #[case::depth_50_vip4(50, OKXVipLevel::Vip4, OKXBookChannel::Books50L2Tbt)]
+    #[case::depth_400_vip3(400, OKXVipLevel::Vip3, OKXBookChannel::Book)]
+    #[case::depth_400_vip4(400, OKXVipLevel::Vip4, OKXBookChannel::BookL2Tbt)]
+    #[case::depth_400_vip5(400, OKXVipLevel::Vip5, OKXBookChannel::BookL2Tbt)]
+    fn test_select_book_channel(
+        #[case] depth: usize,
+        #[case] vip: OKXVipLevel,
+        #[case] expected: OKXBookChannel,
+    ) {
+        assert_eq!(select_book_channel(depth, vip), expected);
+    }
+
+    #[rstest]
+    #[case("54084", true)]
+    #[case("54085", true)]
+    #[case("51019", false)]
+    #[case("", false)]
+    fn test_is_slippage_rejection(#[case] code: &str, #[case] expected: bool) {
+        assert_eq!(is_slippage_rejection(code), expected);
+    }
+
+    #[rstest]
+    #[case("50001", true)]
+    #[case("50011", true)]
+    #[case("60005", true)]
+    #[case("60014", false)]
+    #[case("64007", false)]
+    #[case(OKX_SERVICE_UPGRADE_RECONNECT_CODE, true)]
+    #[case("50113", false)]
+    #[case("60012", false)]
+    fn test_should_retry_error_code(#[case] code: &str, #[case] expected: bool) {
+        assert_eq!(should_retry_error_code(code), expected);
+    }
+
+    #[rstest]
+    #[case("O20260101000000ABC1", true)]
+    #[case("aB9", true)]
+    #[case("abcdefghij0123456789ABCDEFGHIJ12", true)] // exactly 32 chars
+    #[case("abcdefghij0123456789ABCDEFGHIJ123", false)] // 33 chars
+    #[case("O-20260101-000000-001-001-1", false)] // hyphens
+    #[case("O_20260101_000000", false)] // underscores
+    #[case("", true)] // empty: OKX rejects, but core ClientOrderId never produces empty
+    fn test_validate_okx_client_order_id(#[case] cl_ord_id: &str, #[case] expected_ok: bool) {
+        assert_eq!(validate_okx_client_order_id(cl_ord_id).is_ok(), expected_ok);
+    }
+
+    #[rstest]
+    fn test_validate_okx_client_order_id_length_message() {
+        // 35-char compact ID (the shape reported in the original bug report).
+        let cl_ord_id = "O20260522145501532392555aceLTCUSDT5";
+        let err = validate_okx_client_order_id(cl_ord_id).unwrap_err();
+        assert!(err.contains("at most 32"));
+        assert!(err.contains("was 35"));
+        assert!(err.contains("use_uuid_client_order_ids"));
+    }
+
+    #[rstest]
+    #[case(OrderSide::Buy, false, Some(OKXTargetCurrency::BaseCcy))]
+    #[case(OrderSide::Buy, true, Some(OKXTargetCurrency::QuoteCcy))]
+    #[case(OrderSide::Sell, false, None)]
+    fn test_okx_algo_target_currency_cash_market_orders(
+        #[case] side: OrderSide,
+        #[case] quote_quantity: bool,
+        #[case] expected: Option<OKXTargetCurrency>,
+        #[values(OrderType::StopMarket, OrderType::MarketIfTouched)] order_type: OrderType,
+    ) {
+        assert_eq!(
+            okx_algo_target_currency(
+                OKXInstrumentType::Spot,
+                OKXTradeMode::Cash,
+                side,
+                order_type,
+                quote_quantity,
+            ),
+            Ok(expected),
+        );
+    }
+
+    #[rstest]
+    fn test_okx_algo_target_currency_denies_quote_sells(
+        #[values(
+            OrderType::StopMarket,
+            OrderType::MarketIfTouched,
+            OrderType::TrailingStopMarket
+        )]
+        order_type: OrderType,
+        #[values(OKXTradeMode::Cash, OKXTradeMode::Cross, OKXTradeMode::Isolated)]
+        trade_mode: OKXTradeMode,
+    ) {
+        assert_eq!(
+            okx_algo_target_currency(
+                OKXInstrumentType::Spot,
+                trade_mode,
+                OrderSide::Sell,
+                order_type,
+                true,
+            ),
+            Err(OrderDeniedReason::unsupported_quote_quantity()),
+        );
+    }
+
+    #[rstest]
+    #[case(OKXInstrumentType::Swap, OrderType::StopMarket)]
+    #[case(OKXInstrumentType::Spot, OrderType::StopLimit)]
+    #[case(OKXInstrumentType::Spot, OrderType::LimitIfTouched)]
+    fn test_okx_algo_target_currency_preserves_base_routes(
+        #[case] instrument_type: OKXInstrumentType,
+        #[case] order_type: OrderType,
+    ) {
+        assert_eq!(
+            okx_algo_target_currency(
+                instrument_type,
+                OKXTradeMode::Cash,
+                OrderSide::Buy,
+                order_type,
+                false,
+            ),
+            Ok(None),
+        );
+    }
+
+    #[rstest]
+    fn test_okx_algo_target_currency_spot_trailing_buy_uses_native_quote_size(
+        #[values(OKXTradeMode::Cash, OKXTradeMode::Cross, OKXTradeMode::Isolated)]
+        trade_mode: OKXTradeMode,
+    ) {
+        assert_eq!(
+            okx_algo_target_currency(
+                OKXInstrumentType::Spot,
+                trade_mode,
+                OrderSide::Buy,
+                OrderType::TrailingStopMarket,
+                true,
+            ),
+            Ok(None),
+        );
+    }
+
+    #[rstest]
+    fn test_okx_algo_target_currency_does_not_restrict_ordinary_market_orders(
+        #[values(OrderSide::Buy, OrderSide::Sell)] side: OrderSide,
+        #[values(false, true)] quote_quantity: bool,
+    ) {
+        assert_eq!(
+            okx_algo_target_currency(
+                OKXInstrumentType::Spot,
+                OKXTradeMode::Cash,
+                side,
+                OrderType::Market,
+                quote_quantity,
+            ),
+            Ok(None),
+        );
+    }
+
+    #[rstest]
+    #[case(OKXTradeMode::Cross, false, OKXTargetCurrency::BaseCcy)]
+    #[case(OKXTradeMode::Cross, true, OKXTargetCurrency::QuoteCcy)]
+    #[case(OKXTradeMode::Isolated, false, OKXTargetCurrency::BaseCcy)]
+    #[case(OKXTradeMode::Isolated, true, OKXTargetCurrency::QuoteCcy)]
+    fn test_okx_algo_target_currency_non_cash_spot_buys(
+        #[case] trade_mode: OKXTradeMode,
+        #[case] quote_quantity: bool,
+        #[case] expected: OKXTargetCurrency,
+        #[values(OrderType::StopMarket, OrderType::MarketIfTouched)] order_type: OrderType,
+    ) {
+        assert_eq!(
+            okx_algo_target_currency(
+                OKXInstrumentType::Spot,
+                trade_mode,
+                OrderSide::Buy,
+                order_type,
+                quote_quantity,
+            ),
+            Ok(Some(expected)),
+        );
+    }
+
+    #[rstest]
+    #[case(OKXInstrumentType::Spot, OrderType::StopLimit)]
+    #[case(OKXInstrumentType::Spot, OrderType::LimitIfTouched)]
+    #[case(OKXInstrumentType::Swap, OrderType::StopMarket)]
+    #[case(OKXInstrumentType::Futures, OrderType::MarketIfTouched)]
+    fn test_okx_algo_target_currency_denies_unsupported_quote_orders(
+        #[case] instrument_type: OKXInstrumentType,
+        #[case] order_type: OrderType,
+        #[values(OrderSide::Buy, OrderSide::Sell)] side: OrderSide,
+        #[values(OKXTradeMode::Cash, OKXTradeMode::Cross, OKXTradeMode::Isolated)]
+        trade_mode: OKXTradeMode,
+    ) {
+        assert_eq!(
+            okx_algo_target_currency(instrument_type, trade_mode, side, order_type, true),
+            Err(OrderDeniedReason::unsupported_quote_quantity()),
+        );
+    }
+
+    #[rstest]
+    fn test_okx_algo_target_currency_denies_base_spot_trailing_buy() {
+        assert_eq!(
+            okx_algo_target_currency(
+                OKXInstrumentType::Spot,
+                OKXTradeMode::Cash,
+                OrderSide::Buy,
+                OrderType::TrailingStopMarket,
+                false,
+            ),
+            Err(OrderDeniedReason::ValidationFailed {
+                detail:
+                    "OKX Spot TRAILING_STOP_MARKET algo buys require quote quantity in Cash mode"
+                        .to_string(),
+            }),
+        );
+    }
+
+    #[rstest]
+    #[case(OKXInstrumentType::Spot, OrderType::StopMarket, None)]
+    #[case(
+        OKXInstrumentType::Spot,
+        OrderType::StopLimit,
+        Some(TriggerType::Default)
+    )]
+    #[case(
+        OKXInstrumentType::Spot,
+        OrderType::MarketIfTouched,
+        Some(TriggerType::LastPrice)
+    )]
+    #[case(
+        OKXInstrumentType::Spot,
+        OrderType::TrailingStopMarket,
+        Some(TriggerType::LastPrice)
+    )]
+    #[case(
+        OKXInstrumentType::Swap,
+        OrderType::StopMarket,
+        Some(TriggerType::MarkPrice)
+    )]
+    #[case(
+        OKXInstrumentType::Futures,
+        OrderType::LimitIfTouched,
+        Some(TriggerType::IndexPrice)
+    )]
+    fn test_validate_algo_trigger_type_accepts_supported_feeds(
+        #[case] instrument_type: OKXInstrumentType,
+        #[case] order_type: OrderType,
+        #[case] trigger_type: Option<TriggerType>,
+    ) {
+        assert_eq!(
+            validate_algo_trigger_type(
+                instrument_type,
+                OKXTradeMode::Cash,
+                order_type,
+                trigger_type
+            ),
+            Ok(())
+        );
+    }
+
+    #[rstest]
+    #[case(OKXInstrumentType::Spot, OrderType::StopMarket, TriggerType::MarkPrice)]
+    #[case(
+        OKXInstrumentType::Spot,
+        OrderType::MarketIfTouched,
+        TriggerType::IndexPrice
+    )]
+    #[case(OKXInstrumentType::Spot, OrderType::StopLimit, TriggerType::MarkPrice)]
+    #[case(
+        OKXInstrumentType::Spot,
+        OrderType::LimitIfTouched,
+        TriggerType::IndexPrice
+    )]
+    #[case(OKXInstrumentType::Swap, OrderType::StopMarket, TriggerType::BidAsk)]
+    #[case(
+        OKXInstrumentType::Swap,
+        OrderType::TrailingStopMarket,
+        TriggerType::MarkPrice
+    )]
+    fn test_validate_algo_trigger_type_denies_unsupported_feeds(
+        #[case] instrument_type: OKXInstrumentType,
+        #[case] order_type: OrderType,
+        #[case] trigger_type: TriggerType,
+    ) {
+        assert_eq!(
+            validate_algo_trigger_type(
+                instrument_type,
+                OKXTradeMode::Cash,
+                order_type,
+                Some(trigger_type)
+            ),
+            Err(format!(
+                "OKX {instrument_type} {order_type} algo orders do not support {trigger_type} triggers"
+            )),
+        );
+    }
+
+    #[rstest]
+    fn test_validate_algo_trigger_type_allows_non_cash_margin_feeds(
+        #[values(OKXTradeMode::Cross, OKXTradeMode::Isolated)] trade_mode: OKXTradeMode,
+        #[values(OrderType::StopMarket, OrderType::MarketIfTouched)] order_type: OrderType,
+        #[values(TriggerType::MarkPrice, TriggerType::IndexPrice)] trigger_type: TriggerType,
+    ) {
+        assert_eq!(
+            validate_algo_trigger_type(
+                OKXInstrumentType::Spot,
+                trade_mode,
+                order_type,
+                Some(trigger_type),
+            ),
+            Ok(()),
+        );
+    }
+
+    #[rstest]
+    #[case::cash(
+        OKXInstrumentType::Spot,
+        OKXTradeMode::Cash,
+        OrderSide::Sell,
+        None,
+        Err("OKX cash orders do not support reduce-only instructions".to_string()),
+    )]
+    #[case::spot_cross(
+        OKXInstrumentType::Spot,
+        OKXTradeMode::Cross,
+        OrderSide::Sell,
+        None,
+        Err("OKX spot orders do not support reduce-only instructions".to_string()),
+    )]
+    #[case::spot_isolated(
+        OKXInstrumentType::Spot,
+        OKXTradeMode::Isolated,
+        OrderSide::Sell,
+        None,
+        Err("OKX spot orders do not support reduce-only instructions".to_string()),
+    )]
+    #[case::margin(
+        OKXInstrumentType::Margin,
+        OKXTradeMode::Cross,
+        OrderSide::Sell,
+        None,
+        Ok(Some(true))
+    )]
+    #[case::net(
+        OKXInstrumentType::Swap,
+        OKXTradeMode::Cross,
+        OrderSide::Sell,
+        None,
+        Ok(Some(true))
+    )]
+    #[case::close_long(
+        OKXInstrumentType::Swap,
+        OKXTradeMode::Cross,
+        OrderSide::Sell,
+        Some(PositionSide::Long),
+        Ok(None)
+    )]
+    #[case::close_short(
+        OKXInstrumentType::Futures,
+        OKXTradeMode::Isolated,
+        OrderSide::Buy,
+        Some(PositionSide::Short),
+        Ok(None)
+    )]
+    #[case::increase_long(
+        OKXInstrumentType::Swap,
+        OKXTradeMode::Cross,
+        OrderSide::Buy,
+        Some(PositionSide::Long),
+        Err("OKX BUY orders on the LONG side do not enforce reduce-only".to_string()),
+    )]
+    #[case::option(
+        OKXInstrumentType::Option,
+        OKXTradeMode::Cross,
+        OrderSide::Sell,
+        None,
+        Err("OKX Option orders do not support reduce-only instructions".to_string()),
+    )]
+    fn test_okx_reduce_only_wire_value(
+        #[case] instrument_type: OKXInstrumentType,
+        #[case] td_mode: OKXTradeMode,
+        #[case] order_side: OrderSide,
+        #[case] position_side: Option<PositionSide>,
+        #[case] expected: Result<Option<bool>, String>,
+    ) {
+        assert_eq!(
+            okx_reduce_only_wire_value(
+                instrument_type,
+                td_mode,
+                order_side,
+                position_side,
+                Some(true),
+            ),
+            expected
+        );
+    }
+
+    #[rstest]
+    fn test_spot_trade_quote_ccy_wire_value_omits_non_spot() {
+        assert_eq!(
+            spot_trade_quote_ccy_wire_value(
+                OKXInstrumentType::Swap,
+                Some("USD"),
+                &[Ustr::from("USD")],
+            ),
+            Ok(None)
+        );
+    }
+
+    #[rstest]
+    fn test_spot_trade_quote_ccy_wire_value_omits_when_unset() {
+        assert_eq!(
+            spot_trade_quote_ccy_wire_value(OKXInstrumentType::Spot, None, &[Ustr::from("USD")]),
+            Ok(None)
+        );
+        assert_eq!(
+            spot_trade_quote_ccy_wire_value(OKXInstrumentType::Spot, Some("  "), &[]),
+            Ok(None)
+        );
+    }
+
+    #[rstest]
+    fn test_spot_trade_quote_ccy_wire_value_sends_usd_when_listed() {
+        assert_eq!(
+            spot_trade_quote_ccy_wire_value(
+                OKXInstrumentType::Spot,
+                Some("USD"),
+                &[Ustr::from("USD"), Ustr::from("USDC")],
+            ),
+            Ok(Some(Ustr::from("USD")))
+        );
+    }
+
+    #[rstest]
+    fn test_spot_trade_quote_ccy_wire_value_rejects_when_list_unknown() {
+        let err =
+            spot_trade_quote_ccy_wire_value(OKXInstrumentType::Spot, Some("USD"), &[]).unwrap_err();
+        assert!(err.contains("tradeQuoteCcyList is unknown"));
+        assert!(err.contains("tradeQuoteCcy 'USD'"));
+    }
+
+    #[rstest]
+    fn test_spot_trade_quote_ccy_wire_value_rejects_unlisted() {
+        let err = spot_trade_quote_ccy_wire_value(
+            OKXInstrumentType::Spot,
+            Some("USD"),
+            &[Ustr::from("USDC")],
+        )
+        .unwrap_err();
+        assert!(err.contains("tradeQuoteCcy 'USD'"));
+        assert!(err.contains("was [USDC]"));
+        assert!(!err.contains(&format!(", {}", "got")));
+    }
+}

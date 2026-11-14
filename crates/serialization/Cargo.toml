@@ -1,0 +1,87 @@
+[package]
+name = "nautilus-serialization"
+include = ["src/**/*", "tests/**/*", "benches/**/*", "Cargo.toml", "README.md"]
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Serialization functionality for the Nautilus trading engine"
+categories.workspace = true
+keywords.workspace = true
+documentation.workspace = true
+repository.workspace = true
+homepage.workspace = true
+
+[lints]
+workspace = true
+
+[lib]
+name = "nautilus_serialization"
+crate-type = ["rlib"]
+
+[features]
+default = []
+arrow = ["dep:arrow", "dep:nautilus-macros", "nautilus-model/arrow"]
+arrow-display = ["arrow"]
+sbe = []
+extension-module = [
+  "nautilus-core/extension-module",
+  "nautilus-model/extension-module",
+  "python",
+  "pyo3/extension-module",
+]
+python = [
+  "nautilus-core/python",
+  "nautilus-model/python",
+  "pyo3",
+  "pyo3-stub-gen",
+]
+high-precision = ["nautilus-model/high-precision"]
+
+[package.metadata.docs.rs]
+# Python docs depend on the local pyo3-stub-gen patch for now, which published crates do not carry
+features = ["arrow", "arrow-display", "high-precision", "sbe"]
+rustdoc-args = ["--cfg", "docsrs"]
+
+[dependencies]
+nautilus-core = { workspace = true }
+nautilus-macros = { workspace = true, optional = true }
+nautilus-model = { workspace = true }
+
+anyhow = { workspace = true }
+indexmap = { workspace = true }
+rust_decimal = { workspace = true }
+rust_decimal_macros = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+ustr = { workspace = true }
+
+arrow = { workspace = true, optional = true }
+pyo3 = { workspace = true, optional = true }
+pyo3-stub-gen = { workspace = true, optional = true }
+
+[dev-dependencies]
+nautilus-model = { workspace = true, features = ["test-support"] }
+
+criterion = { workspace = true }
+pretty_assertions = { workspace = true }
+rstest = { workspace = true }
+
+[[bench]]
+name = "serialization_comparison"
+path = "benches/serialization_comparison.rs"
+harness = false
+
+[[bench]]
+name = "sbe_decoding"
+path = "benches/sbe_decoding.rs"
+harness = false
+required-features = ["sbe"]
+
+[[bench]]
+name = "generated_custom_data"
+path = "benches/generated_custom_data.rs"
+harness = false
+required-features = ["arrow"]

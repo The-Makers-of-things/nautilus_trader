@@ -1,0 +1,705 @@
+// -------------------------------------------------------------------------------------------------
+//  Copyright (C) 2015-2026 Nautech Systems Pty Ltd. All rights reserved.
+//  https://nautechsystems.io
+//
+//  Licensed under the GNU Lesser General Public License Version 3.0 (the "License");
+//  You may not use this file except in compliance with the License.
+//  You may obtain a copy of the License at https://www.gnu.org/licenses/lgpl-3.0.en.html
+//
+//  Unless required by applicable law or agreed to in writing, software
+//  distributed under the License is distributed on an "AS IS" BASIS,
+//  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+//  See the License for the specific language governing permissions and
+//  limitations under the License.
+// -------------------------------------------------------------------------------------------------
+
+use std::fmt::{Debug, Display};
+
+use indexmap::IndexMap;
+use nautilus_core::{UUID4, UnixNanos};
+use rust_decimal::Decimal;
+use serde::{Deserialize, Serialize};
+use ustr::Ustr;
+
+use crate::{
+    enums::{
+        ContingencyType, LiquiditySide, OrderSide, OrderType, TimeInForce, TrailingOffsetType,
+        TriggerType,
+    },
+    events::OrderEvent,
+    identifiers::{
+        AccountId, ClientOrderId, ExecAlgorithmId, InstrumentId, OrderListId, PositionId,
+        StrategyId, TradeId, TraderId, VenueOrderId,
+    },
+    position::{amount, quantity_sub, split_commission_qty},
+    types::{Currency, Money, Price, Quantity},
+};
+
+#[repr(C)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type")]
+#[cfg_attr(
+    feature = "python",
+    pyo3::pyclass(module = "nautilus_trader.model", from_py_object)
+)]
+#[cfg_attr(
+    feature = "python",
+    pyo3_stub_gen::derive::gen_stub_pyclass(module = "nautilus_trader.model")
+)]
+pub struct OrderFilled {
+    /// The trader ID associated with the event.
+    pub trader_id: TraderId,
+    /// The strategy ID associated with the event.
+    pub strategy_id: StrategyId,
+    /// The instrument ID associated with the event.
+    pub instrument_id: InstrumentId,
+    /// The client order ID associated with the event.
+    pub client_order_id: ClientOrderId,
+    /// The venue order ID associated with the event.
+    pub venue_order_id: VenueOrderId,
+    /// The account ID associated with the event.
+    pub account_id: AccountId,
+    /// The trade match ID (assigned by the venue).
+    pub trade_id: TradeId,
+    /// The order side.
+    pub order_side: OrderSide,
+    /// The order type.
+    pub order_type: OrderType,
+    /// The fill quantity for this execution.
+    pub last_qty: Quantity,
+    /// The fill price for this execution.
+    pub last_px: Price,
+    /// The currency of the `last_px`.
+    pub currency: Currency,
+    /// The liquidity side of the execution.
+    pub liquidity_side: LiquiditySide,
+    /// The unique identifier for the event.
+    pub event_id: UUID4,
+    /// UNIX timestamp (nanoseconds) when the event occurred.
+    pub ts_event: UnixNanos,
+    /// UNIX timestamp (nanoseconds) when the event was initialized.
+    pub ts_init: UnixNanos,
+    /// If the event was generated during reconciliation.
+    pub reconciliation: bool,
+    /// The position ID (assigned by the venue).
+    pub position_id: Option<PositionId>,
+    /// The commission generated from this execution.
+    pub commission: Option<Money>,
+    /// Additional fill metadata (venue/adapter specific).
+    pub info: Option<IndexMap<Ustr, Ustr>>,
+    /// The causation ID associated with the event.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub causation_id: Option<UUID4>,
+}
+
+impl OrderFilled {
+    /// Creates a new [`OrderFilled`] instance.
+    #[expect(clippy::too_many_arguments)]
+    #[must_use]
+    pub fn new(
+        trader_id: TraderId,
+        strategy_id: StrategyId,
+        instrument_id: InstrumentId,
+        client_order_id: ClientOrderId,
+        venue_order_id: VenueOrderId,
+        account_id: AccountId,
+        trade_id: TradeId,
+        order_side: OrderSide,
+        order_type: OrderType,
+        last_qty: Quantity,
+        last_px: Price,
+        currency: Currency,
+        liquidity_side: LiquiditySide,
+        event_id: UUID4,
+        ts_event: UnixNanos,
+        ts_init: UnixNanos,
+        reconciliation: bool,
+        position_id: Option<PositionId>,
+        commission: Option<Money>,
+        info: Option<IndexMap<Ustr, Ustr>>,
+    ) -> Self {
+        Self {
+            trader_id,
+            strategy_id,
+            instrument_id,
+            client_order_id,
+            venue_order_id,
+            account_id,
+            trade_id,
+            order_side,
+            order_type,
+            last_qty,
+            last_px,
+            currency,
+            liquidity_side,
+            event_id,
+            ts_event,
+            ts_init,
+            reconciliation,
+            position_id,
+            commission,
+            info,
+            causation_id: None,
+        }
+    }
+
+    #[must_use]
+    pub fn is_buy(&self) -> bool {
+        self.order_side == OrderSide::Buy
+    }
+
+    #[must_use]
+    pub fn is_sell(&self) -> bool {
+        self.order_side == OrderSide::Sell
+    }
+
+    /// Splits an overfill into the fragment which closes the current position and the
+    /// fragment which opens the flipped position.
+    ///
+    /// The closing commission truncates its exact proportional share toward zero in native Money
+    /// units. The opening commission receives the remainder, conserving fees and rebates exactly.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `closing_qty` is zero, is not smaller than the fill quantity, or the
+    /// proportional commission cannot be represented.
+    pub fn split_for_position_flip(
+        &self,
+        closing_qty: Quantity,
+        opening_position_id: Option<PositionId>,
+        opening_event_id: UUID4,
+    ) -> anyhow::Result<(Self, Self)> {
+        if let Some(commission) = self.commission {
+            amount(commission)?;
+        }
+
+        anyhow::ensure!(closing_qty.non_zero(), "closing quantity was zero");
+        anyhow::ensure!(
+            closing_qty < self.last_qty,
+            "closing quantity {closing_qty} must be smaller than fill quantity {}",
+            self.last_qty,
+        );
+
+        let opening_qty = quantity_sub(self.last_qty, closing_qty, closing_qty.precision)?;
+
+        let (closing_commission, opening_commission) = match self.commission {
+            Some(commission) => {
+                let (closing, opening) =
+                    split_commission_qty(commission, closing_qty, self.last_qty)?;
+                (Some(closing), Some(opening))
+            }
+            None => (None, None),
+        };
+
+        let mut closing = self.clone();
+        closing.last_qty = closing_qty;
+        closing.commission = closing_commission;
+
+        let mut opening = self.clone();
+        opening.last_qty = opening_qty;
+        opening.position_id = opening_position_id;
+        opening.commission = opening_commission;
+        opening.event_id = opening_event_id;
+        opening.causation_id = Some(self.event_id);
+
+        Ok((closing, opening))
+    }
+}
+
+impl Debug for OrderFilled {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let position_id_str = match self.position_id {
+            Some(position_id) => position_id.to_string(),
+            None => "None".to_string(),
+        };
+        let commission_str = match self.commission {
+            Some(commission) => commission.to_string(),
+            None => "None".to_string(),
+        };
+        write!(
+            f,
+            "{}(\
+            trader_id={}, \
+            strategy_id={}, \
+            instrument_id={}, \
+            client_order_id={}, \
+            venue_order_id={}, \
+            account_id={}, \
+            trade_id={}, \
+            position_id={}, \
+            order_side={}, \
+            order_type={}, \
+            last_qty={}, \
+            last_px={} {}, \
+            commission={}, \
+            liquidity_side={}, \
+            event_id={}, \
+            ts_event={}, \
+            ts_init={})",
+            stringify!(OrderFilled),
+            self.trader_id,
+            self.strategy_id,
+            self.instrument_id,
+            self.client_order_id,
+            self.venue_order_id,
+            self.account_id,
+            self.trade_id,
+            position_id_str,
+            self.order_side,
+            self.order_type,
+            self.last_qty.to_formatted_string(),
+            self.last_px.to_formatted_string(),
+            self.currency,
+            commission_str,
+            self.liquidity_side,
+            self.event_id,
+            self.ts_event,
+            self.ts_init
+        )
+    }
+}
+
+impl Display for OrderFilled {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{}(\
+            instrument_id={}, \
+            client_order_id={}, \
+            venue_order_id={}, \
+            account_id={}, \
+            trade_id={}, \
+            position_id={}, \
+            order_side={}, \
+            order_type={}, \
+            last_qty={}, \
+            last_px={} {}, \
+            commission={}, \
+            liquidity_side={}, \
+            ts_event={})",
+            stringify!(OrderFilled),
+            self.instrument_id,
+            self.client_order_id,
+            self.venue_order_id,
+            self.account_id,
+            self.trade_id,
+            self.position_id
+                .map_or("None".to_string(), |id| id.to_string()),
+            self.order_side,
+            self.order_type,
+            self.last_qty.to_formatted_string(),
+            self.last_px.to_formatted_string(),
+            self.currency,
+            self.commission
+                .map_or_else(|| "None".to_string(), |commission| commission.to_string()),
+            self.liquidity_side,
+            self.ts_event
+        )
+    }
+}
+
+impl OrderEvent for OrderFilled {
+    fn id(&self) -> UUID4 {
+        self.event_id
+    }
+
+    fn type_name(&self) -> &'static str {
+        stringify!(OrderFilled)
+    }
+
+    fn order_type(&self) -> Option<OrderType> {
+        Some(self.order_type)
+    }
+
+    fn order_side(&self) -> Option<OrderSide> {
+        Some(self.order_side)
+    }
+
+    fn trader_id(&self) -> TraderId {
+        self.trader_id
+    }
+
+    fn strategy_id(&self) -> StrategyId {
+        self.strategy_id
+    }
+
+    fn instrument_id(&self) -> InstrumentId {
+        self.instrument_id
+    }
+
+    fn trade_id(&self) -> Option<TradeId> {
+        Some(self.trade_id)
+    }
+
+    fn currency(&self) -> Option<Currency> {
+        Some(self.currency)
+    }
+
+    fn client_order_id(&self) -> ClientOrderId {
+        self.client_order_id
+    }
+
+    fn reason(&self) -> Option<Ustr> {
+        None
+    }
+
+    fn quantity(&self) -> Option<Quantity> {
+        Some(self.last_qty)
+    }
+
+    fn time_in_force(&self) -> Option<TimeInForce> {
+        None
+    }
+
+    fn liquidity_side(&self) -> Option<LiquiditySide> {
+        Some(self.liquidity_side)
+    }
+
+    fn post_only(&self) -> Option<bool> {
+        None
+    }
+
+    fn reduce_only(&self) -> Option<bool> {
+        None
+    }
+
+    fn quote_quantity(&self) -> Option<bool> {
+        None
+    }
+
+    fn reconciliation(&self) -> bool {
+        self.reconciliation
+    }
+
+    fn price(&self) -> Option<Price> {
+        None
+    }
+
+    fn last_px(&self) -> Option<Price> {
+        Some(self.last_px)
+    }
+
+    fn last_qty(&self) -> Option<Quantity> {
+        Some(self.last_qty)
+    }
+
+    fn activation_price(&self) -> Option<Price> {
+        None
+    }
+
+    fn trigger_price(&self) -> Option<Price> {
+        None
+    }
+
+    fn trigger_type(&self) -> Option<TriggerType> {
+        None
+    }
+
+    fn limit_offset(&self) -> Option<Decimal> {
+        None
+    }
+
+    fn trailing_offset(&self) -> Option<Decimal> {
+        None
+    }
+
+    fn trailing_offset_type(&self) -> Option<TrailingOffsetType> {
+        None
+    }
+
+    fn expire_time(&self) -> Option<UnixNanos> {
+        None
+    }
+
+    fn display_qty(&self) -> Option<Quantity> {
+        None
+    }
+
+    fn emulation_trigger(&self) -> Option<TriggerType> {
+        None
+    }
+
+    fn trigger_instrument_id(&self) -> Option<InstrumentId> {
+        None
+    }
+
+    fn contingency_type(&self) -> Option<ContingencyType> {
+        None
+    }
+
+    fn order_list_id(&self) -> Option<OrderListId> {
+        None
+    }
+
+    fn linked_order_ids(&self) -> Option<Vec<ClientOrderId>> {
+        None
+    }
+
+    fn parent_order_id(&self) -> Option<ClientOrderId> {
+        None
+    }
+
+    fn exec_algorithm_id(&self) -> Option<ExecAlgorithmId> {
+        None
+    }
+
+    fn exec_spawn_id(&self) -> Option<ClientOrderId> {
+        None
+    }
+
+    fn venue_order_id(&self) -> Option<VenueOrderId> {
+        Some(self.venue_order_id)
+    }
+
+    fn account_id(&self) -> Option<AccountId> {
+        Some(self.account_id)
+    }
+
+    fn position_id(&self) -> Option<PositionId> {
+        self.position_id
+    }
+
+    fn commission(&self) -> Option<Money> {
+        self.commission
+    }
+
+    fn ts_event(&self) -> UnixNanos {
+        self.ts_event
+    }
+
+    fn ts_init(&self) -> UnixNanos {
+        self.ts_init
+    }
+    fn causation_id(&self) -> Option<UUID4> {
+        self.causation_id
+    }
+
+    fn info(&self) -> Option<IndexMap<Ustr, Ustr>> {
+        self.info.clone()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use nautilus_core::UnixNanos;
+    use rstest::rstest;
+
+    use super::*;
+    use crate::{
+        enums::OrderSide,
+        events::order::stubs::*,
+        identifiers::PositionId,
+        types::{Currency, Money, Price, Quantity},
+    };
+
+    fn create_test_order_filled() -> OrderFilled {
+        OrderFilled::new(
+            TraderId::from("TRADER-001"),
+            StrategyId::from("EMA-CROSS"),
+            InstrumentId::from("EURUSD.SIM"),
+            ClientOrderId::from("O-19700101-000000-001-001-1"),
+            VenueOrderId::from("V-001"),
+            AccountId::from("SIM-001"),
+            TradeId::from("T-001"),
+            OrderSide::Buy,
+            OrderType::Market,
+            Quantity::from("100"),
+            Price::from("1.0500"),
+            Currency::USD(),
+            LiquiditySide::Taker,
+            UUID4::default(),
+            UnixNanos::from(1_000_000_000),
+            UnixNanos::from(2_000_000_000),
+            false,
+            Some(PositionId::from("P-001")),
+            Some(Money::new(2.5, Currency::USD())),
+            None,
+        )
+    }
+
+    #[rstest]
+    #[case(Some(Money::from("12.2 USDT")), "12.20000000 USDT")]
+    #[case(Some(Money::from("0 USDT")), "0.00000000 USDT")]
+    #[case(None, "None")]
+    fn test_order_filled_display(
+        mut order_filled: OrderFilled,
+        #[case] commission: Option<Money>,
+        #[case] expected: &str,
+    ) {
+        order_filled.commission = commission;
+        let display = format!("{order_filled}");
+        assert_eq!(
+            display,
+            format!(
+                "OrderFilled(instrument_id=BTCUSDT.COINBASE, client_order_id=O-19700101-000000-001-001-1, \
+            venue_order_id=123456, account_id=SIM-001, trade_id=1, position_id=None, \
+            order_side=BUY, order_type=LIMIT, last_qty=0.561, last_px=22_000 USDT, \
+            commission={expected}, liquidity_side=TAKER, ts_event=0)"
+            )
+        );
+    }
+
+    #[rstest]
+    fn test_order_filled_is_buy(order_filled: OrderFilled) {
+        assert!(order_filled.is_buy());
+        assert!(!order_filled.is_sell());
+    }
+
+    #[rstest]
+    fn test_order_filled_info_round_trips_through_serde(order_filled: OrderFilled) {
+        let mut info = IndexMap::new();
+        info.insert(Ustr::from("liquidation"), Ustr::from("true"));
+        info.insert(Ustr::from("maker_order_id"), Ustr::from("ABC-123"));
+        let original = OrderFilled {
+            info: Some(info),
+            ..order_filled
+        };
+
+        let json = serde_json::to_string(&original).unwrap();
+        let deserialized: OrderFilled = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(deserialized.info, original.info);
+        assert_eq!(deserialized, original);
+    }
+
+    #[rstest]
+    fn test_order_filled_is_sell() {
+        let mut order_filled = create_test_order_filled();
+        order_filled.order_side = OrderSide::Sell;
+
+        assert!(order_filled.is_sell());
+        assert!(!order_filled.is_buy());
+    }
+
+    #[rstest]
+    fn test_split_for_position_flip_preserves_provenance_and_commission() {
+        let mut fill = create_test_order_filled();
+        fill.last_qty = Quantity::from(100);
+        fill.commission = Some(Money::new(2.5, Currency::USD()));
+        let source_event_id = fill.event_id;
+        let opening_event_id = UUID4::new();
+        let opening_position_id = PositionId::from("P-FLIPPED");
+
+        let (closing, opening) = fill
+            .split_for_position_flip(
+                Quantity::from(40),
+                Some(opening_position_id),
+                opening_event_id,
+            )
+            .expect("split fill");
+
+        assert_eq!(closing.last_qty, Quantity::from(40));
+        assert_eq!(closing.position_id, fill.position_id);
+        assert_eq!(closing.event_id, source_event_id);
+        assert_eq!(closing.causation_id, fill.causation_id);
+        assert_eq!(closing.commission, Some(Money::new(1.0, Currency::USD())));
+        assert_eq!(opening.last_qty, Quantity::from(60));
+        assert_eq!(opening.position_id, Some(opening_position_id));
+        assert_eq!(opening.event_id, opening_event_id);
+        assert_eq!(opening.causation_id, Some(source_event_id));
+        assert_eq!(opening.commission, Some(Money::new(1.5, Currency::USD())));
+    }
+
+    #[cfg(feature = "defi")]
+    #[rstest]
+    fn test_split_for_position_flip_preserves_mixed_quantity_scales() {
+        let mut fill = create_test_order_filled();
+        fill.last_qty = Quantity::from("2.000000000000000001");
+        fill.commission = None;
+        let closing_qty = Quantity::from("1.00");
+
+        let (closing, opening) = fill
+            .split_for_position_flip(closing_qty, None, UUID4::new())
+            .unwrap();
+
+        assert_eq!(closing.last_qty, closing_qty);
+        assert_eq!(opening.last_qty, Quantity::from("1.000000000000000001"));
+        assert_eq!(opening.last_qty.precision, 18);
+        assert_eq!(closing.commission, None);
+        assert_eq!(opening.commission, None);
+    }
+
+    #[cfg(feature = "high-precision")]
+    #[rstest]
+    fn test_split_for_position_flip_rejects_unrepresentable_original_commission() {
+        let mut fill = create_test_order_filled();
+        fill.last_qty = Quantity::from(2);
+        fill.commission = Some(Money::from_raw(
+            100_000_000_000_000_000_000_000_000_001,
+            Currency::USD(),
+        ));
+
+        let result = fill.split_for_position_flip(Quantity::from(1), None, UUID4::new());
+
+        assert_eq!(
+            result.unwrap_err().to_string(),
+            "position input exceeds exact Decimal representation"
+        );
+    }
+
+    #[rstest]
+    fn test_order_filled_without_position_id_display() {
+        let mut order_filled = create_test_order_filled();
+        order_filled.position_id = None;
+
+        let display = format!("{order_filled}");
+        assert!(display.contains("position_id=None"));
+        assert!(!display.contains("position_id=P-001"));
+    }
+
+    #[rstest]
+    fn test_order_filled_exact_usd_commission_roundtrip() {
+        let mut fill = create_test_order_filled();
+        let commission = Money::from_str_exact("0.000001 USD").unwrap();
+        fill.commission = Some(commission);
+        let json = serde_json::to_value(&fill).unwrap();
+        let restored: OrderFilled = serde_json::from_value(json.clone()).unwrap();
+        let msgpack = rmp_serde::to_vec_named(&fill).unwrap();
+        let restored_msgpack: OrderFilled = rmp_serde::from_slice(&msgpack).unwrap();
+
+        assert_eq!(json["commission"], "0.000001 USD");
+
+        for restored in [restored, restored_msgpack] {
+            assert_eq!(restored.commission, Some(commission));
+            assert_eq!(serde_json::to_value(restored).unwrap(), json);
+        }
+    }
+
+    #[rstest]
+    fn test_order_filled_without_commission_serialization() {
+        let mut order_filled = create_test_order_filled();
+        order_filled.commission = None;
+
+        let json = serde_json::to_string(&order_filled).unwrap();
+        let deserialized: OrderFilled = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(deserialized.commission, None);
+        assert_eq!(deserialized.trade_id, order_filled.trade_id);
+    }
+
+    #[rstest]
+    fn test_order_filled_serialization() {
+        let original = create_test_order_filled();
+
+        let json = serde_json::to_string(&original).unwrap();
+        let deserialized: OrderFilled = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(original, deserialized);
+    }
+
+    #[rstest]
+    fn test_order_filled_serialization_with_causation_id() {
+        let causation_id = UUID4::new();
+        let original = OrderFilled {
+            causation_id: Some(causation_id),
+            ..create_test_order_filled()
+        };
+
+        let json = serde_json::to_string(&original).unwrap();
+        let deserialized: OrderFilled = serde_json::from_str(&json).unwrap();
+
+        assert!(json.contains("\"causation_id\""));
+        assert_eq!(deserialized.causation_id, Some(causation_id));
+        assert_eq!(original, deserialized);
+    }
+}

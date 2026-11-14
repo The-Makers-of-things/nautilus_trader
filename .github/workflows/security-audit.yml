@@ -1,0 +1,337 @@
+name: security-audit
+
+# Supply chain security checks.
+#
+# Triggers:
+#   - Nightly cron and manual dispatch: every audit job runs unconditionally.
+#   - Calls from build.yml: audit jobs run for audit-relevant changes, while
+#     test-ci and test-pre-commit force every audit job and nightly skips them.
+#     A valid development override skips the audit jobs and leaves the gate green.
+#   - Pull requests not targeting develop: GitHub path filters create a workflow
+#     run only when audit-relevant paths change.
+#   - Pushes to test-security: GitHub path filters create a workflow run only
+#     when audit-relevant paths change.
+
+permissions:
+  contents: read
+  actions: read
+
+env:
+  # Fork PRs lack repo/org vars, so audit instead of block.
+  EGRESS_POLICY: >-
+    ${{ github.event.pull_request.head.repo.fork && 'audit'
+    || vars.STEP_SECURITY_EGRESS_POLICY
+    || 'block' }}
+
+on:
+  workflow_call:
+    inputs:
+      force:
+        description: Run every audit job regardless of changed paths
+        type: boolean
+        default: false
+      skip:
+        description: Complete the audit gate without running audit jobs
+        type: boolean
+        default: false
+  pull_request:
+    branches-ignore: [develop]
+    paths: &security_audit_paths
+      - Cargo.lock # Keep in sync with scripts/ci/security-audit-gate.sh.
+      - Cargo.toml
+      - crates/**/Cargo.toml
+      - crates/**/fuzz/Cargo.lock
+      - .pre-commit-config.yaml
+      - python/uv.lock
+      - python/pyproject.toml
+      - deny.toml
+      - .cargo/deny-fuzz.toml
+      - osv-scanner.toml
+      - security-audit.toml
+      - .supply-chain/**
+      - .nautilus-engineering/tools.toml
+      - tools.toml
+      - .cargo/config.toml
+      - .cargo/audit.toml
+      - rust-toolchain.toml
+      - scripts/cargo-tool-version.sh
+      - scripts/install-osv-scanner.sh
+      - scripts/install-security-tools.sh
+      - scripts/purge-orphan-dev-wheels.sh
+      - scripts/rust-toolchain.sh
+      - scripts/security-audit.py
+      - scripts/tool-version.sh
+      - scripts/uv-version.sh
+      - scripts/ci/check-security-gate-override.bash
+      - scripts/ci/configure-r2-aws.bash
+      - scripts/ci/create-docker-manifest.bash
+      - scripts/ci/merge-nightly.bash
+      - scripts/ci/package-cli-artifact.bash
+      - scripts/ci/plan-nightly-merge.bash
+      - scripts/ci/plan-wheel-publication.bash
+      - scripts/ci/publish-wheels*
+      - scripts/ci/save-docker-digest.bash
+      - scripts/ci/security-audit-gate.sh
+      - scripts/ci/select-attestation-bundle.bash
+      - scripts/ci/test-publish-wheels.bash
+      - scripts/ci/update-pyproject-version.sh
+      - scripts/ci/validate-wheel-artifacts.bash
+      - scripts/ci/validate-wheel-upload.bash
+      - .github/actions/**
+      - .github/workflows/**
+  push:
+    branches: [test-security]
+    paths: *security_audit_paths
+  schedule:
+    - cron: "0 12 * * *" # Daily at 12:00 UTC (2hrs prior to nightly-merge)
+  workflow_dispatch: # Allow manual trigger
+
+jobs:
+  override:
+    name: security override
+    if: github.event_name == 'push' && github.ref == 'refs/heads/develop'
+    runs-on: ubuntu-22.04
+    environment: r2-develop
+    outputs:
+      override_active: ${{ steps.override.outputs.override_active }}
+    steps:
+      # https://github.com/step-security/harden-runner
+      - uses: step-security/harden-runner@46b06cea07f9e64621fdf066ba77ac6915163d43 # v2.22.3
+        with:
+          egress-policy: ${{ vars.STEP_SECURITY_EGRESS_POLICY || 'block' }}
+          allowed-endpoints: >-
+            ${{ vars.COMMON_ALLOWED_ENDPOINTS }}
+
+      - name: Checkout repository
+        # https://github.com/actions/checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Check security gate override
+        id: override
+        env:
+          SECURITY_GATE_OVERRIDE: ${{ vars.SECURITY_GATE_OVERRIDE }}
+        run: bash scripts/ci/check-security-gate-override.bash
+
+  changes:
+    name: changes
+    needs: override
+    if: >-
+      !cancelled() &&
+      (needs.override.result == 'success' || needs.override.result == 'skipped')
+    runs-on: ubuntu-22.04
+    outputs:
+      audit_needed: ${{ steps.filter.outputs.audit_needed }}
+    steps:
+      # https://github.com/step-security/harden-runner
+      - uses: step-security/harden-runner@46b06cea07f9e64621fdf066ba77ac6915163d43 # v2.22.3
+        with:
+          egress-policy: ${{ env.EGRESS_POLICY }}
+          allowed-endpoints: >-
+            ${{ vars.COMMON_ALLOWED_ENDPOINTS }}
+
+      - name: Checkout repository
+        # https://github.com/actions/checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Detect audit-relevant changes
+        id: filter
+        shell: bash
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          FORCE_AUDIT: ${{ inputs.force }}
+          SKIP_AUDIT: ${{ inputs.skip || needs.override.outputs.override_active == 'true' }}
+          PR_BASE_REF: ${{ github.event.pull_request.base.ref }}
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          PUSH_BEFORE_SHA: ${{ github.event.before }}
+          PUSH_AFTER_SHA: ${{ github.event.after }}
+        run: |
+          if [ "$SKIP_AUDIT" = "true" ]; then
+            export SKIP_SECURITY_AUDIT=true
+          elif [ "$FORCE_AUDIT" = "true" ]; then
+            export FORCE_SECURITY_AUDIT=true
+          fi
+          bash scripts/ci/security-audit-gate.sh
+
+  zizmor:
+    name: zizmor
+    needs: changes
+    if: >-
+      !cancelled() && needs.changes.result == 'success' &&
+      needs.changes.outputs.audit_needed == 'true'
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: read
+      actions: read
+      security-events: write
+    steps:
+      # https://github.com/step-security/harden-runner
+      - uses: step-security/harden-runner@46b06cea07f9e64621fdf066ba77ac6915163d43 # v2.22.3
+        with:
+          egress-policy: ${{ env.EGRESS_POLICY }}
+          allowed-endpoints: >-
+            ${{ vars.COMMON_ALLOWED_ENDPOINTS }}
+            ${{ vars.SECURITY_AUDIT_ALLOWED_ENDPOINTS }}
+
+      - name: Checkout repository
+        # https://github.com/actions/checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        # https://github.com/actions/setup-python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.13"
+
+      - name: Get uv version from pyproject.toml
+        id: uv-version
+        run: echo "uv_version=$(bash scripts/uv-version.sh)" >> "$GITHUB_OUTPUT"
+
+      - name: Install uv
+        # https://github.com/astral-sh/setup-uv
+        uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
+        with:
+          version: ${{ steps.uv-version.outputs.uv_version }}
+          enable-cache: true
+          prune-cache: true
+
+      - name: Run zizmor
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          uv run --no-project --with "zizmor==$(bash scripts/tool-version.sh zizmor)" -- \
+            zizmor --strict-collection --format sarif --min-severity informational .github/ \
+            > zizmor.sarif
+
+      - name: Upload zizmor SARIF
+        if: >-
+          always() &&
+          hashFiles('zizmor.sarif') != '' &&
+          (github.event_name != 'pull_request' ||
+          !github.event.pull_request.head.repo.fork)
+        # https://github.com/github/codeql-action
+        uses: github/codeql-action/upload-sarif@24c54180a607b1449ed407dd24f251e4e9147c8d # v4.38.3
+        with:
+          sarif_file: zizmor.sarif
+          category: zizmor
+
+  supply-chain:
+    name: supply-chain
+    needs: changes
+    if: >-
+      !cancelled() && needs.changes.result == 'success' &&
+      needs.changes.outputs.audit_needed == 'true'
+    runs-on: ubuntu-22.04
+    steps:
+      # https://github.com/step-security/harden-runner
+      - uses: step-security/harden-runner@46b06cea07f9e64621fdf066ba77ac6915163d43 # v2.22.3
+        with:
+          egress-policy: ${{ env.EGRESS_POLICY }}
+          allowed-endpoints: >-
+            ${{ vars.COMMON_ALLOWED_ENDPOINTS }}
+            ${{ vars.SECURITY_AUDIT_ALLOWED_ENDPOINTS }}
+
+      - name: Checkout repository
+        # https://github.com/actions/checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Get Rust toolchain version
+        id: rust-toolchain
+        run: echo "toolchain=$(bash scripts/rust-toolchain.sh)" >> "$GITHUB_OUTPUT"
+
+      - name: Set up Rust toolchain
+        # https://github.com/actions-rust-lang/setup-rust-toolchain
+        uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f # v2.0.0
+        with:
+          toolchain: ${{ steps.rust-toolchain.outputs.toolchain }}
+          override: true
+          rustflags: -D warnings
+          build-warnings: ""
+
+      - name: Cache supply-chain tools
+        # https://github.com/actions/cache
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |-
+            ~/.cargo/bin/cargo-audit
+            ~/.cargo/bin/cargo-deny
+            ~/.cargo/bin/cargo-vet
+            ~/.cargo/bin/osv-scanner
+          key: >-
+            supply-chain-tools-${{ runner.os }}-${{
+            hashFiles('.nautilus-engineering/tools.toml', 'rust-toolchain.toml') }}
+
+      - name: Get uv version
+        id: uv-version
+        run: echo "version=$(bash scripts/uv-version.sh)" >> "$GITHUB_OUTPUT"
+
+      - name: Install uv
+        # https://github.com/astral-sh/setup-uv
+        uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
+        with:
+          version: ${{ steps.uv-version.outputs.version }}
+          prune-cache: true
+
+      - name: Install Python
+        run: uv python install 3.14
+
+      - name: Install supply-chain tools
+        run: bash scripts/install-security-tools.sh
+
+      - name: Run supply-chain audits
+        run: uv run --project python --no-sync --no-build -- python scripts/security-audit.py run
+
+  audit-result:
+    name: audit-result
+    if: always()
+    needs:
+      - changes
+      - zizmor
+      - supply-chain
+    runs-on: ubuntu-22.04
+    env:
+      AUDIT_NEEDED: ${{ needs.changes.outputs.audit_needed }}
+      CHANGES_RESULT: ${{ needs.changes.result }}
+      ZIZMOR_RESULT: ${{ needs.zizmor.result }}
+      SUPPLY_CHAIN_RESULT: ${{ needs.supply-chain.result }}
+    steps:
+      # https://github.com/step-security/harden-runner
+      - uses: step-security/harden-runner@46b06cea07f9e64621fdf066ba77ac6915163d43 # v2.22.3
+        with:
+          egress-policy: ${{ env.EGRESS_POLICY }}
+          allowed-endpoints: >-
+            ${{ vars.COMMON_ALLOWED_ENDPOINTS }}
+
+      - name: Require the planned audit result
+        shell: bash
+        run: |-
+          if [ "$CHANGES_RESULT" != "success" ]; then
+            echo "::error::Security audit planning did not succeed"
+            exit 1
+          fi
+
+          if [ "$AUDIT_NEEDED" = "true" ]; then
+            expected=success
+          elif [ "$AUDIT_NEEDED" = "false" ]; then
+            expected=skipped
+          else
+            echo "::error::Security audit planning produced no decision"
+            exit 1
+          fi
+
+          for result in \
+            "$ZIZMOR_RESULT" \
+            "$SUPPLY_CHAIN_RESULT"; do
+            if [ "$result" != "$expected" ]; then
+              echo "::error::Expected audit job result $expected, found $result"
+              exit 1
+            fi
+          done

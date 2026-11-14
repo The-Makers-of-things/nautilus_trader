@@ -1,0 +1,96 @@
+# Hyperliquid Test Data
+
+This directory contains API response samples and documented error messages for testing.
+
+## Files
+
+### HTTP Public Data (No Account Required)
+
+- `http_meta_perp_sample.json` - Perpetuals market metadata (sample of 3 markets)
+- `http_meta_spot_sample.json` - Spot market metadata (sample of 3 markets)
+- `http_outcome_meta.json` - Constructed outcomes with USDC, USDH, and missing quote-token metadata
+- `http_l2_book_btc.json` - BTC order book snapshot (5 levels each side)
+- `http_l2_book_snapshot.json` - Existing order book test data
+
+### WebSocket Public Data (No Account Required)
+
+- `ws_trades_sample.json` - Real-time trade message sample
+- `ws_l2_book_sample.json` - Order book update message sample
+- `ws_book_data.json` - Existing book data test sample
+
+### Position average precision
+
+`http_meta_position_precision.json` and `http_positions_precision.json` contain matching subsets
+of mainnet `meta` and `clearinghouseState` responses captured from the public HLP vault on
+2026-11-02. Each `universe` and `assetPositions` entry is unmodified. The metadata sample omits other
+markets, so tests resolve instruments by symbol rather than venue asset index. MEME and BIGTIME cover
+long and short averages whose difference from the PnL-derived cost basis exceeds 0.01%. BTC, ETH,
+and ATOM cover other instrument price precisions.
+
+### Documented exchange errors
+
+`exchange_error_messages.json` contains the order and cancel error messages listed in the
+[official error reference](https://hyperliquid.gitbook.io/hyperliquid-docs/for-developers/api/error-responses).
+These messages are copied from the documentation, including its placeholders, rather than captured
+from live responses. Tests use them in both whole-request and per-order rejection responses.
+
+### Cancel action serialization
+
+`cancel_actions.json` contains independently constructed JSON and named MessagePack vectors for
+cancel actions with absent, false, and true fast flags. These synthetic vectors are not captured
+from the venue.
+
+### Scheduled cancellation
+
+`schedule_cancel.json` contains synthetic arm, replace, and clear JSON and independently constructed
+MessagePack vectors, plus synthetic success and rejection responses. The eligibility rejection follows
+an observed venue response with account-specific traded volume replaced by zero.
+
+### Order decimal serialization
+
+`order_decimal_signing.json` contains synthetic JSON, named MessagePack, connection IDs, and signature
+vectors generated with `hyperliquid-python-sdk` 0.24.0. Its signing implementation matches
+[revision 2fdb18f](https://github.com/hyperliquid-dex/hyperliquid-python-sdk/blob/2fdb18f9517675ea03695a0962bd19eece9c83f0/hyperliquid/utils/signing.py).
+The inputs retain decimal trailing zeros for limit orders, trigger orders, and fractional batch
+modifications. The vectors use nonce `1680000000000` and the deterministic key already used by the
+Rust signing tests. They are generated offline rather than captured from the venue.
+
+## Capturing New Test Data
+
+### HTTP Data
+
+```bash
+cargo run --bin capture-test-data
+```
+
+### WebSocket Data
+
+```bash
+cargo run --bin capture-ws-test-data
+```
+
+## Usage in Tests
+
+```rust
+fn load_test_data<T>(filename: &str) -> T
+where
+    T: serde::de::DeserializeOwned,
+{
+    let path = format!("test_data/{}", filename);
+    let content = std::fs::read_to_string(path).expect("Failed to read test data");
+    serde_json::from_str(&content).expect("Failed to parse test data")
+}
+
+#[rstest]
+fn test_parse_perpetuals_metadata() {
+    let meta: PerpMetadata = load_test_data("http_meta_perp_sample.json");
+    // assertions...
+}
+```
+
+## Data Size Policy
+
+- Keep files small (< 50KB each)
+- Sample only 3-5 items from large arrays
+- Use real mainnet data when possible
+- Update files when API response format changes

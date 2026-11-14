@@ -1,0 +1,2003 @@
+// -------------------------------------------------------------------------------------------------
+//  Copyright (C) 2015-2026 Nautech Systems Pty Ltd. All rights reserved.
+//  https://nautechsystems.io
+//
+//  Licensed under the GNU Lesser General Public License Version 3.0 (the "License");
+//  You may not use this file except in compliance with the License.
+//  You may obtain a copy of the License at https://www.gnu.org/licenses/lgpl-3.0.en.html
+//
+//  Unless required by applicable law or agreed to in writing, software
+//  distributed under the License is distributed on an "AS IS" BASIS,
+//  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+//  See the License for the specific language governing permissions and
+//  limitations under the License.
+// -------------------------------------------------------------------------------------------------
+
+//! Arrow serialization for instruments.
+//!
+//! `InstrumentAny` acts as a dispatcher that routes to the appropriate concrete instrument type's
+//! Arrow serialization implementation. Each concrete instrument type implements its own schema
+//! with all fields as columns (wide schema approach), matching the Python implementation.
+
+use std::{any::type_name, borrow::Borrow, collections::HashMap, fmt, str::FromStr};
+
+use arrow::{
+    array::{Array, StringArray},
+    datatypes::Schema,
+    error::ArrowError,
+    record_batch::RecordBatch,
+};
+use nautilus_model::{
+    instruments::{
+        Instrument, InstrumentAny, betting::BettingInstrument, binary_option::BinaryOption,
+        cfd::Cfd, commodity::Commodity, crypto_future::CryptoFuture,
+        crypto_futures_spread::CryptoFuturesSpread, crypto_option::CryptoOption,
+        crypto_option_spread::CryptoOptionSpread, crypto_perpetual::CryptoPerpetual,
+        currency_pair::CurrencyPair, equity::Equity, futures_contract::FuturesContract,
+        futures_spread::FuturesSpread, index_instrument::IndexInstrument,
+        option_contract::OptionContract, option_spread::OptionSpread,
+        perpetual_contract::PerpetualContract, tokenized_asset::TokenizedAsset,
+    },
+    types::{Currency, Price, Quantity},
+};
+
+#[allow(unused)]
+use crate::arrow::{
+    ArrowSchemaProvider, Data, DecodeDataFromRecordBatch, DecodeFromRecordBatch,
+    EncodeToRecordBatch, EncodingError, KEY_INSTRUMENT_ID, KEY_TYPE_NAME, first_logical_null,
+};
+
+pub mod betting;
+pub mod binary_option;
+pub mod cfd;
+pub mod commodity;
+pub mod crypto_future;
+pub mod crypto_futures_spread;
+pub mod crypto_option;
+pub mod crypto_option_spread;
+pub mod crypto_perpetual;
+pub mod currency_pair;
+pub mod equity;
+pub mod futures_contract;
+pub mod futures_spread;
+pub mod index_instrument;
+pub mod option_contract;
+pub mod option_spread;
+pub mod perpetual_contract;
+pub mod tokenized_asset;
+
+// Columns added after the original schemas are read by name and yield `None` when absent,
+// so fragments written before the column existed decode exactly as they did previously.
+pub(crate) fn optional_quantity_value(
+    values: Option<&StringArray>,
+    field: &'static str,
+    row: usize,
+) -> Result<Option<Quantity>, EncodingError> {
+    let Some(column) = values else {
+        return Ok(None);
+    };
+
+    if column.is_null(row) {
+        return Ok(None);
+    }
+
+    Quantity::from_str(column.value(row))
+        .map(Some)
+        .map_err(|e| EncodingError::ParseError(field, format!("row {row}: {e}")))
+}
+
+pub(crate) fn optional_price_value(
+    values: Option<&StringArray>,
+    field: &'static str,
+    row: usize,
+) -> Result<Option<Price>, EncodingError> {
+    let Some(column) = values else {
+        return Ok(None);
+    };
+
+    if column.is_null(row) {
+        return Ok(None);
+    }
+
+    Price::from_str(column.value(row))
+        .map(Some)
+        .map_err(|e| EncodingError::ParseError(field, format!("row {row}: {e}")))
+}
+
+// Errors on empty/whitespace codes so corrupted rows surface as ParseError,
+// instead of silently registering as a fallback currency. Known codes resolve
+// from CURRENCY_MAP with original metadata; unknown non-empty codes fall back
+// to a new crypto currency to support newly listed exchange assets.
+pub(crate) fn decode_currency(
+    value: &str,
+    field: &'static str,
+    context: &'static str,
+    row: usize,
+) -> Result<Currency, EncodingError> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return Err(EncodingError::ParseError(
+            field,
+            format!("row {row}: empty currency code"),
+        ));
+    }
+
+    Ok(Currency::get_or_create_crypto_with_context(
+        trimmed,
+        Some(context),
+    ))
+}
+
+const INSTRUMENT_VALIDATION_FIELD: &str = "instrument";
+
+pub(crate) fn instrument_validation_error<T>(
+    row: usize,
+    error: impl fmt::Display,
+) -> EncodingError {
+    let type_name = type_name::<T>();
+    let instrument_type = type_name.rsplit("::").next().unwrap_or(type_name);
+
+    EncodingError::ParseError(
+        INSTRUMENT_VALIDATION_FIELD,
+        format!("row {row}: invalid {instrument_type}: {error}"),
+    )
+}
+
+pub(crate) fn validate_required_instrument_columns<T: ArrowSchemaProvider>(
+    metadata: &HashMap<String, String>,
+    record_batch: &RecordBatch,
+) -> Result<(), EncodingError> {
+    let expected = T::get_schema(Some(metadata.clone()));
+    let actual = record_batch.schema();
+    for field in expected
+        .fields()
+        .iter()
+        .filter(|field| !field.is_nullable())
+    {
+        let Ok(index) = actual.index_of(field.name()) else {
+            continue;
+        };
+
+        if let Some(row) = first_logical_null(record_batch.column(index).as_ref()) {
+            return Err(EncodingError::ParseError(
+                INSTRUMENT_VALIDATION_FIELD,
+                format!("required field '{}' is null at row {row}", field.name()),
+            ));
+        }
+    }
+
+    Ok(())
+}
+
+impl ArrowSchemaProvider for InstrumentAny {
+    fn get_schema(metadata: Option<HashMap<String, String>>) -> Schema {
+        let instrument_type = metadata
+            .as_ref()
+            .and_then(|m| m.get(KEY_TYPE_NAME))
+            .map_or("CurrencyPair", |s| s.as_str());
+
+        match instrument_type {
+            "BettingInstrument" => BettingInstrument::get_schema(metadata),
+            "BinaryOption" => BinaryOption::get_schema(metadata),
+            "Cfd" => Cfd::get_schema(metadata),
+            "Commodity" => Commodity::get_schema(metadata),
+            "CryptoFuture" => CryptoFuture::get_schema(metadata),
+            "CryptoFuturesSpread" => CryptoFuturesSpread::get_schema(metadata),
+            "CryptoOption" => CryptoOption::get_schema(metadata),
+            "CryptoOptionSpread" => CryptoOptionSpread::get_schema(metadata),
+            "CryptoPerpetual" => CryptoPerpetual::get_schema(metadata),
+            "CurrencyPair" => CurrencyPair::get_schema(metadata),
+            "Equity" => Equity::get_schema(metadata),
+            "FuturesContract" => FuturesContract::get_schema(metadata),
+            "FuturesSpread" => FuturesSpread::get_schema(metadata),
+            "IndexInstrument" => IndexInstrument::get_schema(metadata),
+            "OptionContract" => OptionContract::get_schema(metadata),
+            "OptionSpread" => OptionSpread::get_schema(metadata),
+            "PerpetualContract" => PerpetualContract::get_schema(metadata),
+            "TokenizedAsset" => TokenizedAsset::get_schema(metadata),
+            _ => {
+                // Fallback to CurrencyPair schema if type is unknown
+                CurrencyPair::get_schema(metadata)
+            }
+        }
+    }
+}
+
+impl EncodeToRecordBatch for InstrumentAny {
+    fn encode_batch<T>(
+        #[allow(unused)] metadata: &HashMap<String, String>,
+        data: &[T],
+    ) -> Result<RecordBatch, ArrowError>
+    where
+        T: std::borrow::Borrow<Self>,
+    {
+        if data.is_empty() {
+            return Err(ArrowError::InvalidArgumentError(
+                "Cannot encode empty instrument batch".to_string(),
+            ));
+        }
+
+        let mut by_type: HashMap<String, Vec<&Self>> = HashMap::new();
+
+        for instrument in data.iter().map(Borrow::borrow) {
+            let type_name = match instrument {
+                Self::Cfd(_) => "Cfd",
+                Self::Commodity(_) => "Commodity",
+                Self::CurrencyPair(_) => "CurrencyPair",
+                Self::Equity(_) => "Equity",
+                Self::CryptoFuture(_) => "CryptoFuture",
+                Self::CryptoFuturesSpread(_) => "CryptoFuturesSpread",
+                Self::CryptoPerpetual(_) => "CryptoPerpetual",
+                Self::CryptoOption(_) => "CryptoOption",
+                Self::CryptoOptionSpread(_) => "CryptoOptionSpread",
+                Self::FuturesContract(_) => "FuturesContract",
+                Self::FuturesSpread(_) => "FuturesSpread",
+                Self::IndexInstrument(_) => "IndexInstrument",
+                Self::OptionContract(_) => "OptionContract",
+                Self::OptionSpread(_) => "OptionSpread",
+                Self::BinaryOption(_) => "BinaryOption",
+                Self::Betting(_) => "BettingInstrument",
+                Self::PerpetualContract(_) => "PerpetualContract",
+                Self::TokenizedAsset(_) => "TokenizedAsset",
+            };
+            by_type
+                .entry(type_name.to_string())
+                .or_default()
+                .push(instrument);
+        }
+
+        if by_type.len() > 1 {
+            return Err(ArrowError::InvalidArgumentError(
+                "Cannot encode mixed instrument types in a single batch. Use separate batches for each type.".to_string(),
+            ));
+        }
+
+        let (type_name, instruments) = by_type.iter().next().unwrap();
+        match type_name.as_str() {
+            "Cfd" => {
+                let cfds: Vec<_> = instruments
+                    .iter()
+                    .map(|i| {
+                        if let Self::Cfd(c) = i {
+                            c
+                        } else {
+                            unreachable!()
+                        }
+                    })
+                    .cloned()
+                    .collect();
+                Cfd::encode_batch(metadata, &cfds)
+            }
+            "Commodity" => {
+                let commodities: Vec<_> = instruments
+                    .iter()
+                    .map(|i| {
+                        if let Self::Commodity(c) = i {
+                            c
+                        } else {
+                            unreachable!()
+                        }
+                    })
+                    .cloned()
+                    .collect();
+                Commodity::encode_batch(metadata, &commodities)
+            }
+            "BettingInstrument" => {
+                let betting: Vec<_> = instruments
+                    .iter()
+                    .map(|i| {
+                        if let Self::Betting(b) = i {
+                            b
+                        } else {
+                            unreachable!()
+                        }
+                    })
+                    .cloned()
+                    .collect();
+                BettingInstrument::encode_batch(metadata, &betting)
+            }
+            "BinaryOption" => {
+                let binary_options: Vec<_> = instruments
+                    .iter()
+                    .map(|i| {
+                        if let Self::BinaryOption(bo) = i {
+                            bo
+                        } else {
+                            unreachable!()
+                        }
+                    })
+                    .cloned()
+                    .collect();
+                BinaryOption::encode_batch(metadata, &binary_options)
+            }
+            "CryptoFuture" => {
+                let crypto_futures: Vec<_> = instruments
+                    .iter()
+                    .map(|i| {
+                        if let Self::CryptoFuture(cf) = i {
+                            cf
+                        } else {
+                            unreachable!()
+                        }
+                    })
+                    .cloned()
+                    .collect();
+                CryptoFuture::encode_batch(metadata, &crypto_futures)
+            }
+            "CryptoFuturesSpread" => {
+                let spreads: Vec<_> = instruments
+                    .iter()
+                    .map(|i| {
+                        if let Self::CryptoFuturesSpread(cfs) = i {
+                            cfs
+                        } else {
+                            unreachable!()
+                        }
+                    })
+                    .cloned()
+                    .collect();
+                CryptoFuturesSpread::encode_batch(metadata, &spreads)
+            }
+            "CryptoOption" => {
+                let crypto_options: Vec<_> = instruments
+                    .iter()
+                    .map(|i| {
+                        if let Self::CryptoOption(co) = i {
+                            co
+                        } else {
+                            unreachable!()
+                        }
+                    })
+                    .cloned()
+                    .collect();
+                CryptoOption::encode_batch(metadata, &crypto_options)
+            }
+            "CryptoOptionSpread" => {
+                let spreads: Vec<_> = instruments
+                    .iter()
+                    .map(|i| {
+                        if let Self::CryptoOptionSpread(cos) = i {
+                            cos
+                        } else {
+                            unreachable!()
+                        }
+                    })
+                    .cloned()
+                    .collect();
+                CryptoOptionSpread::encode_batch(metadata, &spreads)
+            }
+            "CryptoPerpetual" => {
+                let crypto_perps: Vec<_> = instruments
+                    .iter()
+                    .map(|i| {
+                        if let Self::CryptoPerpetual(cp) = i {
+                            cp
+                        } else {
+                            unreachable!()
+                        }
+                    })
+                    .cloned()
+                    .collect();
+                CryptoPerpetual::encode_batch(metadata, &crypto_perps)
+            }
+            "CurrencyPair" => {
+                let currency_pairs: Vec<_> = instruments
+                    .iter()
+                    .map(|i| {
+                        if let Self::CurrencyPair(cp) = i {
+                            cp
+                        } else {
+                            unreachable!()
+                        }
+                    })
+                    .cloned()
+                    .collect();
+                CurrencyPair::encode_batch(metadata, &currency_pairs)
+            }
+            "Equity" => {
+                let equities: Vec<_> = instruments
+                    .iter()
+                    .map(|i| {
+                        if let Self::Equity(e) = i {
+                            e
+                        } else {
+                            unreachable!()
+                        }
+                    })
+                    .cloned()
+                    .collect();
+                Equity::encode_batch(metadata, &equities)
+            }
+            "FuturesContract" => {
+                let futures_contracts: Vec<_> = instruments
+                    .iter()
+                    .map(|i| {
+                        if let Self::FuturesContract(fc) = i {
+                            fc
+                        } else {
+                            unreachable!()
+                        }
+                    })
+                    .cloned()
+                    .collect();
+                FuturesContract::encode_batch(metadata, &futures_contracts)
+            }
+            "FuturesSpread" => {
+                let futures_spreads: Vec<_> = instruments
+                    .iter()
+                    .map(|i| {
+                        if let Self::FuturesSpread(fs) = i {
+                            fs
+                        } else {
+                            unreachable!()
+                        }
+                    })
+                    .cloned()
+                    .collect();
+                FuturesSpread::encode_batch(metadata, &futures_spreads)
+            }
+            "IndexInstrument" => {
+                let index_instruments: Vec<_> = instruments
+                    .iter()
+                    .map(|i| {
+                        if let Self::IndexInstrument(ii) = i {
+                            ii
+                        } else {
+                            unreachable!()
+                        }
+                    })
+                    .cloned()
+                    .collect();
+                IndexInstrument::encode_batch(metadata, &index_instruments)
+            }
+            "OptionContract" => {
+                let option_contracts: Vec<_> = instruments
+                    .iter()
+                    .map(|i| {
+                        if let Self::OptionContract(oc) = i {
+                            oc
+                        } else {
+                            unreachable!()
+                        }
+                    })
+                    .cloned()
+                    .collect();
+                OptionContract::encode_batch(metadata, &option_contracts)
+            }
+            "OptionSpread" => {
+                let option_spreads: Vec<_> = instruments
+                    .iter()
+                    .map(|i| {
+                        if let Self::OptionSpread(os) = i {
+                            os
+                        } else {
+                            unreachable!()
+                        }
+                    })
+                    .cloned()
+                    .collect();
+                OptionSpread::encode_batch(metadata, &option_spreads)
+            }
+            "PerpetualContract" => {
+                let perpetual_contracts: Vec<_> = instruments
+                    .iter()
+                    .map(|i| {
+                        if let Self::PerpetualContract(pc) = i {
+                            pc
+                        } else {
+                            unreachable!()
+                        }
+                    })
+                    .cloned()
+                    .collect();
+                PerpetualContract::encode_batch(metadata, &perpetual_contracts)
+            }
+            "TokenizedAsset" => {
+                let tokenized_assets: Vec<_> = instruments
+                    .iter()
+                    .map(|i| {
+                        if let Self::TokenizedAsset(ta) = i {
+                            ta
+                        } else {
+                            unreachable!()
+                        }
+                    })
+                    .cloned()
+                    .collect();
+                TokenizedAsset::encode_batch(metadata, &tokenized_assets)
+            }
+            _ => Err(ArrowError::InvalidArgumentError(format!(
+                "Instrument type {type_name} serialization not yet implemented"
+            ))),
+        }
+    }
+
+    fn metadata(&self) -> HashMap<String, String> {
+        let mut metadata = HashMap::new();
+        metadata.insert(
+            KEY_INSTRUMENT_ID.to_string(),
+            Instrument::id(self).to_string(),
+        );
+
+        let type_name = match self {
+            Self::Cfd(_) => "Cfd",
+            Self::Commodity(_) => "Commodity",
+            Self::CurrencyPair(_) => "CurrencyPair",
+            Self::Equity(_) => "Equity",
+            Self::CryptoFuture(_) => "CryptoFuture",
+            Self::CryptoFuturesSpread(_) => "CryptoFuturesSpread",
+            Self::CryptoPerpetual(_) => "CryptoPerpetual",
+            Self::CryptoOption(_) => "CryptoOption",
+            Self::CryptoOptionSpread(_) => "CryptoOptionSpread",
+            Self::FuturesContract(_) => "FuturesContract",
+            Self::FuturesSpread(_) => "FuturesSpread",
+            Self::IndexInstrument(_) => "IndexInstrument",
+            Self::OptionContract(_) => "OptionContract",
+            Self::OptionSpread(_) => "OptionSpread",
+            Self::BinaryOption(_) => "BinaryOption",
+            Self::Betting(_) => "BettingInstrument",
+            Self::PerpetualContract(_) => "PerpetualContract",
+            Self::TokenizedAsset(_) => "TokenizedAsset",
+        };
+
+        metadata.insert(KEY_TYPE_NAME.to_string(), type_name.to_string());
+        metadata
+    }
+}
+
+/// Decode InstrumentAny from RecordBatch
+/// (Cannot implement DecodeFromRecordBatch trait due to `Into<Data>` bound)
+///
+/// # Errors
+///
+/// Returns an error if the RecordBatch cannot be decoded.
+pub fn decode_instrument_any_batch(
+    #[allow(unused)] metadata: &HashMap<String, String>,
+    record_batch: &RecordBatch,
+) -> Result<Vec<InstrumentAny>, EncodingError> {
+    let type_name = metadata
+        .get(KEY_TYPE_NAME)
+        .map(String::as_str)
+        .ok_or_else(|| EncodingError::MissingMetadata(KEY_TYPE_NAME))?;
+
+    match type_name {
+        "Cfd" => {
+            let cfds = cfd::decode_cfd_batch(metadata, record_batch)?;
+            Ok(cfds.into_iter().map(InstrumentAny::Cfd).collect())
+        }
+        "Commodity" => {
+            let commodities = commodity::decode_commodity_batch(metadata, record_batch)?;
+            Ok(commodities
+                .into_iter()
+                .map(InstrumentAny::Commodity)
+                .collect())
+        }
+        "BettingInstrument" => {
+            let betting = betting::decode_betting_instrument_batch(metadata, record_batch)?;
+            Ok(betting.into_iter().map(InstrumentAny::Betting).collect())
+        }
+        "BinaryOption" => {
+            let binary_options = binary_option::decode_binary_option_batch(metadata, record_batch)?;
+            Ok(binary_options
+                .into_iter()
+                .map(InstrumentAny::BinaryOption)
+                .collect())
+        }
+        "CryptoFuture" => {
+            let crypto_futures = crypto_future::decode_crypto_future_batch(metadata, record_batch)?;
+            Ok(crypto_futures
+                .into_iter()
+                .map(InstrumentAny::CryptoFuture)
+                .collect())
+        }
+        "CryptoFuturesSpread" => {
+            let spreads =
+                crypto_futures_spread::decode_crypto_futures_spread_batch(metadata, record_batch)?;
+            Ok(spreads
+                .into_iter()
+                .map(InstrumentAny::CryptoFuturesSpread)
+                .collect())
+        }
+        "CryptoOption" => {
+            let crypto_options = crypto_option::decode_crypto_option_batch(metadata, record_batch)?;
+            Ok(crypto_options
+                .into_iter()
+                .map(InstrumentAny::CryptoOption)
+                .collect())
+        }
+        "CryptoOptionSpread" => {
+            let spreads =
+                crypto_option_spread::decode_crypto_option_spread_batch(metadata, record_batch)?;
+            Ok(spreads
+                .into_iter()
+                .map(InstrumentAny::CryptoOptionSpread)
+                .collect())
+        }
+        "CryptoPerpetual" => {
+            let crypto_perps =
+                crypto_perpetual::decode_crypto_perpetual_batch(metadata, record_batch)?;
+            Ok(crypto_perps
+                .into_iter()
+                .map(InstrumentAny::CryptoPerpetual)
+                .collect())
+        }
+        "CurrencyPair" => {
+            let currency_pairs = currency_pair::decode_currency_pair_batch(metadata, record_batch)?;
+            Ok(currency_pairs
+                .into_iter()
+                .map(InstrumentAny::CurrencyPair)
+                .collect())
+        }
+        "Equity" => {
+            let equities = equity::decode_equity_batch(metadata, record_batch)?;
+            Ok(equities.into_iter().map(InstrumentAny::Equity).collect())
+        }
+        "FuturesContract" => {
+            let futures_contracts =
+                futures_contract::decode_futures_contract_batch(metadata, record_batch)?;
+            Ok(futures_contracts
+                .into_iter()
+                .map(InstrumentAny::FuturesContract)
+                .collect())
+        }
+        "FuturesSpread" => {
+            let futures_spreads =
+                futures_spread::decode_futures_spread_batch(metadata, record_batch)?;
+            Ok(futures_spreads
+                .into_iter()
+                .map(InstrumentAny::FuturesSpread)
+                .collect())
+        }
+        "IndexInstrument" => {
+            let index_instruments =
+                index_instrument::decode_index_instrument_batch(metadata, record_batch)?;
+            Ok(index_instruments
+                .into_iter()
+                .map(InstrumentAny::IndexInstrument)
+                .collect())
+        }
+        "OptionContract" => {
+            let option_contracts =
+                option_contract::decode_option_contract_batch(metadata, record_batch)?;
+            Ok(option_contracts
+                .into_iter()
+                .map(InstrumentAny::OptionContract)
+                .collect())
+        }
+        "OptionSpread" => {
+            let option_spreads = option_spread::decode_option_spread_batch(metadata, record_batch)?;
+            Ok(option_spreads
+                .into_iter()
+                .map(InstrumentAny::OptionSpread)
+                .collect())
+        }
+        "PerpetualContract" => {
+            let perpetual_contracts =
+                perpetual_contract::decode_perpetual_contract_batch(metadata, record_batch)?;
+            Ok(perpetual_contracts
+                .into_iter()
+                .map(InstrumentAny::PerpetualContract)
+                .collect())
+        }
+        "TokenizedAsset" => {
+            let tokenized_assets =
+                tokenized_asset::decode_tokenized_asset_batch(metadata, record_batch)?;
+            Ok(tokenized_assets
+                .into_iter()
+                .map(InstrumentAny::TokenizedAsset)
+                .collect())
+        }
+        _ => Err(EncodingError::ParseError(
+            KEY_TYPE_NAME,
+            format!("Unknown instrument type: {type_name}"),
+        )),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use arrow::{
+        array::{Array, ArrayRef, StringArray, UInt8Array},
+        datatypes::DataType,
+    };
+    use nautilus_core::{Params, UnixNanos};
+    use nautilus_model::{
+        enums::{AssetClass, CurrencyType, OptionKind},
+        identifiers::{InstrumentId, Symbol},
+        instruments::{
+            Instrument, InstrumentAny,
+            currency_pair::CurrencyPair,
+            stubs::{
+                betting, cfd_gold, commodity_gold, crypto_future_btcusdt,
+                crypto_futures_spread_btc_deribit, crypto_option_btc_deribit,
+                crypto_option_spread_btc_deribit, crypto_perpetual_ethusdt, currency_pair_ethusdt,
+                equity_aapl, perpetual_contract_eurusd, tokenized_asset_aaplx,
+            },
+            tick_scheme::{
+                FixedTickScheme, TickScheme, TieredTickScheme, get_tick_scheme,
+                register_tick_scheme,
+            },
+        },
+        types::{Currency, Money, Price, Quantity},
+    };
+    use rstest::rstest;
+    use rust_decimal_macros::dec;
+    use ustr::Ustr;
+
+    use super::*;
+
+    #[rstest]
+    fn test_get_schema() {
+        let mut metadata = HashMap::new();
+        metadata.insert(KEY_TYPE_NAME.to_string(), "CurrencyPair".to_string());
+        let schema = InstrumentAny::get_schema(Some(metadata));
+        assert!(schema.fields().len() >= 20);
+        assert_eq!(schema.field(0).name(), "id");
+    }
+
+    #[rstest]
+    #[case("")]
+    #[case("   ")]
+    #[case("\t\n")]
+    fn test_decode_currency_empty_or_whitespace_errors(#[case] value: &str) {
+        let result = decode_currency(value, "currency", "test.currency", 7);
+        let err = result.expect_err("empty code must surface EncodingError");
+        match err {
+            EncodingError::ParseError(field, msg) => {
+                assert_eq!(field, "currency");
+                assert!(
+                    msg.contains("row 7"),
+                    "message should include row index, found: {msg}",
+                );
+                assert!(
+                    msg.contains("empty currency code"),
+                    "message should describe empty code, found: {msg}",
+                );
+            }
+            other => panic!("unexpected error variant: {other:?}"),
+        }
+        // Ensure the fallback did not register a phantom currency under the empty key.
+        assert!(Currency::try_from_str(value.trim()).is_none());
+    }
+
+    #[rstest]
+    #[case("USD", CurrencyType::Fiat, 2)]
+    #[case("BTC", CurrencyType::Crypto, 8)]
+    #[case("XAU", CurrencyType::CommodityBacked, 2)]
+    fn test_decode_currency_known_code_preserves_metadata(
+        #[case] code: &str,
+        #[case] expected_type: CurrencyType,
+        #[case] expected_precision: u8,
+    ) {
+        let currency = decode_currency(code, "currency", "test.currency", 0).unwrap();
+        assert_eq!(currency.code.as_str(), code);
+        assert_eq!(currency.currency_type, expected_type);
+        assert_eq!(currency.precision, expected_precision);
+    }
+
+    #[rstest]
+    fn test_decode_currency_unknown_code_registers_as_crypto() {
+        let code = "XDECTEST";
+        assert!(
+            Currency::try_from_str(code).is_none(),
+            "test precondition: '{code}' must not be pre-registered",
+        );
+
+        let currency = decode_currency(code, "base_currency", "test.base_currency", 0).unwrap();
+        assert_eq!(currency.code.as_str(), code);
+        assert_eq!(currency.currency_type, CurrencyType::Crypto);
+        assert_eq!(currency.precision, 8);
+        assert_eq!(currency.iso4217, 0);
+
+        let registered = Currency::try_from_str(code).expect("unknown code must be registered");
+        assert_eq!(registered, currency);
+    }
+
+    #[rstest]
+    fn test_encode_decode_round_trip() {
+        let instrument_id = InstrumentId::from("EUR/USD.SIM");
+        let currency_pair = CurrencyPair::builder()
+            .instrument_id(instrument_id)
+            .raw_symbol(Symbol::from("EUR/USD"))
+            .base_currency(Currency::from("EUR"))
+            .quote_currency(Currency::from("USD"))
+            .price_precision(5)
+            // size_precision must match size_increment precision (0)
+            .size_precision(0)
+            .price_increment(Price::new(0.00001, 5))
+            // precision 0
+            .size_increment(Quantity::new(1.0, 0))
+            .tick_scheme(Ustr::from("FOREX_5DECIMAL"))
+            .ts_event(UnixNanos::default())
+            .ts_init(UnixNanos::default())
+            .build()
+            .unwrap();
+        let instrument = InstrumentAny::CurrencyPair(currency_pair);
+
+        let metadata = instrument.metadata();
+        let record_batch =
+            InstrumentAny::encode_batch(&metadata, std::slice::from_ref(&instrument)).unwrap();
+        let decoded = decode_instrument_any_batch(&metadata, &record_batch).unwrap();
+
+        assert_eq!(decoded.len(), 1);
+        assert_eq!(Instrument::id(&decoded[0]), Instrument::id(&instrument));
+        assert_eq!(
+            Instrument::raw_symbol(&decoded[0]),
+            Instrument::raw_symbol(&instrument)
+        );
+        assert_eq!(
+            Instrument::asset_class(&decoded[0]),
+            Instrument::asset_class(&instrument)
+        );
+
+        match (&decoded[0], &instrument) {
+            (InstrumentAny::CurrencyPair(decoded_cp), InstrumentAny::CurrencyPair(original_cp)) => {
+                assert_eq!(decoded_cp.id, original_cp.id);
+                assert_eq!(decoded_cp.base_currency, original_cp.base_currency);
+                assert_eq!(decoded_cp.quote_currency, original_cp.quote_currency);
+                assert_eq!(decoded_cp.price_precision, original_cp.price_precision);
+                assert_eq!(decoded_cp.size_precision, original_cp.size_precision);
+                assert_eq!(decoded_cp.tick_scheme, original_cp.tick_scheme);
+            }
+            _ => panic!("Decoded instrument type mismatch"),
+        }
+    }
+
+    #[rstest]
+    #[case::binary_option(nautilus_model::instruments::stubs::binary_option().into_any())]
+    #[case::betting(betting().into_any())]
+    #[case::cfd(cfd_gold().into_any())]
+    #[case::commodity(commodity_gold().into_any())]
+    #[case::crypto_future(crypto_future_btcusdt(2, 6, Price::from("0.01"), Quantity::from("0.000001")).into_any())]
+    #[case::crypto_futures_spread(crypto_futures_spread_btc_deribit().into_any())]
+    #[case::crypto_option(crypto_option_btc_deribit(3, 1, Price::from("0.001"), Quantity::from("0.1")).into_any())]
+    #[case::crypto_option_spread(crypto_option_spread_btc_deribit().into_any())]
+    #[case::crypto_perpetual(crypto_perpetual_ethusdt().into_any())]
+    #[case::currency_pair(currency_pair_ethusdt().into_any())]
+    #[case::perpetual_contract(perpetual_contract_eurusd().into_any())]
+    #[case::tokenized_asset(tokenized_asset_aaplx().into_any())]
+    fn test_instrument_exact_money_notional_round_trip(#[case] instrument: InstrumentAny) {
+        let currency = instrument.quote_currency();
+        let maximum = Money::from_decimal_exact(dec!(1.000000001), currency).unwrap();
+        let minimum = Money::from_decimal_exact(dec!(0.000000003), currency).unwrap();
+        let mut encoded = serde_json::to_value(instrument).unwrap();
+        let fields = encoded
+            .as_object_mut()
+            .unwrap()
+            .values_mut()
+            .next()
+            .unwrap();
+        fields["max_notional"] = serde_json::to_value(maximum).unwrap();
+        fields["min_notional"] = serde_json::to_value(minimum).unwrap();
+        let instrument: InstrumentAny = serde_json::from_value(encoded).unwrap();
+        let metadata = instrument.metadata();
+        let batch =
+            InstrumentAny::encode_batch(&metadata, std::slice::from_ref(&instrument)).unwrap();
+        let decoded = decode_instrument_any_batch(&metadata, &batch).unwrap();
+
+        assert_eq!(decoded.len(), 1);
+        assert_eq!(decoded[0].id(), instrument.id());
+        assert_eq!(decoded[0].max_notional(), Some(maximum));
+        assert_eq!(decoded[0].min_notional(), Some(minimum));
+    }
+
+    #[rstest]
+    fn test_decode_currency_pair_without_tick_scheme_column_defaults_none() {
+        let instrument_id = InstrumentId::from("EUR/USD.SIM");
+        let currency_pair = CurrencyPair::builder()
+            .instrument_id(instrument_id)
+            .raw_symbol(Symbol::from("EUR/USD"))
+            .base_currency(Currency::from("EUR"))
+            .quote_currency(Currency::from("USD"))
+            .price_precision(5)
+            .size_precision(0)
+            .price_increment(Price::new(0.00001, 5))
+            .size_increment(Quantity::new(1.0, 0))
+            .tick_scheme(Ustr::from("FOREX_5DECIMAL"))
+            .ts_event(UnixNanos::default())
+            .ts_init(UnixNanos::default())
+            .build()
+            .unwrap();
+        let instrument = InstrumentAny::CurrencyPair(currency_pair);
+
+        let metadata = instrument.metadata();
+        let record_batch =
+            InstrumentAny::encode_batch(&metadata, std::slice::from_ref(&instrument)).unwrap();
+        let record_batch = batch_without_column(&record_batch, "tick_scheme");
+        let decoded = decode_instrument_any_batch(&metadata, &record_batch).unwrap();
+
+        assert_eq!(decoded.len(), 1);
+        match &decoded[0] {
+            InstrumentAny::CurrencyPair(decoded_cp) => {
+                assert_eq!(decoded_cp.id, instrument.id());
+                assert_eq!(decoded_cp.tick_scheme, None);
+            }
+            _ => panic!("Decoded instrument type mismatch"),
+        }
+    }
+
+    #[rstest]
+    fn test_encode_decode_round_trip_equity() {
+        use nautilus_model::instruments::{Instrument, equity::Equity};
+
+        let instrument_id = InstrumentId::from("AAPL.NASDAQ");
+        let equity = Equity::builder()
+            .instrument_id(instrument_id)
+            .raw_symbol(Symbol::from("AAPL"))
+            .currency(Currency::from("USD"))
+            .price_precision(2)
+            .price_increment(Price::new(0.01, 2))
+            .ts_event(UnixNanos::default())
+            .ts_init(UnixNanos::default())
+            .build()
+            .unwrap();
+        let instrument = InstrumentAny::Equity(equity);
+
+        let metadata = instrument.metadata();
+        let record_batch =
+            InstrumentAny::encode_batch(&metadata, std::slice::from_ref(&instrument)).unwrap();
+        let decoded = decode_instrument_any_batch(&metadata, &record_batch).unwrap();
+        assert_eq!(decoded.len(), 1);
+        assert_eq!(Instrument::id(&decoded[0]), Instrument::id(&instrument));
+        assert_eq!(
+            Instrument::raw_symbol(&decoded[0]),
+            Instrument::raw_symbol(&instrument)
+        );
+        assert_eq!(
+            Instrument::asset_class(&decoded[0]),
+            Instrument::asset_class(&instrument)
+        );
+
+        match (&decoded[0], &instrument) {
+            (InstrumentAny::Equity(decoded_eq), InstrumentAny::Equity(original_eq)) => {
+                assert_eq!(decoded_eq.id, original_eq.id);
+                assert_eq!(decoded_eq.currency, original_eq.currency);
+                assert_eq!(decoded_eq.price_precision, original_eq.price_precision);
+            }
+            _ => panic!("Decoded instrument type mismatch"),
+        }
+    }
+
+    #[rstest]
+    fn test_encode_decode_round_trip_equity_all_fields() {
+        use nautilus_core::Params;
+
+        let info = Params::new([("sector".to_string(), serde_json::json!("technology"))].into());
+
+        let equity = Equity::builder()
+            .instrument_id(InstrumentId::from("AAPL.NASDAQ"))
+            .raw_symbol(Symbol::from("AAPL"))
+            .isin(Ustr::from("US0378331005"))
+            .currency(Currency::from("USD"))
+            .price_precision(2)
+            .price_increment(Price::from("0.01"))
+            .lot_size(Quantity::from("100"))
+            .max_quantity(Quantity::from("10000"))
+            .min_quantity(Quantity::from("1"))
+            .max_price(Price::from("9999.99"))
+            .min_price(Price::from("0.01"))
+            .margin_init(dec!(0.01))
+            .margin_maint(dec!(0.02))
+            .tick_scheme(Ustr::from("TOPIX100"))
+            .info(info)
+            .ts_event(1.into())
+            .ts_init(2.into())
+            .build()
+            .unwrap();
+        let instrument = InstrumentAny::Equity(equity.clone());
+
+        let metadata = instrument.metadata();
+        let record_batch =
+            InstrumentAny::encode_batch(&metadata, std::slice::from_ref(&instrument)).unwrap();
+        let decoded = decode_instrument_any_batch(&metadata, &record_batch).unwrap();
+
+        assert_eq!(decoded.len(), 1);
+        let InstrumentAny::Equity(decoded_equity) = &decoded[0] else {
+            panic!("Decoded instrument type mismatch");
+        };
+
+        // The v1 `from_dict` dropped these quantity constraints (#4461), so check them here
+        assert_eq!(decoded_equity.max_quantity, equity.max_quantity);
+        assert_eq!(decoded_equity.min_quantity, equity.min_quantity);
+
+        // `PartialEq` compares only `id`, so compare every field via its serialized form
+        assert_eq!(
+            serde_json::to_value(decoded_equity).unwrap(),
+            serde_json::to_value(&equity).unwrap(),
+        );
+    }
+
+    #[rstest]
+    fn test_instrument_info_uses_nullable_utf8_json() {
+        let absent = equity_aapl();
+        let mut populated = absent.clone();
+
+        let info = nautilus_core::Params::new(
+            [
+                ("enabled".to_string(), serde_json::json!(true)),
+                ("source".to_string(), serde_json::json!("unit-test")),
+            ]
+            .into(),
+        );
+        populated.info = Some(info);
+        let instruments = [
+            InstrumentAny::Equity(populated.clone()),
+            InstrumentAny::Equity(absent.clone()),
+        ];
+        let metadata = instruments[0].metadata();
+
+        let batch = InstrumentAny::encode_batch(&metadata, &instruments).unwrap();
+        let schema = batch.schema();
+        let field = schema.field_with_name("info").unwrap();
+        let info = batch
+            .column_by_name("info")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        let decoded = decode_instrument_any_batch(&metadata, &batch).unwrap();
+
+        assert_eq!(field.data_type(), &DataType::Utf8);
+        assert!(field.is_nullable());
+        assert_eq!(field.extension_type_name(), Some("arrow.json"));
+        assert_eq!(
+            serde_json::from_str::<nautilus_core::Params>(info.value(0)).unwrap(),
+            populated.info.clone().unwrap(),
+        );
+        assert!(info.is_null(1));
+        let InstrumentAny::Equity(decoded_populated) = &decoded[0] else {
+            panic!("Decoded instrument type mismatch");
+        };
+        let InstrumentAny::Equity(decoded_absent) = &decoded[1] else {
+            panic!("Decoded instrument type mismatch");
+        };
+        assert_eq!(decoded_populated.info, populated.info);
+        assert_eq!(decoded_absent.info, absent.info);
+    }
+
+    #[rstest]
+    fn test_encode_decode_round_trip_futures_contract_all_fields() {
+        let contract = FuturesContract::builder()
+            .instrument_id(InstrumentId::from("ESZ4.XCME"))
+            .raw_symbol(Symbol::from("ESZ4"))
+            .asset_class(AssetClass::Index)
+            .exchange(Ustr::from("XCME"))
+            .underlying(Ustr::from("ES"))
+            .activation_ns(1.into())
+            .expiration_ns(2.into())
+            .currency(Currency::from("USD"))
+            .price_precision(2)
+            .price_increment(Price::from("0.01"))
+            .multiplier(Quantity::from("1"))
+            .lot_size(Quantity::from("1"))
+            .max_quantity(Quantity::from("10000"))
+            .min_quantity(Quantity::from("5"))
+            .max_price(Price::from("9999.99"))
+            .min_price(Price::from("0.01"))
+            .margin_init(dec!(0.01))
+            .margin_maint(dec!(0.02))
+            .ts_event(1.into())
+            .ts_init(2.into())
+            .build()
+            .unwrap();
+
+        let decoded = encode_decode_instrument(&InstrumentAny::FuturesContract(contract.clone()));
+        let InstrumentAny::FuturesContract(decoded) = decoded else {
+            panic!("Decoded instrument type mismatch");
+        };
+
+        assert_eq!(
+            serde_json::to_value(&decoded).unwrap(),
+            serde_json::to_value(&contract).unwrap(),
+        );
+    }
+
+    #[rstest]
+    fn test_encode_decode_round_trip_option_contract_all_fields() {
+        let contract = OptionContract::builder()
+            .instrument_id(InstrumentId::from("AAPL_C100.OPRA"))
+            .raw_symbol(Symbol::from("AAPL_C100"))
+            .asset_class(AssetClass::Equity)
+            .exchange(Ustr::from("OPRA"))
+            .underlying(Ustr::from("AAPL"))
+            .option_kind(OptionKind::Call)
+            .strike_price(Price::from("100.00"))
+            .currency(Currency::from("USD"))
+            .activation_ns(1.into())
+            .expiration_ns(2.into())
+            .price_precision(2)
+            .price_increment(Price::from("0.01"))
+            .multiplier(Quantity::from("100"))
+            .lot_size(Quantity::from("1"))
+            .max_quantity(Quantity::from("10000"))
+            .min_quantity(Quantity::from("5"))
+            .max_price(Price::from("9999.99"))
+            .min_price(Price::from("0.01"))
+            .margin_init(dec!(0.01))
+            .margin_maint(dec!(0.02))
+            .ts_event(1.into())
+            .ts_init(2.into())
+            .build()
+            .unwrap();
+
+        let decoded = encode_decode_instrument(&InstrumentAny::OptionContract(contract.clone()));
+        let InstrumentAny::OptionContract(decoded) = decoded else {
+            panic!("Decoded instrument type mismatch");
+        };
+
+        assert_eq!(
+            serde_json::to_value(&decoded).unwrap(),
+            serde_json::to_value(&contract).unwrap(),
+        );
+    }
+
+    #[rstest]
+    fn test_encode_decode_round_trip_binary_option_all_fields() {
+        let raw = "0.1234567890123456789012345678";
+        let info = Params::new([("gamma_market".to_string(), serde_json::json!(raw))].into());
+        let option = BinaryOption::builder()
+            .instrument_id(InstrumentId::from("ELECTION.POLYMARKET"))
+            .raw_symbol(Symbol::from("ELECTION"))
+            .asset_class(AssetClass::Alternative)
+            .currency(Currency::from("USDC"))
+            .activation_ns(1.into())
+            .expiration_ns(2.into())
+            .price_precision(2)
+            .size_precision(0)
+            .price_increment(Price::from("0.01"))
+            .size_increment(Quantity::from("1"))
+            .event_id(Ustr::from("event-123"))
+            .info(info)
+            .outcome(Ustr::from("YES"))
+            .description(Ustr::from("Election outcome"))
+            .max_quantity(Quantity::from("10000"))
+            .min_quantity(Quantity::from("5"))
+            .max_notional(Money::from("50000 USDC"))
+            .min_notional(Money::from("5 USDC"))
+            .max_price(Price::from("0.99"))
+            .min_price(Price::from("0.01"))
+            .margin_init(dec!(0.01))
+            .margin_maint(dec!(0.02))
+            .ts_event(1.into())
+            .ts_init(2.into())
+            .build()
+            .unwrap();
+
+        let decoded = encode_decode_instrument(&InstrumentAny::BinaryOption(option.clone()));
+        let InstrumentAny::BinaryOption(decoded) = decoded else {
+            panic!("Decoded instrument type mismatch");
+        };
+
+        assert_eq!(
+            serde_json::to_value(&decoded).unwrap(),
+            serde_json::to_value(&option).unwrap(),
+        );
+    }
+
+    #[rstest]
+    #[case::missing(false)]
+    #[case::null(true)]
+    fn test_binary_option_event_id_legacy_default(#[case] null: bool) {
+        let mut option = nautilus_model::instruments::stubs::binary_option();
+        option.event_id = Some(Ustr::from("event-123"));
+        let metadata = option.metadata();
+        let batch = BinaryOption::encode_batch(&metadata, &[option]).unwrap();
+
+        let batch = if null {
+            batch_with_null_string_column(&batch, "event_id")
+        } else {
+            batch_without_column(&batch, "event_id")
+        };
+
+        let decoded = binary_option::decode_binary_option_batch(&metadata, &batch).unwrap();
+        assert_eq!(decoded.len(), 1);
+        assert_eq!(decoded[0].event_id, None);
+    }
+
+    #[rstest]
+    #[case::fixed("BINARY_CODEC_FIXED", TickScheme::Fixed(FixedTickScheme::new(Price::from("0.0020")).unwrap()))]
+    #[case::tiered("BINARY_CODEC_TIERED", TickScheme::Tiered(TieredTickScheme::from_ticks(vec![Price::from("0.000000001"), Price::from("0.123456789"), Price::from("0.999999999")], 9).unwrap()))]
+    #[case::betfair("BETFAIR", TickScheme::Betfair)]
+    #[case::crypto("CRYPTO_0_01", TickScheme::Crypto)]
+    fn test_binary_option_tick_scheme_definition_restores_missing_scheme(
+        #[case] name: &str,
+        #[case] scheme: TickScheme,
+    ) {
+        if get_tick_scheme(name).is_none() {
+            register_tick_scheme(name, scheme.clone()).unwrap();
+        }
+
+        let mut option = nautilus_model::instruments::stubs::binary_option();
+        option.tick_scheme = Some(Ustr::from(name));
+        let metadata = option.metadata();
+        let batch = BinaryOption::encode_batch(&metadata, &[option.clone()]).unwrap();
+        let restored_name = format!("{name}_RESTORED");
+        let mut columns = batch.columns().to_vec();
+        columns[batch.schema().index_of("tick_scheme").unwrap()] =
+            Arc::new(StringArray::from(vec![restored_name.as_str()]));
+        let batch = RecordBatch::try_new(batch.schema(), columns).unwrap();
+        assert_eq!(get_tick_scheme(&restored_name), None);
+
+        let decoded = binary_option::decode_binary_option_batch(&metadata, &batch).unwrap();
+        let repeated = binary_option::decode_binary_option_batch(&metadata, &batch).unwrap();
+        option.tick_scheme = Some(Ustr::from(restored_name.as_str()));
+
+        assert_eq!(
+            serde_json::to_value(&decoded).unwrap(),
+            serde_json::to_value([&option]).unwrap()
+        );
+        assert_eq!(
+            serde_json::to_value(&repeated).unwrap(),
+            serde_json::to_value([&option]).unwrap()
+        );
+        assert_eq!(get_tick_scheme(&restored_name), Some(scheme));
+    }
+
+    #[rstest]
+    #[case::missing_builtin(false, "BETFAIR")]
+    #[case::null_builtin(true, "BETFAIR")]
+    #[case::missing_custom(false, "BINARY_CODEC_LEGACY_REGISTERED_MISSING")]
+    #[case::null_custom(true, "BINARY_CODEC_LEGACY_REGISTERED_NULL")]
+    fn test_binary_option_tick_scheme_definition_legacy_default(
+        #[case] null: bool,
+        #[case] name: &str,
+    ) {
+        if get_tick_scheme(name).is_none() {
+            let scheme = FixedTickScheme::new(Price::from("0.0020")).unwrap();
+            register_tick_scheme(name, TickScheme::Fixed(scheme)).unwrap();
+        }
+
+        let mut option = nautilus_model::instruments::stubs::binary_option();
+        option.tick_scheme = Some(Ustr::from(name));
+        let metadata = option.metadata();
+        let batch = BinaryOption::encode_batch(&metadata, &[option.clone()]).unwrap();
+        let batch = if null {
+            batch_with_null_string_column(&batch, "tick_scheme_definition")
+        } else {
+            batch_without_column(&batch, "tick_scheme_definition")
+        };
+
+        let decoded = binary_option::decode_binary_option_batch(&metadata, &batch).unwrap();
+
+        assert_eq!(
+            serde_json::to_value(decoded).unwrap(),
+            serde_json::to_value([option]).unwrap()
+        );
+    }
+
+    #[rstest]
+    #[case::missing(false)]
+    #[case::null(true)]
+    fn test_binary_option_legacy_unregistered_tick_scheme_rejected(#[case] null: bool) {
+        let option = nautilus_model::instruments::stubs::binary_option();
+        let metadata = option.metadata();
+        let batch = BinaryOption::encode_batch(&metadata, &[option]).unwrap();
+        let batch = if null {
+            batch_with_null_string_column(&batch, "tick_scheme_definition")
+        } else {
+            batch_without_column(&batch, "tick_scheme_definition")
+        };
+
+        let name = "BINARY_CODEC_LEGACY_UNREGISTERED";
+        let mut columns = batch.columns().to_vec();
+        columns[batch.schema().index_of("tick_scheme").unwrap()] =
+            Arc::new(StringArray::from(vec![name]));
+        let batch = RecordBatch::try_new(batch.schema(), columns).unwrap();
+        assert_eq!(get_tick_scheme(name), None);
+
+        let error = binary_option::decode_binary_option_batch(&metadata, &batch).unwrap_err();
+
+        assert!(
+            matches!(&error, EncodingError::ParseError("instrument", detail) if detail == "row 0: invalid BinaryOption: tick_scheme not found in tick schemes"),
+            "{error}"
+        );
+    }
+
+    #[rstest]
+    fn test_binary_option_encoding_unregistered_tick_scheme_rejected() {
+        let name = "BINARY_CODEC_ENCODING_UNREGISTERED";
+        let mut option = nautilus_model::instruments::stubs::binary_option();
+        option.tick_scheme = Some(Ustr::from(name));
+        let metadata = option.metadata();
+        assert_eq!(get_tick_scheme(name), None);
+
+        let error = BinaryOption::encode_batch(&metadata, &[option]).unwrap_err();
+
+        assert!(
+            matches!(&error, ArrowError::InvalidArgumentError(detail) if detail == "Unknown tick scheme BINARY_CODEC_ENCODING_UNREGISTERED"),
+            "{error}"
+        );
+    }
+
+    #[rstest]
+    #[case::malformed(Some("BINARY_CODEC_BAD_JSON"), "{", "EOF while parsing")]
+    #[case::no_name(None, r#"{"type":"crypto"}"#, "no tick scheme name")]
+    #[case::conflict(Some("BETFAIR"), r#"{"type":"crypto"}"#, "conflicting definition")]
+    #[case::invalid_ticks(
+        Some("BINARY_CODEC_BAD_TICKS"),
+        r#"{"type":"tiered","ticks":["0.02","0.01"],"precision":2}"#,
+        "not greater"
+    )]
+    #[case::inexact(
+        Some("BINARY_CODEC_INEXACT"),
+        r#"{"type":"tiered","ticks":["0.001"],"precision":2}"#,
+        "cannot be represented"
+    )]
+    fn test_binary_option_tick_scheme_definition_rejects_invalid_data(
+        #[case] name: Option<&str>,
+        #[case] json: &str,
+        #[case] message: &str,
+    ) {
+        let option = nautilus_model::instruments::stubs::binary_option();
+        let metadata = option.metadata();
+        let batch = BinaryOption::encode_batch(&metadata, &[option]).unwrap();
+        let mut columns = batch.columns().to_vec();
+        columns[batch.schema().index_of("tick_scheme").unwrap()] =
+            Arc::new(StringArray::from(vec![name]));
+        columns[batch.schema().index_of("tick_scheme_definition").unwrap()] =
+            Arc::new(StringArray::from(vec![json]));
+        let batch = RecordBatch::try_new(batch.schema(), columns).unwrap();
+
+        let error = binary_option::decode_binary_option_batch(&metadata, &batch).unwrap_err();
+
+        assert!(
+            matches!(&error, EncodingError::ParseError("tick_scheme_definition", detail) if detail.starts_with("row 0:") && detail.contains(message)),
+            "{error}"
+        );
+    }
+
+    // The `betting` stub populates every bound, margin, and fee, so this covers the whole struct
+    #[rstest]
+    fn test_encode_decode_round_trip_betting_all_fields() {
+        let instrument = betting();
+
+        let decoded = encode_decode_instrument(&InstrumentAny::Betting(instrument.clone()));
+        let InstrumentAny::Betting(decoded) = decoded else {
+            panic!("Decoded instrument type mismatch");
+        };
+
+        assert_eq!(
+            serde_json::to_value(&decoded).unwrap(),
+            serde_json::to_value(&instrument).unwrap(),
+        );
+    }
+
+    fn encode_decode_instrument(instrument: &InstrumentAny) -> InstrumentAny {
+        let metadata = instrument.metadata();
+        let record_batch =
+            InstrumentAny::encode_batch(&metadata, std::slice::from_ref(instrument)).unwrap();
+        let mut decoded = decode_instrument_any_batch(&metadata, &record_batch).unwrap();
+
+        assert_eq!(decoded.len(), 1);
+        decoded.remove(0)
+    }
+
+    fn roundtrip_case(instrument: &InstrumentAny) {
+        let metadata = instrument.metadata();
+        let record_batch =
+            InstrumentAny::encode_batch(&metadata, std::slice::from_ref(instrument)).unwrap();
+        let decoded = decode_instrument_any_batch(&metadata, &record_batch).unwrap();
+
+        assert_eq!(decoded.len(), 1);
+        assert_eq!(Instrument::id(&decoded[0]), Instrument::id(instrument));
+        assert_eq!(
+            Instrument::raw_symbol(&decoded[0]),
+            Instrument::raw_symbol(instrument)
+        );
+        assert_eq!(
+            Instrument::asset_class(&decoded[0]),
+            Instrument::asset_class(instrument)
+        );
+        assert_eq!(
+            Instrument::instrument_class(&decoded[0]),
+            Instrument::instrument_class(instrument)
+        );
+        assert_eq!(
+            Instrument::price_precision(&decoded[0]),
+            Instrument::price_precision(instrument)
+        );
+        assert_eq!(
+            Instrument::size_precision(&decoded[0]),
+            Instrument::size_precision(instrument)
+        );
+        assert_eq!(
+            Instrument::quote_currency(&decoded[0]),
+            Instrument::quote_currency(instrument)
+        );
+        assert_eq!(
+            std::mem::discriminant(&decoded[0]),
+            std::mem::discriminant(instrument),
+            "decoded variant must match encoded variant"
+        );
+    }
+
+    fn batch_without_column(record_batch: &RecordBatch, column_name: &str) -> RecordBatch {
+        let schema = record_batch.schema();
+        let column_index = schema.index_of(column_name).unwrap();
+        let fields: Vec<_> = schema
+            .fields()
+            .iter()
+            .enumerate()
+            .filter(|(index, _)| *index != column_index)
+            .map(|(_, field)| field.as_ref().clone())
+            .collect();
+        let columns = record_batch
+            .columns()
+            .iter()
+            .enumerate()
+            .filter(|(index, _)| *index != column_index)
+            .map(|(_, column)| Arc::clone(column))
+            .collect();
+        let new_schema = Schema::new_with_metadata(fields, schema.metadata().clone());
+
+        RecordBatch::try_new(Arc::new(new_schema), columns).unwrap()
+    }
+
+    fn batch_with_null_string_column(record_batch: &RecordBatch, column_name: &str) -> RecordBatch {
+        let schema = record_batch.schema();
+        let column_index = schema.index_of(column_name).unwrap();
+        let mut columns = record_batch.columns().to_vec();
+        let null_column: ArrayRef = Arc::new(StringArray::from(vec![None::<&str>]));
+        columns[column_index] = null_column;
+
+        RecordBatch::try_new(schema, columns).unwrap()
+    }
+
+    fn batch_with_uint8_column(
+        record_batch: &RecordBatch,
+        column_name: &str,
+        values: Vec<u8>,
+    ) -> RecordBatch {
+        let schema = record_batch.schema();
+        let column_index = schema.index_of(column_name).unwrap();
+        let mut columns = record_batch.columns().to_vec();
+        columns[column_index] = Arc::new(UInt8Array::from(values));
+
+        RecordBatch::try_new(schema, columns).unwrap()
+    }
+
+    fn batch_with_null_uint8_column(record_batch: &RecordBatch, column_name: &str) -> RecordBatch {
+        let schema = record_batch.schema();
+        let column_index = schema.index_of(column_name).unwrap();
+        let fields = schema
+            .fields()
+            .iter()
+            .enumerate()
+            .map(|(index, field)| {
+                if index == column_index {
+                    field.as_ref().clone().with_nullable(true)
+                } else {
+                    field.as_ref().clone()
+                }
+            })
+            .collect::<Vec<_>>();
+
+        let mut columns = record_batch.columns().to_vec();
+        columns[column_index] = Arc::new(UInt8Array::from(vec![None]));
+        let schema = Schema::new_with_metadata(fields, schema.metadata().clone());
+
+        RecordBatch::try_new(Arc::new(schema), columns).unwrap()
+    }
+
+    #[rstest]
+    fn test_public_instrument_decoders_reject_null_required_columns() {
+        let instruments = vec![
+            InstrumentAny::Betting(nautilus_model::instruments::stubs::betting()),
+            InstrumentAny::BinaryOption(nautilus_model::instruments::stubs::binary_option()),
+            InstrumentAny::Cfd(nautilus_model::instruments::stubs::cfd_gold()),
+            InstrumentAny::Commodity(nautilus_model::instruments::stubs::commodity_gold()),
+            InstrumentAny::CryptoFuture(nautilus_model::instruments::stubs::crypto_future_btcusdt(
+                2,
+                6,
+                Price::from("0.01"),
+                Quantity::from("0.000001"),
+            )),
+            InstrumentAny::CryptoFuturesSpread(
+                nautilus_model::instruments::stubs::crypto_futures_spread_btc_deribit(),
+            ),
+            InstrumentAny::CryptoOption(
+                nautilus_model::instruments::stubs::crypto_option_btc_deribit(
+                    3,
+                    1,
+                    Price::from("0.001"),
+                    Quantity::from("0.1"),
+                ),
+            ),
+            InstrumentAny::CryptoOptionSpread(
+                nautilus_model::instruments::stubs::crypto_option_spread_btc_deribit(),
+            ),
+            InstrumentAny::CryptoPerpetual(
+                nautilus_model::instruments::stubs::crypto_perpetual_ethusdt(),
+            ),
+            InstrumentAny::CurrencyPair(nautilus_model::instruments::stubs::currency_pair_btcusdt()),
+            InstrumentAny::Equity(nautilus_model::instruments::stubs::equity_aapl()),
+            InstrumentAny::FuturesContract(
+                nautilus_model::instruments::stubs::futures_contract_es(None, None),
+            ),
+            InstrumentAny::FuturesSpread(nautilus_model::instruments::stubs::futures_spread_es()),
+            InstrumentAny::IndexInstrument(
+                nautilus_model::instruments::stubs::index_instrument_spx(),
+            ),
+            InstrumentAny::OptionContract(
+                nautilus_model::instruments::stubs::option_contract_appl(),
+            ),
+            InstrumentAny::OptionSpread(nautilus_model::instruments::stubs::option_spread()),
+            InstrumentAny::PerpetualContract(
+                nautilus_model::instruments::stubs::perpetual_contract_eurusd(),
+            ),
+            InstrumentAny::TokenizedAsset(
+                nautilus_model::instruments::stubs::tokenized_asset_aaplx(),
+            ),
+        ];
+
+        for instrument in instruments {
+            let metadata = instrument.metadata();
+            let record_batch =
+                InstrumentAny::encode_batch(&metadata, std::slice::from_ref(&instrument)).unwrap();
+            let record_batch = batch_with_null_uint8_column(&record_batch, "price_precision");
+
+            let result = decode_instrument_any_batch(&metadata, &record_batch);
+
+            assert!(matches!(
+                result,
+                Err(EncodingError::ParseError(INSTRUMENT_VALIDATION_FIELD, ref message))
+                    if message == "required field 'price_precision' is null at row 0"
+            ));
+        }
+    }
+
+    #[rstest]
+    #[case::binary_option(InstrumentAny::BinaryOption(
+        nautilus_model::instruments::stubs::binary_option()
+    ))]
+    #[case::cfd(InstrumentAny::Cfd(nautilus_model::instruments::stubs::cfd_gold()))]
+    #[case::commodity(InstrumentAny::Commodity(
+        nautilus_model::instruments::stubs::commodity_gold()
+    ))]
+    #[case::crypto_future(InstrumentAny::CryptoFuture(
+        nautilus_model::instruments::stubs::crypto_future_btcusdt(
+            2,
+            6,
+            Price::from("0.01"),
+            Quantity::from("0.000001"),
+        )
+    ))]
+    #[case::crypto_futures_spread(InstrumentAny::CryptoFuturesSpread(
+        nautilus_model::instruments::stubs::crypto_futures_spread_btc_deribit()
+    ))]
+    #[case::crypto_option(InstrumentAny::CryptoOption(
+        nautilus_model::instruments::stubs::crypto_option_btc_deribit(
+            3,
+            1,
+            Price::from("0.001"),
+            Quantity::from("0.1"),
+        )
+    ))]
+    #[case::crypto_option_spread(InstrumentAny::CryptoOptionSpread(
+        nautilus_model::instruments::stubs::crypto_option_spread_btc_deribit()
+    ))]
+    #[case::crypto_perpetual(InstrumentAny::CryptoPerpetual(
+        nautilus_model::instruments::stubs::crypto_perpetual_ethusdt()
+    ))]
+    #[case::currency_pair(InstrumentAny::CurrencyPair(
+        nautilus_model::instruments::stubs::currency_pair_btcusdt()
+    ))]
+    #[case::equity(InstrumentAny::Equity(nautilus_model::instruments::stubs::equity_aapl()))]
+    #[case::futures_contract(InstrumentAny::FuturesContract(
+        nautilus_model::instruments::stubs::futures_contract_es(None, None,)
+    ))]
+    #[case::futures_spread(InstrumentAny::FuturesSpread(
+        nautilus_model::instruments::stubs::futures_spread_es()
+    ))]
+    #[case::index_instrument(InstrumentAny::IndexInstrument(
+        nautilus_model::instruments::stubs::index_instrument_spx()
+    ))]
+    #[case::option_contract(InstrumentAny::OptionContract(
+        nautilus_model::instruments::stubs::option_contract_appl()
+    ))]
+    #[case::option_spread(InstrumentAny::OptionSpread(
+        nautilus_model::instruments::stubs::option_spread()
+    ))]
+    #[case::perpetual_contract(InstrumentAny::PerpetualContract(
+        nautilus_model::instruments::stubs::perpetual_contract_eurusd()
+    ))]
+    #[case::tokenized_asset(InstrumentAny::TokenizedAsset(
+        nautilus_model::instruments::stubs::tokenized_asset_aaplx()
+    ))]
+    fn test_decode_instrument_checked_constructor_error(#[case] instrument: InstrumentAny) {
+        let metadata = instrument.metadata();
+        let class = metadata.get(KEY_TYPE_NAME).unwrap();
+        let first_row_price_precision = Instrument::price_precision(&instrument);
+        let instruments = vec![instrument.clone(), instrument];
+        let record_batch = InstrumentAny::encode_batch(&metadata, &instruments).unwrap();
+        let record_batch = batch_with_uint8_column(
+            &record_batch,
+            "price_precision",
+            vec![first_row_price_precision, u8::MAX],
+        );
+
+        let error = decode_instrument_any_batch(&metadata, &record_batch)
+            .expect_err("invalid precision must return EncodingError");
+
+        match error {
+            EncodingError::ParseError(field, message) => {
+                assert_eq!(field, INSTRUMENT_VALIDATION_FIELD);
+                assert!(
+                    message.contains(class),
+                    "message should include instrument class, found: {message}",
+                );
+                assert!(
+                    message.starts_with("row 1:"),
+                    "message should include row index, found: {message}",
+                );
+                assert!(
+                    message.contains("price_precision"),
+                    "message should include failed precision, found: {message}",
+                );
+            }
+            other => panic!("unexpected error variant: {other:?}"),
+        }
+    }
+
+    #[rstest]
+    fn test_roundtrip_betting() {
+        use nautilus_model::instruments::stubs::betting;
+        roundtrip_case(&InstrumentAny::Betting(betting()));
+    }
+
+    #[rstest]
+    fn test_roundtrip_binary_option() {
+        use nautilus_model::instruments::stubs::binary_option;
+        roundtrip_case(&InstrumentAny::BinaryOption(binary_option()));
+    }
+
+    #[rstest]
+    fn test_roundtrip_cfd() {
+        use nautilus_model::instruments::stubs::cfd_gold;
+        roundtrip_case(&InstrumentAny::Cfd(cfd_gold()));
+    }
+
+    #[rstest]
+    fn test_roundtrip_commodity() {
+        use nautilus_model::instruments::stubs::commodity_gold;
+        roundtrip_case(&InstrumentAny::Commodity(commodity_gold()));
+    }
+
+    #[rstest]
+    fn test_roundtrip_crypto_future() {
+        use nautilus_model::instruments::stubs::crypto_future_btcusdt;
+
+        let mut inst = crypto_future_btcusdt(2, 6, Price::from("0.01"), Quantity::from("0.000001"));
+        inst.lot_size = Quantity::from("0.25");
+        let any = InstrumentAny::CryptoFuture(inst.clone());
+        roundtrip_case(&any);
+        let metadata = any.metadata();
+        let batch = InstrumentAny::encode_batch(&metadata, std::slice::from_ref(&any)).unwrap();
+        let decoded = decode_instrument_any_batch(&metadata, &batch).unwrap();
+        let InstrumentAny::CryptoFuture(decoded_inst) = &decoded[0] else {
+            panic!("decoded variant is not CryptoFuture");
+        };
+        assert_eq!(decoded_inst.lot_size, inst.lot_size);
+    }
+
+    #[rstest]
+    fn test_decode_crypto_future_without_lot_size_column_defaults_to_one() {
+        use nautilus_model::instruments::stubs::crypto_future_btcusdt;
+
+        let inst = crypto_future_btcusdt(2, 6, Price::from("0.01"), Quantity::from("0.000001"));
+        let any = InstrumentAny::CryptoFuture(inst);
+        let metadata = any.metadata();
+        let batch = InstrumentAny::encode_batch(&metadata, std::slice::from_ref(&any)).unwrap();
+        let batch = batch_without_column(&batch, "lot_size");
+
+        let decoded = decode_instrument_any_batch(&metadata, &batch).unwrap();
+
+        let InstrumentAny::CryptoFuture(decoded_inst) = &decoded[0] else {
+            panic!("decoded variant is not CryptoFuture");
+        };
+        assert_eq!(decoded_inst.lot_size, Quantity::from(1));
+    }
+
+    #[rstest]
+    fn test_decode_crypto_future_null_lot_size_defaults_to_one() {
+        use nautilus_model::instruments::stubs::crypto_future_btcusdt;
+
+        let inst = crypto_future_btcusdt(2, 6, Price::from("0.01"), Quantity::from("0.000001"));
+        let any = InstrumentAny::CryptoFuture(inst);
+        let metadata = any.metadata();
+        let batch = InstrumentAny::encode_batch(&metadata, std::slice::from_ref(&any)).unwrap();
+        let batch = batch_with_null_string_column(&batch, "lot_size");
+
+        let decoded = decode_instrument_any_batch(&metadata, &batch).unwrap();
+
+        let InstrumentAny::CryptoFuture(decoded_inst) = &decoded[0] else {
+            panic!("decoded variant is not CryptoFuture");
+        };
+        assert_eq!(decoded_inst.lot_size, Quantity::from(1));
+    }
+
+    #[rstest]
+    fn test_roundtrip_crypto_option() {
+        use nautilus_model::instruments::stubs::crypto_option_btc_deribit;
+
+        let mut inst = crypto_option_btc_deribit(3, 1, Price::from("0.001"), Quantity::from("0.1"));
+        inst.lot_size = Quantity::from("0.5");
+        let any = InstrumentAny::CryptoOption(inst.clone());
+        roundtrip_case(&any);
+        let metadata = any.metadata();
+        let batch = InstrumentAny::encode_batch(&metadata, std::slice::from_ref(&any)).unwrap();
+        let decoded = decode_instrument_any_batch(&metadata, &batch).unwrap();
+        let InstrumentAny::CryptoOption(decoded_inst) = &decoded[0] else {
+            panic!("decoded variant is not CryptoOption");
+        };
+        assert_eq!(decoded_inst.lot_size, inst.lot_size);
+    }
+
+    #[rstest]
+    fn test_decode_crypto_option_without_lot_size_column_defaults_to_one() {
+        use nautilus_model::instruments::stubs::crypto_option_btc_deribit;
+
+        let inst = crypto_option_btc_deribit(3, 1, Price::from("0.001"), Quantity::from("0.1"));
+        let any = InstrumentAny::CryptoOption(inst);
+        let metadata = any.metadata();
+        let batch = InstrumentAny::encode_batch(&metadata, std::slice::from_ref(&any)).unwrap();
+        let batch = batch_without_column(&batch, "lot_size");
+
+        let decoded = decode_instrument_any_batch(&metadata, &batch).unwrap();
+
+        let InstrumentAny::CryptoOption(decoded_inst) = &decoded[0] else {
+            panic!("decoded variant is not CryptoOption");
+        };
+        assert_eq!(decoded_inst.lot_size, Quantity::from(1));
+    }
+
+    #[rstest]
+    fn test_decode_crypto_option_null_lot_size_defaults_to_one() {
+        use nautilus_model::instruments::stubs::crypto_option_btc_deribit;
+
+        let inst = crypto_option_btc_deribit(3, 1, Price::from("0.001"), Quantity::from("0.1"));
+        let any = InstrumentAny::CryptoOption(inst);
+        let metadata = any.metadata();
+        let batch = InstrumentAny::encode_batch(&metadata, std::slice::from_ref(&any)).unwrap();
+        let batch = batch_with_null_string_column(&batch, "lot_size");
+
+        let decoded = decode_instrument_any_batch(&metadata, &batch).unwrap();
+
+        let InstrumentAny::CryptoOption(decoded_inst) = &decoded[0] else {
+            panic!("decoded variant is not CryptoOption");
+        };
+        assert_eq!(decoded_inst.lot_size, Quantity::from(1));
+    }
+
+    #[rstest]
+    fn test_roundtrip_crypto_futures_spread() {
+        use nautilus_model::instruments::{Instrument, stubs::crypto_futures_spread_btc_deribit};
+        let inst = crypto_futures_spread_btc_deribit();
+        let any = InstrumentAny::CryptoFuturesSpread(inst.clone());
+        roundtrip_case(&any);
+        let metadata = any.metadata();
+        let batch = InstrumentAny::encode_batch(&metadata, std::slice::from_ref(&any)).unwrap();
+        let decoded = decode_instrument_any_batch(&metadata, &batch).unwrap();
+        let InstrumentAny::CryptoFuturesSpread(decoded_inst) = &decoded[0] else {
+            panic!("decoded variant is not CryptoFuturesSpread");
+        };
+        assert_eq!(decoded_inst.lot_size, inst.lot_size);
+        assert_eq!(decoded_inst.is_inverse, inst.is_inverse);
+        assert_eq!(decoded_inst.strategy_type, inst.strategy_type);
+        assert_eq!(decoded_inst.settlement_currency, inst.settlement_currency);
+        assert_eq!(Instrument::id(decoded_inst), Instrument::id(&inst));
+    }
+
+    #[rstest]
+    fn test_roundtrip_crypto_option_spread() {
+        use nautilus_model::instruments::{Instrument, stubs::crypto_option_spread_btc_deribit};
+        let inst = crypto_option_spread_btc_deribit();
+        let any = InstrumentAny::CryptoOptionSpread(inst.clone());
+        roundtrip_case(&any);
+        let metadata = any.metadata();
+        let batch = InstrumentAny::encode_batch(&metadata, std::slice::from_ref(&any)).unwrap();
+        let decoded = decode_instrument_any_batch(&metadata, &batch).unwrap();
+        let InstrumentAny::CryptoOptionSpread(decoded_inst) = &decoded[0] else {
+            panic!("decoded variant is not CryptoOptionSpread");
+        };
+        // Deribit BTC option combos carry min_trade_amount=0.1, which sets
+        // lot_size=0.1; dropping the lot_size Arrow column would silently
+        // default it back to 1
+        assert_eq!(decoded_inst.lot_size, inst.lot_size);
+        assert_eq!(decoded_inst.size_precision, inst.size_precision);
+        assert_eq!(decoded_inst.size_increment, inst.size_increment);
+        assert_eq!(decoded_inst.is_inverse, inst.is_inverse);
+        assert_eq!(decoded_inst.strategy_type, inst.strategy_type);
+        assert_eq!(decoded_inst.settlement_currency, inst.settlement_currency);
+        assert_eq!(Instrument::id(decoded_inst), Instrument::id(&inst));
+    }
+
+    #[rstest]
+    fn test_roundtrip_crypto_perpetual_inverse() {
+        use nautilus_model::instruments::stubs::btcusd_bybit;
+        roundtrip_case(&InstrumentAny::CryptoPerpetual(btcusd_bybit()));
+    }
+
+    #[rstest]
+    fn test_roundtrip_crypto_perpetual_linear() {
+        use nautilus_model::instruments::stubs::crypto_perpetual_ethusdt;
+
+        let mut inst = crypto_perpetual_ethusdt();
+        inst.lot_size = Quantity::from("0.005");
+        let any = InstrumentAny::CryptoPerpetual(inst.clone());
+        roundtrip_case(&any);
+        let metadata = any.metadata();
+        let batch = InstrumentAny::encode_batch(&metadata, std::slice::from_ref(&any)).unwrap();
+        let decoded = decode_instrument_any_batch(&metadata, &batch).unwrap();
+        let InstrumentAny::CryptoPerpetual(decoded_inst) = &decoded[0] else {
+            panic!("decoded variant is not CryptoPerpetual");
+        };
+        assert_eq!(decoded_inst.lot_size, inst.lot_size);
+    }
+
+    #[rstest]
+    fn test_decode_crypto_perpetual_without_lot_size_column_defaults_to_one() {
+        use nautilus_model::instruments::stubs::crypto_perpetual_ethusdt;
+
+        let inst = crypto_perpetual_ethusdt();
+        let any = InstrumentAny::CryptoPerpetual(inst);
+        let metadata = any.metadata();
+        let batch = InstrumentAny::encode_batch(&metadata, std::slice::from_ref(&any)).unwrap();
+        let batch = batch_without_column(&batch, "lot_size");
+
+        let decoded = decode_instrument_any_batch(&metadata, &batch).unwrap();
+
+        let InstrumentAny::CryptoPerpetual(decoded_inst) = &decoded[0] else {
+            panic!("decoded variant is not CryptoPerpetual");
+        };
+        assert_eq!(decoded_inst.lot_size, Quantity::from(1));
+    }
+
+    #[rstest]
+    fn test_decode_crypto_perpetual_null_lot_size_defaults_to_one() {
+        use nautilus_model::instruments::stubs::crypto_perpetual_ethusdt;
+
+        let inst = crypto_perpetual_ethusdt();
+        let any = InstrumentAny::CryptoPerpetual(inst);
+        let metadata = any.metadata();
+        let batch = InstrumentAny::encode_batch(&metadata, std::slice::from_ref(&any)).unwrap();
+        let batch = batch_with_null_string_column(&batch, "lot_size");
+
+        let decoded = decode_instrument_any_batch(&metadata, &batch).unwrap();
+
+        let InstrumentAny::CryptoPerpetual(decoded_inst) = &decoded[0] else {
+            panic!("decoded variant is not CryptoPerpetual");
+        };
+        assert_eq!(decoded_inst.lot_size, Quantity::from(1));
+    }
+
+    #[rstest]
+    fn test_roundtrip_futures_contract() {
+        use nautilus_model::instruments::stubs::futures_contract_es;
+        roundtrip_case(&InstrumentAny::FuturesContract(futures_contract_es(
+            None, None,
+        )));
+    }
+
+    #[rstest]
+    fn test_roundtrip_futures_spread() {
+        use nautilus_model::instruments::stubs::futures_spread_es;
+        roundtrip_case(&InstrumentAny::FuturesSpread(futures_spread_es()));
+    }
+
+    #[rstest]
+    fn test_roundtrip_index_instrument() {
+        use nautilus_model::instruments::stubs::index_instrument_spx;
+        roundtrip_case(&InstrumentAny::IndexInstrument(index_instrument_spx()));
+    }
+
+    #[rstest]
+    #[case::option_contract(InstrumentAny::OptionContract(
+        nautilus_model::instruments::stubs::option_contract_appl()
+    ))]
+    #[case::crypto_option(InstrumentAny::CryptoOption(crypto_option_btc_deribit(
+        3,
+        1,
+        Price::from("0.001"),
+        Quantity::from("0.1")
+    )))]
+    fn test_option_terms_round_trip(#[case] instrument: InstrumentAny) {
+        let underlying_id = match &instrument {
+            InstrumentAny::OptionContract(_) => "AAPL.NASDAQ",
+            InstrumentAny::CryptoOption(_) => "BTCUSDT.BINANCE",
+            _ => unreachable!("option fixtures only"),
+        };
+
+        for (known, settlement) in [
+            (true, Some("CASH")),
+            (true, Some("PHYSICAL")),
+            (false, Some("CASH")),
+            (true, None),
+            (false, None),
+        ] {
+            let mut encoded = serde_json::to_value(&instrument).unwrap();
+            let fields = encoded
+                .as_object_mut()
+                .unwrap()
+                .values_mut()
+                .next()
+                .unwrap();
+            fields["underlying_instrument_id"] =
+                serde_json::to_value(known.then_some(underlying_id)).unwrap();
+            fields["settlement_type"] = serde_json::to_value(settlement).unwrap();
+            let instrument: InstrumentAny = serde_json::from_value(encoded.clone()).unwrap();
+            let metadata = instrument.metadata();
+            let batch =
+                InstrumentAny::encode_batch(&metadata, std::slice::from_ref(&instrument)).unwrap();
+            let restored = decode_instrument_any_batch(&metadata, &batch).unwrap();
+            assert_eq!(serde_json::to_value(&restored[0]).unwrap(), encoded);
+
+            let legacy = batch_without_column(&batch, "underlying_instrument_id");
+            let legacy = batch_without_column(&legacy, "settlement_type");
+            let decoded = decode_instrument_any_batch(&metadata, &legacy).unwrap();
+            let restored = serde_json::to_value(&decoded[0]).unwrap();
+            let fields = restored.as_object().unwrap().values().next().unwrap();
+            assert_eq!(fields["underlying_instrument_id"], serde_json::Value::Null);
+            assert_eq!(fields["settlement_type"], serde_json::Value::Null);
+        }
+    }
+
+    #[rstest]
+    #[case::option_contract(InstrumentAny::OptionContract(
+        nautilus_model::instruments::stubs::option_contract_appl()
+    ))]
+    #[case::crypto_option(InstrumentAny::CryptoOption(crypto_option_btc_deribit(
+        3,
+        1,
+        Price::from("0.001"),
+        Quantity::from("0.1")
+    )))]
+    fn test_invalid_option_terms_return_field_error(
+        #[case] instrument: InstrumentAny,
+        #[values("underlying_instrument_id", "settlement_type")] field: &'static str,
+    ) {
+        let metadata = instrument.metadata();
+        let batch = InstrumentAny::encode_batch(&metadata, &[instrument]).unwrap();
+        let schema = batch.schema();
+        let index = schema.index_of(field).unwrap();
+        let mut columns = batch.columns().to_vec();
+        columns[index] = Arc::new(StringArray::from(vec!["INVALID"]));
+        let invalid = RecordBatch::try_new(schema, columns).unwrap();
+        let error = decode_instrument_any_batch(&metadata, &invalid).unwrap_err();
+
+        let EncodingError::ParseError(actual_field, detail) = error else {
+            panic!("expected field parse error, was {error:?}");
+        };
+
+        assert_eq!(actual_field, field);
+        assert!(detail.starts_with("row 0: "));
+    }
+
+    #[rstest]
+    fn test_roundtrip_option_contract() {
+        use nautilus_model::instruments::stubs::option_contract_appl;
+        roundtrip_case(&InstrumentAny::OptionContract(option_contract_appl()));
+    }
+
+    #[rstest]
+    fn test_roundtrip_option_spread() {
+        use nautilus_model::instruments::stubs::option_spread;
+        roundtrip_case(&InstrumentAny::OptionSpread(option_spread()));
+    }
+
+    #[rstest]
+    fn test_roundtrip_perpetual_contract() {
+        use nautilus_model::instruments::stubs::perpetual_contract_eurusd;
+        roundtrip_case(&InstrumentAny::PerpetualContract(
+            perpetual_contract_eurusd(),
+        ));
+    }
+
+    #[rstest]
+    fn test_roundtrip_tokenized_asset() {
+        use nautilus_model::instruments::stubs::tokenized_asset_aaplx;
+        roundtrip_case(&InstrumentAny::TokenizedAsset(tokenized_asset_aaplx()));
+    }
+}

@@ -1,0 +1,5595 @@
+// -------------------------------------------------------------------------------------------------
+//  Copyright (C) 2015-2026 Nautech Systems Pty Ltd. All rights reserved.
+//  https://nautechsystems.io
+//
+//  Licensed under the GNU Lesser General Public License Version 3.0 (the "License");
+//  You may not use this file except in compliance with the License.
+//  You may obtain a copy of the License at https://www.gnu.org/licenses/lgpl-3.0.en.html
+//
+//  Unless required by applicable law or agreed to in writing, software
+//  distributed under the License is distributed on an "AS IS" BASIS,
+//  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+//  See the License for the specific language governing permissions and
+//  limitations under the License.
+// -------------------------------------------------------------------------------------------------
+
+//! Per-client WebSocket dispatch state and pure translations.
+//!
+//! Owns the cloid translation tables, the optimistic nonce manager, and the
+//! cached `AccountState` snapshot that backs `query_account` replays. Cloid
+//! translation, terminal-state eviction, and tick conversion live alongside
+//! the state so the execution-client lifecycle code stays focused on
+//! `ExecutionClient` trait wiring.
+
+use std::{
+    collections::VecDeque,
+    hash::{BuildHasher, Hasher},
+    sync::{
+        Arc, LazyLock,
+        atomic::{AtomicBool, AtomicU64, Ordering},
+    },
+    time::{Duration, Instant},
+};
+
+use ahash::{AHashMap, AHashSet, RandomState};
+use anyhow::Context;
+use dashmap::{DashMap, DashSet, mapref::entry::Entry};
+use nautilus_common::messages::execution::ModifyOrder;
+use nautilus_core::{AtomicTime, UUID4, UnixNanos, string::secret::SecretString};
+use nautilus_execution::reconciliation::inferred_reconciliation_trade_ids;
+use nautilus_model::{
+    enums::{ContingencyType, OrderSide, OrderStatus, OrderType, TimeInForce},
+    events::{AccountState, OrderEventAny, OrderFilled},
+    identifiers::{AccountId, ClientOrderId, InstrumentId, StrategyId, TradeId, VenueOrderId},
+    instruments::{Instrument, InstrumentAny},
+    orders::{Order, OrderAny, STOP_ORDER_TYPES},
+    reports::{FillReport, OrderStatusReport, PositionStatusReport},
+    types::{Price, Quantity},
+};
+use parking_lot::Mutex;
+use rust_decimal::{Decimal, prelude::ToPrimitive};
+use tokio_util::sync::{CancellationToken, DropGuard};
+use zeroize::Zeroizing;
+
+use crate::{
+    common::{
+        credential::Credential,
+        enums::{LighterOrderType, LighterTimeInForce},
+        symbol::MarketRegistry,
+    },
+    http::{
+        client::{LIGHTER_REST_PAGE_SIZE, LighterHttpClient},
+        models::LighterOrder,
+        query::{
+            LighterAccountActiveOrdersQuery, LighterAccountInactiveOrdersQuery,
+            LighterAccountOrdersQuery,
+        },
+    },
+    signing::{auth_token::build_auth_token_for, nonce::NonceManager},
+    websocket::parse::{ParsedOrderEvent, parse_ws_order_status_report},
+};
+
+/// Default GTC / Day order lifetime when the caller did not specify an
+/// explicit expire-time. The adapter uses an explicit 28-day window because
+/// the venue has rejected `OrderExpiry = -1` in this path with
+/// `21711 invalid expiry`; this matches the upstream venue convention.
+pub(crate) const ORDER_EXPIRY_DEFAULT_GTC_MS: i64 = 28 * 24 * 60 * 60 * 1_000;
+
+/// Venue minimum GTD lifetime plus one second for signing and transport.
+pub(crate) const ORDER_EXPIRY_MIN_GTD_MS: i64 = 5 * 60 * 1_000 + 1_000;
+
+/// Venue maximum GTD lifetime.
+pub(crate) const ORDER_EXPIRY_MAX_GTD_MS: i64 = 30 * 24 * 60 * 60 * 1_000;
+
+/// Sentinel used in `OrderInfo.order_expiry` for IOC orders, per the Lighter
+/// Go signer's documented contract: `0` means "no expiry tracking, IOC
+/// semantics".
+pub(crate) const ORDER_EXPIRY_IOC: i64 = 0;
+
+/// Defensive cap for authenticated reconciliation pagination.
+pub(crate) const MAX_RECONCILIATION_PAGES: usize = 1_000;
+
+/// Order identity context captured at submit time.
+///
+/// Used by the consumption loop to construct typed `OrderEventAny` variants
+/// (`OrderAccepted`, `OrderFilled`, etc.) for tracked orders without a Cache
+/// round-trip. Fields are immutable for the lifetime of an order.
+#[derive(Debug, Clone)]
+pub(crate) struct OrderIdentity {
+    pub(crate) instrument_id: InstrumentId,
+    pub(crate) strategy_id: StrategyId,
+    pub(crate) order_side: OrderSide,
+    pub(crate) order_type: OrderType,
+    pub(crate) client_order_index: i64,
+    contingency_type: Option<ContingencyType>,
+    linked_order_ids: Option<Vec<ClientOrderId>>,
+    parent_order_id: Option<ClientOrderId>,
+    held_quantity: Option<Quantity>,
+    binding: Arc<Mutex<OrderIdentityBinding>>,
+    accepted_emitted: Arc<AtomicBool>,
+    triggered_emitted: Arc<AtomicBool>,
+}
+
+#[derive(Debug, Default)]
+struct OrderIdentityBinding {
+    venue_order_id: Option<VenueOrderId>,
+    submission_nonce: Option<i64>,
+    external_venue_ids: AHashSet<VenueOrderId>,
+    create_resolution: CreateResolution,
+    trigger_price: Option<Price>,
+    publication: Option<OrderPublication>,
+    child_fills: Option<ChildFillBaseline>,
+    reduced_qty: Decimal,
+    filled_qty: Decimal,
+    fill_ids: AHashSet<TradeId>,
+    fills_inferred: bool,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct ChildFillBaseline {
+    pub(crate) quantity: Quantity,
+    pub(crate) trade_ids: AHashSet<TradeId>,
+}
+
+#[derive(Debug)]
+enum OrderPublication {
+    Update(UUID4),
+    Fills(Vec<TradeId>),
+    Child {
+        quantity: Quantity,
+        filled_qty: Quantity,
+        trade_ids: Vec<TradeId>,
+    },
+}
+
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+enum CreateResolution {
+    #[default]
+    Pending,
+    Confirmed,
+    Rejected,
+}
+
+impl OrderIdentity {
+    pub(crate) fn new(
+        instrument_id: InstrumentId,
+        strategy_id: StrategyId,
+        order_side: OrderSide,
+        order_type: OrderType,
+        client_order_index: i64,
+    ) -> Self {
+        Self {
+            instrument_id,
+            strategy_id,
+            order_side,
+            order_type,
+            client_order_index,
+            contingency_type: None,
+            linked_order_ids: None,
+            parent_order_id: None,
+            held_quantity: None,
+            binding: Arc::new(Mutex::new(OrderIdentityBinding::default())),
+            accepted_emitted: Arc::new(AtomicBool::new(false)),
+            triggered_emitted: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    fn restored(order: &OrderAny, client_order_index: i64, venue_order_id: VenueOrderId) -> Self {
+        let identity = Self::new(
+            order.instrument_id(),
+            order.strategy_id(),
+            order.order_side(),
+            order.order_type(),
+            client_order_index,
+        )
+        .with_order(order);
+        let mut binding = identity.binding.lock();
+        binding.venue_order_id = Some(venue_order_id);
+        binding.create_resolution = CreateResolution::Confirmed;
+        drop(binding);
+        identity.accepted_emitted.store(true, Ordering::Release);
+        identity
+            .triggered_emitted
+            .store(order.is_triggered() == Some(true), Ordering::Release);
+        identity
+    }
+
+    fn with_order(mut self, order: &OrderAny) -> Self {
+        self.contingency_type = order.contingency_type();
+        self.linked_order_ids = order.linked_order_ids().map(<[_]>::to_vec);
+        self.parent_order_id = order.parent_order_id();
+        self.held_quantity = self.parent_order_id.map(|_| order.quantity());
+        let mut binding = self.binding.lock();
+        binding.trigger_price = order.trigger_price();
+        binding.child_fills = self.parent_order_id.map(|_| ChildFillBaseline {
+            quantity: order.filled_qty(),
+            trade_ids: order.trade_ids().into_iter().copied().collect(),
+        });
+
+        drop(binding);
+        self.sync_fills(order);
+        self
+    }
+
+    pub(crate) fn normalize_shape(&self, mut shape: OrderShapeSnapshot) -> OrderShapeSnapshot {
+        if shape.quantity.is_zero()
+            && let Some(quantity) = self.held_quantity
+        {
+            shape.quantity = quantity;
+        }
+
+        shape
+    }
+
+    pub(crate) fn reduced_qty(&self) -> Decimal {
+        self.binding.lock().reduced_qty
+    }
+
+    pub(crate) fn record_reduction(&self, quantity: Decimal) {
+        let mut binding = self.binding.lock();
+
+        // Older HTTP snapshots cannot undo cumulative self-trade reductions
+        binding.reduced_qty = binding.reduced_qty.max(quantity);
+    }
+
+    pub(crate) fn child_fill_baseline(&self) -> Option<ChildFillBaseline> {
+        self.binding.lock().child_fills.clone()
+    }
+
+    pub(crate) fn publication_pending(&self, order: Option<&OrderAny>) -> bool {
+        let mut binding = self.binding.lock();
+
+        let Some(publication) = &binding.publication else {
+            return false;
+        };
+
+        let applied = order.is_some_and(|order| match publication {
+            OrderPublication::Update(id) => order.events().iter().any(
+                |event| matches!(event, OrderEventAny::Updated(update) if update.event_id == *id),
+            ),
+            OrderPublication::Fills(ids) => ids.iter().all(|id| order.trade_ids().contains(&id)),
+            OrderPublication::Child {
+                quantity,
+                filled_qty,
+                trade_ids,
+            } => {
+                order.is_closed()
+                    && order.quantity() == *quantity
+                    && order.filled_qty() == *filled_qty
+                    && trade_ids.iter().all(|id| order.trade_ids().contains(&id))
+            }
+        });
+
+        if applied {
+            binding.publication = None;
+        }
+
+        !applied
+    }
+
+    pub(crate) fn has_publication(&self) -> bool {
+        self.binding.lock().publication.is_some()
+    }
+
+    pub(crate) fn has_child_publication(&self) -> bool {
+        matches!(
+            self.binding.lock().publication,
+            Some(OrderPublication::Child { .. })
+        )
+    }
+
+    pub(crate) fn publish_update(&self, event_id: UUID4) {
+        self.binding.lock().publication = Some(OrderPublication::Update(event_id));
+    }
+
+    pub(crate) fn publish_child(&self, report: &OrderStatusReport, trade_ids: Vec<TradeId>) {
+        let mut binding = self.binding.lock();
+        binding.filled_qty = binding.filled_qty.max(report.filled_qty.as_decimal());
+        binding.fill_ids.extend(trade_ids.iter().copied());
+        if let Some(baseline) = &mut binding.child_fills {
+            baseline.quantity = report.filled_qty;
+            baseline.trade_ids.extend(trade_ids.iter().copied());
+        }
+
+        binding.publication = Some(OrderPublication::Child {
+            quantity: report.quantity,
+            filled_qty: report.filled_qty,
+            trade_ids,
+        });
+    }
+
+    pub(crate) fn publish_fill(&self, fill: &OrderFilled) -> bool {
+        let mut binding = self.binding.lock();
+        if binding.fills_inferred || !binding.fill_ids.insert(fill.trade_id) {
+            return false;
+        }
+
+        binding.filled_qty += fill.last_qty.as_decimal();
+        if let Some(baseline) = &mut binding.child_fills
+            && baseline.trade_ids.insert(fill.trade_id)
+        {
+            baseline.quantity = baseline.quantity + fill.last_qty;
+        }
+
+        if let Some(OrderPublication::Fills(ids)) = &mut binding.publication {
+            ids.push(fill.trade_id);
+        } else {
+            binding.publication = Some(OrderPublication::Fills(vec![fill.trade_id]));
+        }
+
+        true
+    }
+
+    pub(crate) fn filled_qty(&self) -> Decimal {
+        self.binding.lock().filled_qty
+    }
+
+    pub(crate) fn sync_fills(&self, order: &OrderAny) {
+        let inferred = inferred_reconciliation_trade_ids(order);
+        let mut binding = self.binding.lock();
+
+        let inferred = match inferred {
+            Ok(ids) => ids,
+            Err(e) => {
+                binding.fills_inferred = true;
+                log::error!(
+                    "Cannot establish Lighter real fill coverage for {}: {e}",
+                    order.client_order_id()
+                );
+                return;
+            }
+        };
+
+        binding.fills_inferred = !inferred.is_empty();
+        let mut active_ids = None;
+
+        for event in order.events() {
+            if let OrderEventAny::Filled(fill) = event
+                && !binding.fill_ids.contains(&fill.trade_id)
+                && !inferred.contains(&fill.trade_id)
+                && active_ids
+                    .get_or_insert_with(|| {
+                        order
+                            .trade_ids()
+                            .into_iter()
+                            .copied()
+                            .collect::<AHashSet<_>>()
+                    })
+                    .contains(&fill.trade_id)
+            {
+                binding.fill_ids.insert(fill.trade_id);
+                binding.filled_qty += fill.last_qty.as_decimal();
+                if let Some(baseline) = &mut binding.child_fills
+                    && baseline.trade_ids.insert(fill.trade_id)
+                {
+                    baseline.quantity = baseline.quantity + fill.last_qty;
+                }
+            }
+        }
+    }
+
+    pub(crate) fn has_inferred_fills(&self) -> bool {
+        self.binding.lock().fills_inferred
+    }
+
+    pub(crate) fn report_fills_covered(
+        &self,
+        report: &OrderStatusReport,
+        fills: &[FillReport],
+    ) -> bool {
+        let binding = self.binding.lock();
+        if binding.fills_inferred {
+            return false;
+        }
+
+        let mut quantity = binding.filled_qty;
+        let mut seen = AHashSet::new();
+        for fill in fills_for_order(report, fills) {
+            if !binding.fill_ids.contains(&fill.trade_id) && seen.insert(fill.trade_id) {
+                quantity += fill.last_qty.as_decimal();
+            }
+        }
+
+        quantity >= report.filled_qty.as_decimal()
+    }
+
+    fn mark_submission(&self, nonce: i64) {
+        self.binding.lock().submission_nonce = Some(nonce);
+    }
+
+    fn bind_venue_order_id(&self, venue_order_id: VenueOrderId) -> bool {
+        let mut binding = self.binding.lock();
+        if binding.create_resolution == CreateResolution::Rejected {
+            return false;
+        }
+
+        match binding.venue_order_id {
+            Some(existing) => {
+                if existing == venue_order_id {
+                    binding.create_resolution = CreateResolution::Confirmed;
+                    true
+                } else {
+                    false
+                }
+            }
+            None => {
+                if binding.external_venue_ids.contains(&venue_order_id)
+                    || binding.submission_nonce.is_none()
+                {
+                    binding.external_venue_ids.insert(venue_order_id);
+                    return false;
+                }
+                binding.venue_order_id = Some(venue_order_id);
+                binding.create_resolution = CreateResolution::Confirmed;
+                true
+            }
+        }
+    }
+
+    pub(crate) fn matches_venue_order_id(&self, venue_order_id: VenueOrderId) -> bool {
+        self.binding.lock().venue_order_id == Some(venue_order_id)
+    }
+
+    pub(crate) fn venue_order_id(&self) -> Option<VenueOrderId> {
+        self.binding.lock().venue_order_id
+    }
+
+    pub(crate) fn shares_submission(&self, other: &Self) -> bool {
+        let nonce = self.binding.lock().submission_nonce;
+        nonce.is_some() && nonce == other.binding.lock().submission_nonce
+    }
+
+    fn accepted_was_emitted(&self) -> bool {
+        self.accepted_emitted.load(Ordering::Acquire)
+    }
+
+    fn claim_accepted_emission(&self) -> bool {
+        let mut binding = self.binding.lock();
+        if binding.create_resolution == CreateResolution::Rejected {
+            return false;
+        }
+        binding.create_resolution = CreateResolution::Confirmed;
+        drop(binding);
+        !self.accepted_emitted.swap(true, Ordering::AcqRel)
+    }
+
+    fn submission_is_pending(&self, client_order_index: i64, nonce: i64) -> bool {
+        if self.client_order_index != client_order_index {
+            return false;
+        }
+
+        let binding = self.binding.lock();
+        binding.submission_nonce == Some(nonce)
+            && binding.create_resolution == CreateResolution::Pending
+    }
+
+    fn confirm_submission(&self, client_order_index: i64, nonce: i64) -> bool {
+        if self.client_order_index != client_order_index {
+            return false;
+        }
+
+        let mut binding = self.binding.lock();
+        if binding.submission_nonce != Some(nonce)
+            || binding.create_resolution == CreateResolution::Rejected
+        {
+            return false;
+        }
+        binding.create_resolution = CreateResolution::Confirmed;
+        true
+    }
+
+    fn reject_submission(
+        &self,
+        client_order_index: i64,
+        nonce: i64,
+        connection_epoch: Option<(&AtomicU64, u64)>,
+    ) -> bool {
+        if self.client_order_index != client_order_index {
+            return false;
+        }
+
+        let mut binding = self.binding.lock();
+        if binding.submission_nonce != Some(nonce)
+            || binding.create_resolution != CreateResolution::Pending
+        {
+            return false;
+        }
+        binding.create_resolution = CreateResolution::Rejected;
+
+        if connection_epoch
+            .is_some_and(|(current, expected)| current.load(Ordering::Acquire) != expected)
+        {
+            binding.create_resolution = CreateResolution::Pending;
+            return false;
+        }
+        true
+    }
+}
+
+pub(crate) fn fills_for_order<'a>(
+    report: &'a OrderStatusReport,
+    fills: &'a [FillReport],
+) -> impl Iterator<Item = &'a FillReport> {
+    fills.iter().filter(|fill| {
+        fill.venue_order_id == report.venue_order_id
+            && fill.account_id == report.account_id
+            && fill.instrument_id == report.instrument_id
+            && Some(fill.order_side) == report.order_side
+    })
+}
+
+/// In-flight sendTx awaiting a venue response.
+///
+/// Every signed sendTx (create, cancel, modify, update_leverage) enqueues an
+/// entry keyed by the signed `tx_hash`, which the venue echoes in its ACK.
+/// Responses that carry the hash remove their matching entry directly;
+/// responses without one fall back to FIFO-head attribution, so the queue
+/// order still matches the send order. The `kind` records whether the entry
+/// has an originating Nautilus order that should receive a typed
+/// order event on a venue rejection.
+#[derive(Debug, Clone)]
+pub(crate) struct PendingSendTx {
+    pub(crate) batch_id: Option<String>,
+    pub(crate) connection_epoch: u64,
+    pub(crate) kind: PendingSendTxKind,
+    pub(crate) submitted_at: UnixNanos,
+    pub(crate) nonce: i64,
+    pub(crate) api_key_index: u8,
+    pub(crate) tx_hash: String,
+}
+
+/// What kind of sendTx is sitting at this queue position, and whether the
+/// consumption loop has anything cloid-bound to roll back on rejection.
+#[derive(Debug, Clone)]
+pub(crate) enum PendingSendTxKind {
+    /// Create-order submit. On rejection: emit `OrderRejected`, evict the
+    /// cloid_map slot, and forget the order identity.
+    Create {
+        order: Box<OrderAny>,
+        client_order_index: i64,
+    },
+    /// One native grouped transaction owning all of its order identities.
+    CreateGroup { orders: Vec<(OrderAny, i64)> },
+    /// Cancel-order submit. An implicit OCO peer has no command ID.
+    Cancel {
+        command_id: Option<UUID4>,
+        emit_cancel_rejected: bool,
+        strategy_id: StrategyId,
+        instrument_id: InstrumentId,
+        client_order_id: ClientOrderId,
+        venue_order_id: Option<VenueOrderId>,
+    },
+    /// Modify-order submit. Emit a denial if not sent, or a rejection on a venue refusal.
+    Modify {
+        command_id: UUID4,
+        strategy_id: StrategyId,
+        instrument_id: InstrumentId,
+        client_order_id: ClientOrderId,
+        venue_order_id: Option<VenueOrderId>,
+    },
+    /// Non-order sendTx, such as update-leverage. Tracked for FIFO alignment
+    /// so the venue's ACK or rejection pops the correct head.
+    Other,
+}
+
+impl PendingSendTxKind {
+    pub(crate) fn creates(&self) -> impl Iterator<Item = (&OrderAny, i64)> {
+        let (single, grouped) = match self {
+            Self::Create {
+                order,
+                client_order_index,
+            } => (Some((order.as_ref(), *client_order_index)), &[][..]),
+            Self::CreateGroup { orders } => (None, orders.as_slice()),
+            _ => (None, &[][..]),
+        };
+
+        single
+            .into_iter()
+            .chain(grouped.iter().map(|(order, index)| (order, *index)))
+    }
+}
+
+/// Max probing attempts when [`WsDispatchState::register_cloid`] detects a
+/// collision on the derived `client_order_index`. The 31-bit space makes a
+/// collision improbable at session scale; bounding the probe ensures that a
+/// degenerate seed never spins indefinitely while still leaving headroom.
+pub(crate) const CLOID_INDEX_PROBE_LIMIT: usize = 16;
+
+const CLOID_INDEX_MAX: u32 = 0x7FFF_FFFF;
+
+/// Maximum terminal orders and trade ids retained for reconnect replay.
+const REPLAY_CACHE_CAPACITY: usize = 100_000;
+
+#[derive(Debug, Clone)]
+struct RetiredOrderIdentity {
+    cloid: ClientOrderId,
+    identity: OrderIdentity,
+}
+
+#[derive(Debug)]
+pub(crate) struct RetiredOrderCache {
+    inner: Mutex<RetiredOrderCacheInner>,
+    capacity: usize,
+}
+
+#[derive(Debug)]
+struct RetiredOrderCacheInner {
+    by_index: AHashMap<i64, AHashMap<Option<VenueOrderId>, (RetiredOrderIdentity, u64)>>,
+    by_cloid: AHashMap<ClientOrderId, (i64, Option<VenueOrderId>)>,
+    queue: VecDeque<(i64, Option<VenueOrderId>, u64)>,
+    next_seq: u64,
+}
+
+impl RetiredOrderCache {
+    fn new(capacity: usize) -> Self {
+        Self {
+            inner: Mutex::new(RetiredOrderCacheInner {
+                by_index: AHashMap::with_capacity(capacity),
+                by_cloid: AHashMap::with_capacity(capacity),
+                queue: VecDeque::with_capacity(capacity),
+                next_seq: 0,
+            }),
+            capacity,
+        }
+    }
+
+    fn insert(&self, cloid: ClientOrderId, identity: OrderIdentity) {
+        let index = identity.client_order_index;
+        let venue_order_id = identity.venue_order_id();
+        let binding = (index, venue_order_id);
+        let mut inner = self.inner.lock();
+        let seq = inner.next_seq;
+        inner.next_seq = inner.next_seq.wrapping_add(1);
+
+        if let Some((old_index, old_venue_order_id)) = inner.by_cloid.get(&cloid).copied()
+            && (old_index, old_venue_order_id) != binding
+        {
+            let remove_index = inner.by_index.get_mut(&old_index).is_some_and(|bindings| {
+                bindings.remove(&old_venue_order_id);
+                bindings.is_empty()
+            });
+
+            if remove_index {
+                inner.by_index.remove(&old_index);
+            }
+        }
+
+        let replaced = inner.by_index.entry(index).or_default().insert(
+            venue_order_id,
+            (RetiredOrderIdentity { cloid, identity }, seq),
+        );
+
+        if let Some((old, _)) = replaced
+            && old.cloid != cloid
+        {
+            inner.by_cloid.remove(&old.cloid);
+        }
+        inner.by_cloid.insert(cloid, binding);
+        inner.queue.push_back((index, venue_order_id, seq));
+
+        while inner.queue.len() > self.capacity
+            && let Some((old_index, old_venue_order_id, old_seq)) = inner.queue.pop_front()
+        {
+            let removed = inner.by_index.get_mut(&old_index).and_then(|bindings| {
+                if bindings.get(&old_venue_order_id).map(|(_, seq)| *seq) != Some(old_seq) {
+                    return None;
+                }
+                let (old, _) = bindings.remove(&old_venue_order_id)?;
+                Some((old.cloid, bindings.is_empty()))
+            });
+
+            if let Some((old_cloid, remove_index)) = removed {
+                inner.by_cloid.remove(&old_cloid);
+                if remove_index {
+                    inner.by_index.remove(&old_index);
+                }
+
+                log::debug!(
+                    "Evicting retired Lighter order identity at replay-cache capacity: cloid={old_cloid}, client_order_index={old_index}",
+                );
+            }
+        }
+    }
+
+    fn cloid_for_index(&self, index: i64) -> Option<ClientOrderId> {
+        let inner = self.inner.lock();
+        let bindings = inner.by_index.get(&index)?;
+        if bindings.len() != 1 {
+            return None;
+        }
+        bindings.values().next().map(|(retired, _)| retired.cloid)
+    }
+
+    fn cloid_for_venue(&self, index: i64, venue_order_id: VenueOrderId) -> Option<ClientOrderId> {
+        self.inner
+            .lock()
+            .by_index
+            .get(&index)?
+            .get(&Some(venue_order_id))
+            .map(|(retired, _)| retired.cloid)
+    }
+
+    fn identity_for_cloid(&self, cloid: &ClientOrderId) -> Option<OrderIdentity> {
+        let inner = self.inner.lock();
+        let (index, venue_order_id) = inner.by_cloid.get(cloid)?;
+        inner
+            .by_index
+            .get(index)
+            .and_then(|bindings| bindings.get(venue_order_id))
+            .map(|(retired, _)| retired.identity.clone())
+    }
+
+    fn contains_index(&self, index: i64) -> bool {
+        self.inner.lock().by_index.contains_key(&index)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TradeDedupSource {
+    Live,
+    Reconciliation,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PendingOrderAction {
+    Modify,
+    Cancel,
+    CancelUnmarked,
+}
+
+impl PendingOrderAction {
+    pub(crate) fn cancel(emit_cancel_rejected: bool) -> Self {
+        if emit_cancel_rejected {
+            Self::Cancel
+        } else {
+            Self::CancelUnmarked
+        }
+    }
+}
+
+#[derive(Debug)]
+struct PendingOrderActionState {
+    action: PendingOrderAction,
+    submission: Option<PendingCancel>,
+    modify: Option<PendingModify>,
+    cancel_commands: Vec<(UUID4, PendingOrderAction)>,
+}
+
+impl PendingOrderActionState {
+    fn refresh_action(&mut self) -> bool {
+        let action = self
+            .submission
+            .as_ref()
+            .map(|_| self.action)
+            .or_else(|| self.cancel_commands.last().map(|(_, action)| *action))
+            .or_else(|| self.modify.as_ref().map(|_| PendingOrderAction::Modify));
+
+        if let Some(action) = action {
+            self.action = action;
+            true
+        } else {
+            false
+        }
+    }
+}
+
+// Pending state owns the probe lifetime, including waits for REST quota
+#[derive(Debug)]
+struct PendingCancel {
+    command_id: UUID4,
+    identity: (u64, i64),
+    cancellation: DropGuard,
+}
+
+#[derive(Debug)]
+struct PendingModify {
+    command_id: UUID4,
+    shape: Option<OrderShapeSnapshot>,
+    submission: Option<(u64, i64)>,
+    transaction: Option<PendingSendTx>,
+    executed: bool,
+}
+
+#[derive(Debug, Default)]
+pub(crate) struct DeferredOrderEvents {
+    pub(crate) order: Option<LighterOrder>,
+    pub(crate) fills: Vec<OrderFilled>,
+    pub(crate) fill_sequence: AHashMap<TradeId, u64>,
+    pub(crate) recovery_epoch: Option<u64>,
+}
+
+#[derive(Debug)]
+pub(crate) struct PendingTerminal {
+    pub(crate) order: LighterOrder,
+    pub(crate) event: ParsedOrderEvent,
+    pub(crate) retry_at: tokio::time::Instant,
+    pub(crate) attempts: usize,
+}
+
+impl DeferredOrderEvents {
+    pub(crate) fn store_order(&mut self, order: &LighterOrder) {
+        if self
+            .order
+            .as_ref()
+            .is_none_or(|prior| !prior.status.is_terminal())
+        {
+            self.order = Some(order.clone());
+        }
+    }
+}
+
+#[derive(Debug)]
+pub(crate) struct TradeDedupCache {
+    inner: Mutex<TradeDedupCacheInner>,
+    capacity: usize,
+}
+
+#[derive(Debug)]
+struct TradeDedupCacheInner {
+    entries: AHashMap<TradeId, (TradeDedupSource, u64)>,
+    queue: VecDeque<(TradeId, u64)>,
+    next_seq: u64,
+}
+
+impl TradeDedupCache {
+    fn new(capacity: usize) -> Self {
+        Self {
+            inner: Mutex::new(TradeDedupCacheInner {
+                entries: AHashMap::with_capacity(capacity),
+                queue: VecDeque::with_capacity(capacity),
+                next_seq: 0,
+            }),
+            capacity,
+        }
+    }
+
+    fn insert(&self, trade_id: TradeId, source: TradeDedupSource) -> Option<TradeDedupSource> {
+        let mut inner = self.inner.lock();
+        if let Some((existing, _)) = inner.entries.get(&trade_id) {
+            return Some(*existing);
+        }
+
+        let seq = inner.next_seq;
+        inner.next_seq = inner.next_seq.wrapping_add(1);
+        inner.entries.insert(trade_id, (source, seq));
+        inner.queue.push_back((trade_id, seq));
+        while inner.queue.len() > self.capacity
+            && let Some((old_trade_id, old_seq)) = inner.queue.pop_front()
+        {
+            if inner.entries.get(&old_trade_id).map(|(_, seq)| *seq) == Some(old_seq) {
+                inner.entries.remove(&old_trade_id);
+                log::debug!(
+                    "Evicting Lighter trade id at replay-cache capacity: trade_id={old_trade_id}",
+                );
+            }
+        }
+        None
+    }
+
+    #[cfg(test)]
+    pub(crate) fn contains(&self, trade_id: &TradeId) -> bool {
+        self.inner.lock().entries.contains_key(trade_id)
+    }
+}
+
+#[derive(Debug, Default)]
+struct PositionSnapshot {
+    reports: AHashMap<InstrumentId, PositionStatusReport>,
+    skipped_market_ids: Option<AHashSet<i64>>,
+}
+
+/// Per-client WebSocket dispatch state.
+///
+/// Clones share state between the consumption loop and order-action methods
+/// through per-field `Arc`s.
+///
+/// # Account State
+///
+/// Account and position queries use WebSocket snapshots because Lighter has no
+/// equivalent REST snapshots. Connection readiness waits for every account stream's
+/// first frame.
+///
+/// - **Snapshot consistency**: Position reports and coverage share one lock to keep
+///   reconciliation from combining data from different frames.
+/// - **Query scope**: Mass-status queries visit account-active markets to avoid a
+///   full-market REST quota bottleneck.
+///
+/// # Order Lifecycle
+///
+/// - **Identity updates**: Create identity replacement and generation-checked
+///   sequencer-rejection cleanup share a lock.
+/// - **Pending actions**: Venue frames and reconciliation reports cannot bypass
+///   a pending action's confirming event or rejection.
+/// - **Shape changes**: Snapshots distinguish modifications from venue echoes,
+///   reconnect replay, and partial-fill updates. `OrderAccepted` seeds the snapshot;
+///   `OrderUpdated` refreshes it.
+/// - **Response attribution**: Pending submissions retain attribution when sendTx
+///   errors lack correlation fields.
+///
+/// # Replay Protection
+///
+/// - **Retired identities**: Late trade frames and reconnect replay retain attribution.
+///   Client indices remain reserved while their retired entries are retained.
+/// - **Fills**: Trade deduplication spans live frames, reconnect replay, and HTTP
+///   reconciliation to prevent duplicate fills.
+/// - **Triggers**: Trigger deduplication suppresses repeated `Ready` frames after
+///   an order triggers.
+#[derive(Debug, Clone)]
+pub(crate) struct WsDispatchState {
+    pub(crate) cloid_map: Arc<DashMap<i64, ClientOrderId>>,
+    pub(crate) retired_orders: Arc<RetiredOrderCache>,
+    pub(crate) venue_id_map: Arc<DashMap<ClientOrderId, VenueOrderId>>,
+    pub(crate) nonce_manager: Arc<NonceManager>,
+    pub(crate) last_account_state: Arc<Mutex<Option<AccountState>>>,
+    pub(crate) active_markets: Arc<DashSet<i64>>,
+    position_snapshot: Arc<Mutex<PositionSnapshot>>,
+    pub(crate) order_identities: Arc<DashMap<ClientOrderId, OrderIdentity>>,
+    order_restorations: Arc<DashMap<VenueOrderId, OrderAny>>,
+    create_registry: Arc<Mutex<()>>,
+    pub(crate) seen_trade_ids: Arc<TradeDedupCache>,
+    pub(crate) triggered_emitted: Arc<DashSet<ClientOrderId>>,
+    pub(crate) order_snapshots: Arc<DashMap<ClientOrderId, OrderShapeSnapshot>>,
+    pub(crate) order_events: Arc<Mutex<AHashMap<ClientOrderId, DeferredOrderEvents>>>,
+    pub(crate) terminals_pending: Arc<Mutex<AHashMap<ClientOrderId, PendingTerminal>>>,
+    pub(crate) terminals_recover: Arc<tokio::sync::Notify>,
+    fill_sequence: Arc<AtomicU64>,
+    pending_order_actions: Arc<DashMap<ClientOrderId, PendingOrderActionState>>,
+    pub(crate) pending_sendtx: Arc<Mutex<VecDeque<PendingSendTx>>>,
+    pub(crate) account_streams_ready: Arc<AccountStreamsReady>,
+}
+
+/// Compact snapshot of the mutable shape of a tracked order used by the
+/// consumption loop to detect real modifies vs unchanged echoes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct OrderShapeSnapshot {
+    pub(crate) quantity: Quantity,
+    pub(crate) price: Option<Price>,
+    pub(crate) trigger_price: Option<Price>,
+}
+
+/// Fixed seed for the cloid hasher. Pinned at module load so the same
+/// `ClientOrderId` always hashes to the same venue-side `client_order_index`
+/// across operations, reconnects, AND fresh client instances after a
+/// process restart. The seed must not change without coordinated cache
+/// invalidation: if the engine restarts and recovers an order whose cloid
+/// hashed to index N under the old seed, the new instance must derive the
+/// same N to find that order via REST lookup.
+static CLOID_HASHER: LazyLock<RandomState> = LazyLock::new(|| {
+    RandomState::with_seeds(
+        0x4C49_4748_5445_5253, // "LIGHTERS"
+        0x434C_4F49_445F_4853, // "CLOID_HS"
+        0x4E41_5554_494C_5553, // "NAUTILUS"
+        0x5F4C_4F4F_4B5F_5550, // "_LOOK_UP"
+    )
+});
+
+/// First-frame readiness flags for the four account-scoped WebSocket streams.
+///
+/// `connect()` blocks until every flag is set so strategies cannot race the
+/// venue's initial frames. Lighter has no REST endpoint for account/position
+/// state, so the WS frames are the only ground truth: returning before they
+/// land risks `venue_id_map` and the position cache being empty on the first
+/// strategy action.
+#[derive(Debug)]
+pub(crate) struct AccountStreamsReady {
+    orders: AtomicBool,
+    trades: AtomicBool,
+    positions: AtomicBool,
+    assets: AtomicBool,
+    user_stats: AtomicBool,
+    notify: tokio::sync::Notify,
+}
+
+impl AccountStreamsReady {
+    pub(crate) fn new() -> Self {
+        Self {
+            orders: AtomicBool::new(false),
+            trades: AtomicBool::new(false),
+            positions: AtomicBool::new(false),
+            assets: AtomicBool::new(false),
+            user_stats: AtomicBool::new(false),
+            notify: tokio::sync::Notify::new(),
+        }
+    }
+
+    /// Reset every flag so a fresh connect attempt starts with no streams
+    /// marked. Use before re-subscribing on a new WebSocket session.
+    pub(crate) fn reset(&self) {
+        self.orders.store(false, Ordering::Release);
+        self.trades.store(false, Ordering::Release);
+        self.positions.store(false, Ordering::Release);
+        self.assets.store(false, Ordering::Release);
+        self.user_stats.store(false, Ordering::Release);
+    }
+
+    /// Mark the `account_all_orders` stream as having delivered a frame.
+    /// Idempotent: only the first call logs and notifies waiters.
+    pub(crate) fn mark_orders(&self) {
+        self.mark("orders", &self.orders);
+    }
+
+    /// Mark the `account_all_trades` stream as having delivered a frame.
+    /// Idempotent: only the first call logs and notifies waiters.
+    pub(crate) fn mark_trades(&self) {
+        self.mark("trades", &self.trades);
+    }
+
+    /// Mark the `account_all_positions` stream as having delivered a frame.
+    /// Idempotent: only the first call logs and notifies waiters.
+    pub(crate) fn mark_positions(&self) {
+        self.mark("positions", &self.positions);
+    }
+
+    /// Mark the `account_all_assets` stream as having delivered a frame.
+    /// Idempotent: only the first call logs and notifies waiters.
+    pub(crate) fn mark_assets(&self) {
+        self.mark("assets", &self.assets);
+    }
+
+    /// Mark the `user_stats` stream as having delivered a frame.
+    /// Idempotent: only the first call logs and notifies waiters.
+    pub(crate) fn mark_user_stats(&self) {
+        self.mark("user_stats", &self.user_stats);
+    }
+
+    fn mark(&self, name: &str, flag: &AtomicBool) {
+        if !flag.swap(true, Ordering::AcqRel) {
+            log::debug!("Lighter {name}: first frame received");
+            self.notify.notify_waiters();
+        }
+    }
+
+    /// Returns `true` once every account stream has delivered a frame.
+    pub(crate) fn all_ready(&self) -> bool {
+        self.orders.load(Ordering::Acquire)
+            && self.trades.load(Ordering::Acquire)
+            && self.positions.load(Ordering::Acquire)
+            && self.assets.load(Ordering::Acquire)
+            && self.user_stats.load(Ordering::Acquire)
+    }
+
+    fn pending(&self) -> Vec<&'static str> {
+        let mut pending = Vec::new();
+        if !self.orders.load(Ordering::Acquire) {
+            pending.push("orders");
+        }
+
+        if !self.trades.load(Ordering::Acquire) {
+            pending.push("trades");
+        }
+
+        if !self.positions.load(Ordering::Acquire) {
+            pending.push("positions");
+        }
+
+        if !self.assets.load(Ordering::Acquire) {
+            pending.push("assets");
+        }
+
+        if !self.user_stats.load(Ordering::Acquire) {
+            pending.push("user_stats");
+        }
+
+        pending
+    }
+
+    /// Wait until every account stream has delivered a frame, or `timeout`
+    /// elapses. Warns at 5s ticks with the list of pending streams; logs a
+    /// success line with the total wait when all four have landed.
+    pub(crate) async fn await_all(&self, timeout: Duration) -> anyhow::Result<()> {
+        let start = Instant::now();
+        let warn_interval = Duration::from_secs(5);
+        let mut next_warn = start + warn_interval;
+
+        loop {
+            // Register interest before re-checking so a mark between the
+            // `all_ready` test and the `.await` is still observed; with
+            // `notify_waiters` the registration guarantees future notifies
+            // reach us.
+            let waiter = self.notify.notified();
+            tokio::pin!(waiter);
+            waiter.as_mut().enable();
+
+            if self.all_ready() {
+                log::debug!(
+                    "All Lighter account streams ready in {:.1}s",
+                    start.elapsed().as_secs_f64(),
+                );
+                return Ok(());
+            }
+
+            let now = Instant::now();
+            let elapsed = now.duration_since(start);
+            if elapsed >= timeout {
+                anyhow::bail!(
+                    "Timeout after {:.1}s awaiting Lighter account streams: pending={:?}",
+                    timeout.as_secs_f64(),
+                    self.pending(),
+                );
+            }
+
+            // `elapsed < timeout` is established by the bail above, so the
+            // subtraction never underflows. Use `saturating_sub` anyway to
+            // satisfy `clippy::unchecked-time-subtraction`.
+            let until_timeout = timeout.saturating_sub(elapsed);
+            let until_warn = next_warn.saturating_duration_since(now);
+            let wait = until_timeout.min(until_warn);
+
+            let _ = tokio::time::timeout(wait, waiter).await;
+
+            if !self.all_ready() && Instant::now() >= next_warn {
+                log::warn!(
+                    "Still awaiting Lighter account streams after {}s: pending={:?}",
+                    start.elapsed().as_secs(),
+                    self.pending(),
+                );
+                next_warn += warn_interval;
+            }
+        }
+    }
+}
+
+impl WsDispatchState {
+    /// Construct a fresh dispatch state with empty translation tables and a
+    /// default-window nonce manager.
+    pub(crate) fn new() -> Self {
+        Self {
+            cloid_map: Arc::new(DashMap::new()),
+            retired_orders: Arc::new(RetiredOrderCache::new(REPLAY_CACHE_CAPACITY)),
+            venue_id_map: Arc::new(DashMap::new()),
+            nonce_manager: Arc::new(NonceManager::default()),
+            last_account_state: Arc::new(Mutex::new(None)),
+            active_markets: Arc::new(DashSet::new()),
+            position_snapshot: Arc::new(Mutex::new(PositionSnapshot::default())),
+            order_identities: Arc::new(DashMap::new()),
+            order_restorations: Arc::new(DashMap::new()),
+            create_registry: Arc::new(Mutex::new(())),
+            seen_trade_ids: Arc::new(TradeDedupCache::new(REPLAY_CACHE_CAPACITY)),
+            triggered_emitted: Arc::new(DashSet::new()),
+            order_snapshots: Arc::new(DashMap::new()),
+            order_events: Arc::new(Mutex::new(AHashMap::new())),
+            terminals_pending: Arc::new(Mutex::new(AHashMap::new())),
+            terminals_recover: Arc::new(tokio::sync::Notify::new()),
+            fill_sequence: Arc::new(AtomicU64::new(0)),
+            pending_order_actions: Arc::new(DashMap::new()),
+            pending_sendtx: Arc::new(Mutex::new(VecDeque::new())),
+            account_streams_ready: Arc::new(AccountStreamsReady::new()),
+        }
+    }
+
+    /// Append a submit to the FIFO pending-sendTx queue.
+    ///
+    /// No stale-entry pruning: silently dropping entries would misattribute
+    /// a late venue ACK to the next-head. In normal operation ACKs arrive in
+    /// milliseconds; sustained queue growth indicates a stuck WS read loop.
+    pub(crate) fn enqueue_pending_sendtx(&self, pending: PendingSendTx) {
+        for (order, _) in pending.kind.creates() {
+            self.mark_order_submission(&order.client_order_id(), pending.nonce);
+        }
+
+        if let PendingSendTxKind::Modify {
+            client_order_id,
+            command_id,
+            ..
+        } = pending.kind
+            && let Some(mut state) = self.pending_order_actions.get_mut(&client_order_id)
+            && let Some(modify) = state.modify.as_mut()
+            && modify.command_id == command_id
+            && modify.submission == Some((pending.connection_epoch, pending.nonce))
+        {
+            modify.transaction = Some(pending.clone());
+        }
+
+        self.pending_sendtx.lock().push_back(pending);
+    }
+
+    /// Pop the oldest pending entry unconditionally.
+    ///
+    /// Tests and reconnect cleanup use this directly. Live hashless response
+    /// attribution must use [`Self::pop_pending_sendtx_if_only`].
+    #[cfg(test)]
+    pub(crate) fn pop_pending_sendtx_head(&self) -> Option<PendingSendTx> {
+        self.pending_sendtx.lock().pop_front()
+    }
+
+    /// Pop a pending entry only when it is the sole possible match.
+    ///
+    /// Lighter does not always echo `tx_hash`. With two or more transactions
+    /// in flight, FIFO attribution is unsafe because responses may arrive out
+    /// of order.
+    pub(crate) fn pop_pending_sendtx_if_only(
+        &self,
+        connection_epoch: u64,
+    ) -> Option<PendingSendTx> {
+        let mut queue = self.pending_sendtx.lock();
+        let mut matches = queue
+            .iter()
+            .enumerate()
+            .filter(|(_, pending)| pending.connection_epoch == connection_epoch);
+        let (position, pending) = matches.next()?;
+        if pending.batch_id.is_some() || matches.next().is_some() {
+            return None;
+        }
+        queue.remove(position)
+    }
+
+    /// Pop the sole pending entry only if its `submitted_at` is within
+    /// `max_age_ms` of `now`.
+    pub(crate) fn pop_pending_sendtx_if_only_within(
+        &self,
+        connection_epoch: u64,
+        now: UnixNanos,
+        max_age_ms: u64,
+    ) -> Option<PendingSendTx> {
+        let cutoff_ns = now.as_u64().saturating_sub(max_age_ms * 1_000_000);
+        let mut queue = self.pending_sendtx.lock();
+        let mut matches = queue
+            .iter()
+            .enumerate()
+            .filter(|(_, pending)| pending.connection_epoch == connection_epoch);
+        let (position, pending) = matches.next()?;
+        let fresh = pending.submitted_at.as_u64() >= cutoff_ns;
+        if pending.batch_id.is_some() || matches.next().is_some() || !fresh {
+            return None;
+        }
+        queue.remove(position)
+    }
+
+    /// Remove a pending entry by connection epoch and nonce.
+    pub(crate) fn remove_pending_sendtx_by_nonce(
+        &self,
+        connection_epoch: u64,
+        nonce: i64,
+    ) -> Option<PendingSendTx> {
+        let mut q = self.pending_sendtx.lock();
+        let pos = q
+            .iter()
+            .position(|p| p.connection_epoch == connection_epoch && p.nonce == nonce)?;
+        q.remove(pos)
+    }
+
+    /// Remove a pending entry by its signed transaction hash
+    /// (case-insensitive hex comparison, optional `0x` prefix tolerated).
+    /// The venue echoes the hash the client computed at signing time, so a
+    /// match is exact attribution regardless of queue position.
+    pub(crate) fn remove_pending_sendtx_by_hash(
+        &self,
+        connection_epoch: u64,
+        tx_hash: &str,
+    ) -> Option<PendingSendTx> {
+        let mut q = self.pending_sendtx.lock();
+
+        let pos = q.iter().position(|p| {
+            p.connection_epoch == connection_epoch && tx_hash_matches(&p.tx_hash, tx_hash)
+        })?;
+        q.remove(pos)
+    }
+
+    /// Drain pending entries owned by one disconnected connection.
+    pub(crate) fn drain_pending_sendtx(&self, connection_epoch: u64) -> Vec<PendingSendTx> {
+        let mut queue = self.pending_sendtx.lock();
+        let (drained, retained) = std::mem::take(&mut *queue)
+            .into_iter()
+            .partition(|pending| pending.connection_epoch == connection_epoch);
+        *queue = retained;
+        drained.into()
+    }
+
+    pub(crate) fn take_pending_sendtx(&self) -> Vec<PendingSendTx> {
+        std::mem::take(&mut *self.pending_sendtx.lock()).into()
+    }
+
+    /// Returns the current pending-sendTx queue length for tests.
+    #[cfg(test)]
+    pub(crate) fn pending_sendtx_len(&self) -> usize {
+        self.pending_sendtx.lock().len()
+    }
+
+    /// First-time check for an `OrderTriggered` event for `cloid`. Returns
+    /// `true` if `cloid` has not yet emitted `Triggered` and inserts it.
+    pub(crate) fn mark_triggered_emitted(&self, cloid: ClientOrderId) -> bool {
+        if let Some(identity) = self.order_identity(&cloid) {
+            return !identity.triggered_emitted.swap(true, Ordering::AcqRel);
+        }
+
+        self.triggered_emitted.insert(cloid)
+    }
+
+    /// Returns `true` if `OrderTriggered` has already fired for `cloid`.
+    pub(crate) fn triggered_was_emitted(&self, cloid: &ClientOrderId) -> bool {
+        self.triggered_emitted.contains(cloid)
+            || self
+                .order_identity(cloid)
+                .is_some_and(|identity| identity.triggered_emitted.load(Ordering::Acquire))
+    }
+
+    /// Read the last-known order shape for `cloid`, if any.
+    pub(crate) fn snapshot_for(&self, cloid: &ClientOrderId) -> Option<OrderShapeSnapshot> {
+        self.order_snapshots.get(cloid).map(|e| e.value().clone())
+    }
+
+    /// Replace the stored order-shape snapshot for `cloid`.
+    pub(crate) fn store_snapshot(&self, cloid: ClientOrderId, snapshot: OrderShapeSnapshot) {
+        if let Some(identity) = self.order_identity(&cloid) {
+            let mut binding = identity.binding.lock();
+            binding.trigger_price = snapshot.trigger_price.or(binding.trigger_price);
+        }
+
+        self.order_snapshots.insert(cloid, snapshot);
+    }
+
+    pub(crate) fn set_pending_modify_action(&self, cmd: &ModifyOrder) -> bool {
+        let mut state = self
+            .pending_order_actions
+            .entry(cmd.client_order_id)
+            .or_insert(PendingOrderActionState {
+                action: PendingOrderAction::Modify,
+                submission: None,
+                modify: None,
+                cancel_commands: Vec::new(),
+            });
+
+        if state.modify.is_some() || state.action != PendingOrderAction::Modify {
+            return false;
+        }
+
+        state.modify = Some(PendingModify {
+            command_id: cmd.command_id,
+            shape: None,
+            submission: None,
+            transaction: None,
+            executed: false,
+        });
+
+        true
+    }
+
+    pub(crate) fn has_pending_modify(&self, cloid: &ClientOrderId) -> bool {
+        self.pending_order_actions
+            .get(cloid)
+            .is_some_and(|state| state.modify.is_some())
+    }
+
+    pub(crate) fn pending_modify_shape(&self, cloid: &ClientOrderId) -> Option<OrderShapeSnapshot> {
+        self.pending_order_actions.get(cloid).and_then(|state| {
+            state
+                .modify
+                .as_ref()
+                .and_then(|modify| modify.shape.clone())
+        })
+    }
+
+    pub(crate) fn set_pending_modify_shape(&self, cmd: &ModifyOrder, shape: OrderShapeSnapshot) {
+        if let Some(mut state) = self.pending_order_actions.get_mut(&cmd.client_order_id)
+            && let Some(modify) = state.modify.as_mut()
+            && modify.command_id == cmd.command_id
+        {
+            modify.shape = Some(shape);
+        }
+    }
+
+    pub(crate) fn set_pending_modify_nonce(
+        &self,
+        cloid: &ClientOrderId,
+        command_id: UUID4,
+        connection_epoch: u64,
+        nonce: i64,
+    ) {
+        if let Some(mut state) = self.pending_order_actions.get_mut(cloid)
+            && let Some(modify) = state.modify.as_mut()
+            && modify.command_id == command_id
+        {
+            modify.submission = Some((connection_epoch, nonce));
+        }
+    }
+
+    pub(crate) fn pending_modify_nonce(&self, cloid: &ClientOrderId) -> Option<(u64, i64)> {
+        self.pending_order_actions
+            .get(cloid)
+            .and_then(|state| state.modify.as_ref().and_then(|modify| modify.submission))
+    }
+
+    pub(crate) fn pending_modify_by_hash(&self, hash: &str) -> Option<PendingSendTx> {
+        self.pending_order_actions.iter().find_map(|state| {
+            state
+                .modify
+                .as_ref()?
+                .transaction
+                .as_ref()
+                .filter(|tx| tx_hash_matches(&tx.tx_hash, hash))
+                .cloned()
+        })
+    }
+
+    pub(crate) fn set_pending_modify_executed(
+        &self,
+        cloid: &ClientOrderId,
+        pending: &PendingSendTx,
+    ) {
+        if let Some(mut state) = self.pending_order_actions.get_mut(cloid)
+            && let Some(modify) = state.modify.as_mut()
+            && modify.submission == Some((pending.connection_epoch, pending.nonce))
+            && modify
+                .transaction
+                .as_ref()
+                .is_some_and(|tx| tx.tx_hash == pending.tx_hash)
+        {
+            modify.executed = true;
+        }
+    }
+
+    pub(crate) fn pending_modify_executed(&self, cloid: &ClientOrderId) -> Option<PendingSendTx> {
+        self.pending_order_actions.get(cloid).and_then(|state| {
+            let modify = state.modify.as_ref()?;
+            modify
+                .executed
+                .then(|| modify.transaction.clone())
+                .flatten()
+        })
+    }
+
+    pub(crate) fn clear_pending_modify_if_nonce(
+        &self,
+        cloid: &ClientOrderId,
+        connection_epoch: u64,
+        nonce: i64,
+    ) -> bool {
+        self.clear_pending_modify_matching(cloid, |modify| {
+            modify.submission == Some((connection_epoch, nonce))
+        })
+    }
+
+    pub(crate) fn clear_pending_modify_if_command(
+        &self,
+        cloid: &ClientOrderId,
+        command_id: UUID4,
+    ) -> bool {
+        self.clear_pending_modify_matching(cloid, |modify| modify.command_id == command_id)
+    }
+
+    pub(crate) fn clear_pending_modify_if_update(
+        &self,
+        cloid: &ClientOrderId,
+        quantity: Quantity,
+        price: Option<Price>,
+        trigger_price: Option<Price>,
+    ) {
+        self.clear_pending_modify_matching(cloid, |modify| {
+            modify.shape.as_ref()
+                == Some(&OrderShapeSnapshot {
+                    quantity,
+                    price,
+                    trigger_price,
+                })
+        });
+    }
+
+    fn clear_pending_modify_matching(
+        &self,
+        cloid: &ClientOrderId,
+        matches: impl FnOnce(&PendingModify) -> bool,
+    ) -> bool {
+        let Entry::Occupied(mut entry) = self.pending_order_actions.entry(*cloid) else {
+            return false;
+        };
+
+        if !entry.get().modify.as_ref().is_some_and(matches) {
+            return false;
+        }
+
+        if entry.get().action == PendingOrderAction::Modify {
+            entry.remove();
+        } else {
+            entry.get_mut().modify = None;
+        }
+
+        true
+    }
+
+    pub(crate) fn pending_order_action(&self, cloid: &ClientOrderId) -> Option<PendingOrderAction> {
+        self.pending_order_actions
+            .get(cloid)
+            .map(|entry| entry.action)
+    }
+
+    pub(crate) fn register_cancel_command(
+        &self,
+        cloid: ClientOrderId,
+        command_id: UUID4,
+        emit_cancel_rejected: bool,
+    ) {
+        let action = PendingOrderAction::cancel(emit_cancel_rejected);
+
+        let mut state =
+            self.pending_order_actions
+                .entry(cloid)
+                .or_insert(PendingOrderActionState {
+                    action,
+                    submission: None,
+                    modify: None,
+                    cancel_commands: Vec::new(),
+                });
+
+        if !state
+            .cancel_commands
+            .iter()
+            .any(|(id, _)| *id == command_id)
+        {
+            state.cancel_commands.push((command_id, action));
+        }
+
+        state.refresh_action();
+    }
+
+    pub(crate) fn clear_pending_cancel_if_command(
+        &self,
+        cloid: &ClientOrderId,
+        command_id: UUID4,
+    ) -> bool {
+        let Entry::Occupied(mut entry) = self.pending_order_actions.entry(*cloid) else {
+            return false;
+        };
+
+        let mut removed = false;
+
+        if let Some(index) = entry
+            .get()
+            .cancel_commands
+            .iter()
+            .position(|(id, _)| *id == command_id)
+        {
+            entry.get_mut().cancel_commands.remove(index);
+            removed = true;
+        }
+
+        if entry
+            .get()
+            .submission
+            .as_ref()
+            .is_some_and(|submission| submission.command_id == command_id)
+        {
+            entry.get_mut().submission = None;
+            removed = true;
+        }
+
+        if !removed {
+            return false;
+        }
+
+        if !entry.get_mut().refresh_action() {
+            entry.remove();
+        }
+
+        true
+    }
+
+    pub(crate) fn promote_pending_cancel(
+        &self,
+        cloid: &ClientOrderId,
+        command_id: UUID4,
+        connection_epoch: u64,
+        nonce: i64,
+        emit_cancel_rejected: bool,
+    ) -> bool {
+        let _events = self.order_events.lock();
+
+        let Entry::Occupied(mut entry) = self.pending_order_actions.entry(*cloid) else {
+            return false;
+        };
+
+        let Some(index) = entry
+            .get()
+            .cancel_commands
+            .iter()
+            .position(|(id, _)| *id == command_id)
+        else {
+            return false;
+        };
+
+        entry.get_mut().cancel_commands.remove(index);
+        let state = entry.get_mut();
+        state.action = PendingOrderAction::cancel(emit_cancel_rejected);
+        state.submission = Some(PendingCancel {
+            command_id,
+            identity: (connection_epoch, nonce),
+            cancellation: CancellationToken::new().drop_guard(),
+        });
+
+        true
+    }
+
+    pub(crate) fn pending_cancel_nonce(&self, cloid: &ClientOrderId) -> Option<(u64, i64)> {
+        self.pending_cancel_identity(cloid)
+            .map(|(_, identity)| identity)
+    }
+
+    pub(crate) fn pending_cancel_identity(
+        &self,
+        cloid: &ClientOrderId,
+    ) -> Option<(UUID4, (u64, i64))> {
+        self.pending_order_actions
+            .get(cloid)
+            .filter(|state| {
+                matches!(
+                    state.action,
+                    PendingOrderAction::Cancel | PendingOrderAction::CancelUnmarked
+                )
+            })
+            .and_then(|state| {
+                state
+                    .submission
+                    .as_ref()
+                    .map(|submission| (submission.command_id, submission.identity))
+            })
+    }
+
+    pub(crate) fn pending_cancel_token(
+        &self,
+        cloid: &ClientOrderId,
+        connection_epoch: u64,
+        nonce: i64,
+    ) -> Option<CancellationToken> {
+        self.pending_order_actions
+            .get(cloid)
+            .filter(|state| {
+                matches!(
+                    state.action,
+                    PendingOrderAction::Cancel | PendingOrderAction::CancelUnmarked
+                )
+            })
+            .and_then(|state| {
+                state
+                    .submission
+                    .as_ref()
+                    .filter(|submission| submission.identity == (connection_epoch, nonce))
+                    .map(|submission| submission.cancellation.token().clone())
+            })
+    }
+
+    pub(crate) fn stop_cancel_probes_before(&self, connection_epoch: u64) {
+        // Keep submission identities for reconciliation after stopping old probes
+        for state in self.pending_order_actions.iter() {
+            if let Some(submission) = state.submission.as_ref()
+                && submission.identity.0 < connection_epoch
+            {
+                submission.cancellation.token().cancel();
+            }
+        }
+    }
+
+    pub(crate) fn clear_pending_cancel_if_nonce(
+        &self,
+        cloid: &ClientOrderId,
+        connection_epoch: u64,
+        nonce: i64,
+    ) -> bool {
+        let Entry::Occupied(mut entry) = self.pending_order_actions.entry(*cloid) else {
+            return false;
+        };
+
+        if entry
+            .get()
+            .submission
+            .as_ref()
+            .map(|submission| submission.identity)
+            != Some((connection_epoch, nonce))
+        {
+            return false;
+        }
+
+        entry.get_mut().submission = None;
+        if !entry.get_mut().refresh_action() {
+            entry.remove();
+        }
+
+        true
+    }
+
+    pub(crate) fn clear_pending_order_action(&self, cloid: &ClientOrderId) {
+        self.pending_order_actions.remove(cloid);
+    }
+
+    /// Register identity context for an order the client just dispatched.
+    /// The consumption loop reads this to decide whether to emit typed events.
+    pub(crate) fn register_order_identity(&self, cloid: ClientOrderId, identity: OrderIdentity) {
+        self.order_identities.insert(cloid, identity);
+    }
+
+    /// Register the client index and identity for one create as one registry operation.
+    pub(crate) fn register_create_identity(&self, order: &OrderAny) -> anyhow::Result<i64> {
+        let _guard = self.create_registry.lock();
+        let cloid = order.client_order_id();
+        let client_order_index =
+            self.register_cloid(self.derive_client_order_index(&cloid), cloid)?;
+        self.register_order_identity(
+            cloid,
+            OrderIdentity::new(
+                order.instrument_id(),
+                order.strategy_id(),
+                order.order_side(),
+                order.order_type(),
+                client_order_index,
+            )
+            .with_order(order),
+        );
+        Ok(client_order_index)
+    }
+
+    pub(crate) fn mark_order_submission(&self, cloid: &ClientOrderId, nonce: i64) {
+        if let Some(identity) = self.order_identities.get(cloid) {
+            identity.mark_submission(nonce);
+        }
+    }
+
+    pub(crate) fn create_submission_is_pending(
+        &self,
+        cloid: &ClientOrderId,
+        client_order_index: i64,
+        nonce: i64,
+    ) -> bool {
+        self.order_identities
+            .get(cloid)
+            .is_some_and(|identity| identity.submission_is_pending(client_order_index, nonce))
+    }
+
+    pub(crate) fn confirm_create_submission(
+        &self,
+        cloid: &ClientOrderId,
+        client_order_index: i64,
+        nonce: i64,
+    ) -> bool {
+        let _guard = self.create_registry.lock();
+        self.order_identities
+            .get(cloid)
+            .is_some_and(|identity| identity.confirm_submission(client_order_index, nonce))
+    }
+
+    pub(crate) fn observe_create_submission(
+        &self,
+        cloid: &ClientOrderId,
+        client_order_index: i64,
+        nonce: i64,
+        venue_order_id: VenueOrderId,
+    ) -> bool {
+        let _guard = self.create_registry.lock();
+        let Some(identity) = self
+            .order_identities
+            .get(cloid)
+            .map(|entry| entry.value().clone())
+        else {
+            return false;
+        };
+
+        if !identity.confirm_submission(client_order_index, nonce)
+            || !identity.bind_venue_order_id(venue_order_id)
+        {
+            return false;
+        }
+        self.venue_id_map.insert(*cloid, venue_order_id);
+        true
+    }
+
+    /// Atomically claim and remove the exact submitted create generation.
+    pub(crate) fn reject_create_submission(
+        &self,
+        cloid: &ClientOrderId,
+        client_order_index: i64,
+        nonce: i64,
+        connection_epoch: Option<(&AtomicU64, u64)>,
+    ) -> bool {
+        let _guard = self.create_registry.lock();
+        let Some(identity) = self
+            .order_identities
+            .get(cloid)
+            .map(|entry| entry.value().clone())
+        else {
+            return false;
+        };
+
+        if !identity.reject_submission(client_order_index, nonce, connection_epoch) {
+            return false;
+        }
+
+        let removed = self
+            .order_identities
+            .remove_if(cloid, |_, current| {
+                Arc::ptr_eq(&current.binding, &identity.binding)
+            })
+            .is_some();
+
+        if !removed {
+            return false;
+        }
+
+        self.cloid_map
+            .remove_if(&client_order_index, |_, current| current == cloid);
+        self.venue_id_map.remove(cloid);
+        self.triggered_emitted.remove(cloid);
+        self.order_snapshots.remove(cloid);
+        self.clear_pending_order_action(cloid);
+        true
+    }
+
+    /// Drop the identity entry for `cloid` after a terminal event or
+    /// failed dispatch.
+    pub(crate) fn forget_order_identity(&self, cloid: &ClientOrderId) {
+        self.order_identities.remove(cloid);
+        self.triggered_emitted.remove(cloid);
+        self.order_snapshots.remove(cloid);
+        self.clear_pending_order_action(cloid);
+    }
+
+    /// Move a terminal order from active maps into the bounded replay cache.
+    pub(crate) fn retire_order_identity(&self, cloid: &ClientOrderId) {
+        self.clear_pending_order_action(cloid);
+        let Some((_, identity)) = self.order_identities.remove(cloid) else {
+            return;
+        };
+
+        self.cloid_map
+            .remove_if(&identity.client_order_index, |_, current| current == cloid);
+        self.retired_orders.insert(*cloid, identity);
+        self.venue_id_map.remove(cloid);
+        self.triggered_emitted.remove(cloid);
+        self.order_snapshots.remove(cloid);
+    }
+
+    /// Resolve active first, then terminal replay identity.
+    pub(crate) fn order_identity(&self, cloid: &ClientOrderId) -> Option<OrderIdentity> {
+        self.order_identities
+            .get(cloid)
+            .map(|entry| entry.value().clone())
+            .or_else(|| self.retired_orders.identity_for_cloid(cloid))
+    }
+
+    pub(crate) fn any_order_identity(
+        &self,
+        mut predicate: impl FnMut(&ClientOrderId, &OrderIdentity, bool) -> bool,
+    ) -> bool {
+        if self
+            .order_identities
+            .iter()
+            .any(|entry| predicate(entry.key(), entry.value(), false))
+        {
+            return true;
+        }
+
+        self.retired_orders
+            .inner
+            .lock()
+            .by_index
+            .values()
+            .any(|bindings| {
+                bindings
+                    .values()
+                    .any(|(retired, _)| predicate(&retired.cloid, &retired.identity, true))
+            })
+    }
+
+    pub(crate) fn defer_fill(&self, deferred: &mut DeferredOrderEvents, fill: OrderFilled) {
+        if !deferred
+            .fills
+            .iter()
+            .any(|prior| prior.trade_id == fill.trade_id)
+        {
+            let sequence = self.fill_sequence.fetch_add(1, Ordering::Relaxed);
+            deferred.fill_sequence.insert(fill.trade_id, sequence);
+            deferred.fills.push(fill);
+        }
+    }
+
+    /// Returns `true` if an `OrderAccepted` has already been emitted for
+    /// `cloid` on the live path. Drives the modify-as-restate branch and
+    /// the `ensure_accepted_emitted` synthesis.
+    pub(crate) fn accepted_was_emitted(&self, cloid: &ClientOrderId) -> bool {
+        self.order_identity(cloid)
+            .is_some_and(|identity| identity.accepted_was_emitted())
+    }
+
+    /// Atomically claim the right to emit `OrderAccepted` for `cloid`.
+    pub(crate) fn claim_accepted_emission(&self, cloid: &ClientOrderId) -> bool {
+        self.order_identity(cloid)
+            .is_some_and(|identity| identity.claim_accepted_emission())
+    }
+
+    /// Record that an `OrderAccepted` has been emitted for `cloid`.
+    pub(crate) fn mark_accepted_emitted(&self, cloid: ClientOrderId) {
+        let _ = self.claim_accepted_emission(&cloid);
+    }
+
+    /// Seed the live accepted marker from a tracked order report.
+    ///
+    /// Reconciliation can turn any non-rejected tracked report into
+    /// `OrderAccepted` for a locally submitted order before the typed
+    /// WebSocket path receives a cancel, fill, or open frame. Marking here
+    /// keeps that later typed path from synthesizing a second `OrderAccepted`.
+    pub(crate) fn seed_accepted_from_report(&self, report: &OrderStatusReport) {
+        if !matches!(
+            report.order_status,
+            OrderStatus::Submitted
+                | OrderStatus::PendingUpdate
+                | OrderStatus::PendingCancel
+                | OrderStatus::Accepted
+                | OrderStatus::Triggered
+                | OrderStatus::PartiallyFilled
+                | OrderStatus::Filled
+                | OrderStatus::Canceled
+                | OrderStatus::Expired
+        ) {
+            return;
+        }
+
+        let Some(cloid) = report.client_order_id else {
+            return;
+        };
+
+        self.mark_accepted_emitted(cloid);
+    }
+
+    /// First-time check for a trade id: returns `true` if `trade_id` is new
+    /// and inserts it, returns `false` if it was already routed.
+    pub(crate) fn mark_trade_seen(&self, trade_id: TradeId) -> bool {
+        self.seen_trade_ids
+            .insert(trade_id, TradeDedupSource::Live)
+            .is_none()
+    }
+
+    pub(crate) fn trade_source(&self, trade_id: TradeId) -> Option<TradeDedupSource> {
+        self.seen_trade_ids
+            .inner
+            .lock()
+            .entries
+            .get(&trade_id)
+            .map(|(source, _)| *source)
+    }
+
+    /// Record a reconciliation fill and return its prior delivery source.
+    pub(crate) fn mark_trade_reconciled(&self, trade_id: TradeId) -> Option<TradeDedupSource> {
+        self.seen_trade_ids
+            .insert(trade_id, TradeDedupSource::Reconciliation)
+    }
+
+    /// Record a market_index as having reported account activity.
+    pub(crate) fn note_active_market(&self, market_index: i64) {
+        self.active_markets.insert(market_index);
+    }
+
+    /// Hash a Nautilus [`ClientOrderId`] into a stable positive `i64` for use
+    /// as the venue's `client_order_index`. The high bit is masked off so
+    /// every derived value passes Lighter's `client_order_index >= 0` check.
+    pub(crate) fn derive_client_order_index(&self, cloid: &ClientOrderId) -> i64 {
+        derive_client_order_index_static(cloid)
+    }
+
+    /// Register a `(client_order_index, ClientOrderId)` mapping ahead of
+    /// dispatch so the venue's later echo can be translated.
+    ///
+    /// When the derived `client_order_index` collides with an existing
+    /// in-flight registration for a *different* cloid the call probes
+    /// forward by 1 (wrapping inside the 31-bit venue-safe window) up to
+    /// [`CLOID_INDEX_PROBE_LIMIT`] times to find a free slot. The chosen
+    /// index is returned so the caller can use it as the venue-side
+    /// `client_order_index`. A re-registration of the same cloid against
+    /// its already-assigned index is a no-op and returns `index`.
+    ///
+    /// The 31-bit space is large enough that collisions are improbable at
+    /// session scale; the probe protects against rare collisions without
+    /// silently re-routing a later order's fill to a prior cloid.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if every bounded probe candidate is occupied. No existing mapping is
+    /// changed on failure.
+    pub(crate) fn register_cloid(&self, index: i64, cloid: ClientOrderId) -> anyhow::Result<i64> {
+        let mut candidate = index;
+        for attempt in 0..=CLOID_INDEX_PROBE_LIMIT {
+            if self.resolve_client_order_index(candidate).is_some() {
+                if self
+                    .cloid_map
+                    .get(&candidate)
+                    .is_some_and(|entry| *entry.value() == cloid)
+                {
+                    return Ok(candidate);
+                }
+                candidate = next_probe_index(candidate);
+                continue;
+            }
+
+            if self.retired_orders.contains_index(candidate) {
+                candidate = next_probe_index(candidate);
+                continue;
+            }
+
+            match self.cloid_map.entry(candidate) {
+                dashmap::mapref::entry::Entry::Vacant(entry) => {
+                    if self.retired_orders.contains_index(candidate) {
+                        candidate = next_probe_index(candidate);
+                        continue;
+                    }
+                    entry.insert(cloid);
+
+                    if attempt > 0 {
+                        log::warn!(
+                            "Lighter client_order_index collision at {index}: \
+                             cloid {cloid} re-derived to {candidate} after {attempt} probe(s)",
+                        );
+                    }
+                    return Ok(candidate);
+                }
+                dashmap::mapref::entry::Entry::Occupied(entry) => {
+                    if *entry.get() == cloid {
+                        return Ok(candidate);
+                    }
+                    candidate = next_probe_index(candidate);
+                }
+            }
+        }
+        anyhow::bail!(
+            "Lighter client_order_index probe exhausted after {} attempts for cloid {cloid}",
+            CLOID_INDEX_PROBE_LIMIT + 1,
+        )
+    }
+
+    pub(crate) fn seed_order_restorations(&self, orders: Vec<OrderAny>) {
+        self.order_restorations.clear();
+
+        for order in orders {
+            self.seed_order_restoration(order);
+        }
+    }
+
+    pub(crate) fn seed_order_restoration(&self, order: OrderAny) {
+        if !order.strategy_id().is_external()
+            && let Some(venue_order_id) = order.venue_order_id()
+            && self.order_identity(&order.client_order_id()).is_none()
+        {
+            self.order_restorations.insert(venue_order_id, order);
+        }
+    }
+
+    pub(crate) fn restore_cached_order(
+        &self,
+        venue_order_id: VenueOrderId,
+        client_order_index: i64,
+        instrument_id: InstrumentId,
+    ) -> bool {
+        let Some(order) = self
+            .order_restorations
+            .get(&venue_order_id)
+            .map(|entry| entry.value().clone())
+        else {
+            return true;
+        };
+
+        if order.instrument_id() != instrument_id {
+            log::warn!(
+                "Ignoring cached Lighter order with mismatched instrument: venue_order_id={venue_order_id}"
+            );
+            return false;
+        }
+
+        // Reconciliation can retire the order before its first live frame arrives.
+        let terminal = self
+            .retired_orders
+            .identity_for_cloid(&order.client_order_id())
+            .is_some();
+
+        if let Err(e) =
+            self.restore_reconciled_order(&order, client_order_index, venue_order_id, terminal)
+        {
+            log::warn!(
+                "Deferring cached Lighter order restoration: venue_order_id={venue_order_id}, error={e}"
+            );
+            return false;
+        }
+
+        self.order_restorations.remove(&venue_order_id);
+        true
+    }
+
+    /// Restore an exact order identity observed during reconciliation.
+    ///
+    /// `terminal` reflects the current venue report because the cached order can be stale after a
+    /// restart.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the cached order does not carry the same venue order ID, the client
+    /// index is outside the venue-safe range, or the binding conflicts with existing local state.
+    pub(crate) fn restore_reconciled_order(
+        &self,
+        order: &OrderAny,
+        client_order_index: i64,
+        venue_order_id: VenueOrderId,
+        terminal: bool,
+    ) -> anyhow::Result<()> {
+        let cloid = order.client_order_id();
+        anyhow::ensure!(
+            order.venue_order_id() == Some(venue_order_id),
+            "cached Lighter order {cloid} does not match venue order ID {venue_order_id}",
+        );
+        anyhow::ensure!(
+            (0..=(1_i64 << 48) - 1).contains(&client_order_index),
+            "Lighter client_order_index {client_order_index} is outside the venue range",
+        );
+
+        if let Some(existing) = self
+            .order_identities
+            .get(&cloid)
+            .map(|entry| entry.value().clone())
+        {
+            anyhow::ensure!(
+                existing.client_order_index == client_order_index
+                    && existing.matches_venue_order_id(venue_order_id),
+                "active Lighter order {cloid} conflicts with reconciliation binding",
+            );
+
+            if terminal {
+                self.retire_order_identity(&cloid);
+            } else if order.is_triggered() == Some(true) {
+                self.mark_triggered_emitted(cloid);
+            }
+            return Ok(());
+        }
+
+        if let Some(existing) = self.retired_orders.identity_for_cloid(&cloid) {
+            anyhow::ensure!(
+                terminal
+                    && existing.client_order_index == client_order_index
+                    && existing.matches_venue_order_id(venue_order_id),
+                "retired Lighter order {cloid} conflicts with reconciliation binding",
+            );
+            return Ok(());
+        }
+
+        let identity = OrderIdentity::restored(order, client_order_index, venue_order_id);
+
+        let snapshot = OrderShapeSnapshot {
+            quantity: order.quantity(),
+            price: order.price(),
+            trigger_price: order.trigger_price(),
+        };
+
+        if terminal {
+            anyhow::ensure!(
+                self.retired_orders
+                    .cloid_for_venue(client_order_index, venue_order_id)
+                    .is_none(),
+                "retired Lighter binding conflicts at client_order_index {client_order_index} and venue order ID {venue_order_id}",
+            );
+            self.retired_orders.insert(cloid, identity);
+        } else {
+            if let Some(existing) = self.venue_id_map.get(&cloid) {
+                anyhow::ensure!(
+                    *existing.value() == venue_order_id,
+                    "active Lighter order {cloid} conflicts with venue order ID {venue_order_id}",
+                );
+            }
+
+            match self.cloid_map.entry(client_order_index) {
+                dashmap::mapref::entry::Entry::Vacant(entry) => {
+                    self.venue_id_map.insert(cloid, venue_order_id);
+                    self.order_identities.insert(cloid, identity);
+                    entry.insert(cloid);
+                    self.order_snapshots.insert(cloid, snapshot);
+                    if order.is_triggered() == Some(true) {
+                        self.mark_triggered_emitted(cloid);
+                    }
+                }
+                dashmap::mapref::entry::Entry::Occupied(_) => {
+                    self.venue_id_map.insert(cloid, venue_order_id);
+                    self.order_identities.insert(cloid, identity);
+                    self.order_snapshots.insert(cloid, snapshot);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Drop a cloid registration (called from the spawn's error branch when
+    /// the tx never reaches the wire).
+    pub(crate) fn forget_cloid(&self, index: i64) {
+        self.cloid_map.remove(&index);
+    }
+
+    /// Resolve a venue client-order index across active and replay caches.
+    pub(crate) fn resolve_client_order_index(&self, index: i64) -> Option<ClientOrderId> {
+        self.cloid_map
+            .get(&index)
+            .map(|entry| *entry.value())
+            .or_else(|| self.retired_orders.cloid_for_index(index))
+    }
+
+    /// Resolve and bind a live venue client id across active and replay caches.
+    pub(crate) fn resolve_live_order_cloid(
+        &self,
+        raw_client_id: &str,
+        venue_order_id: VenueOrderId,
+    ) -> Option<ClientOrderId> {
+        if let Some(cloid) = self.venue_id_map.iter().find_map(|entry| {
+            (*entry.value() == venue_order_id
+                && self.order_identity(entry.key()).is_some_and(|identity| {
+                    identity.client_order_index == raw_client_id.parse::<i64>().unwrap_or(-1)
+                }))
+            .then_some(*entry.key())
+        }) {
+            return Some(cloid);
+        }
+
+        if raw_client_id.is_empty() || raw_client_id == "0" {
+            return None;
+        }
+
+        let index = raw_client_id.parse::<i64>().ok()?;
+
+        if let Some(cloid) = self.cloid_map.get(&index).map(|entry| *entry.value())
+            && let Some(identity) = self.order_identity(&cloid)
+        {
+            if identity.matches_venue_order_id(venue_order_id) {
+                return Some(cloid);
+            }
+
+            if let Some(retired) = self.retired_orders.cloid_for_venue(index, venue_order_id) {
+                return Some(retired);
+            }
+
+            return identity
+                .bind_venue_order_id(venue_order_id)
+                .then_some(cloid);
+        }
+
+        self.retired_orders.cloid_for_venue(index, venue_order_id)
+    }
+
+    pub(crate) fn resolve_live_trade_cloid(
+        &self,
+        raw_client_id: &str,
+        venue_order_id: VenueOrderId,
+    ) -> Option<ClientOrderId> {
+        self.resolve_live_order_cloid(raw_client_id, venue_order_id)
+    }
+
+    pub(crate) fn resolve_client_order_index_for_venue(
+        &self,
+        index: i64,
+        venue_order_id: VenueOrderId,
+    ) -> Option<ClientOrderId> {
+        if let Some(cloid) = self.venue_id_map.iter().find_map(|entry| {
+            (*entry.value() == venue_order_id
+                && self
+                    .order_identity(entry.key())
+                    .is_some_and(|identity| identity.client_order_index == index))
+            .then_some(*entry.key())
+        }) {
+            return Some(cloid);
+        }
+
+        if let Some(cloid) = self.cloid_map.get(&index).map(|entry| *entry.value())
+            && self
+                .order_identity(&cloid)
+                .is_some_and(|identity| identity.matches_venue_order_id(venue_order_id))
+        {
+            return Some(cloid);
+        }
+
+        self.retired_orders.cloid_for_venue(index, venue_order_id)
+    }
+
+    pub(crate) fn record_order_reduction(
+        &self,
+        index: i64,
+        venue_order_id: VenueOrderId,
+        quantity: Decimal,
+    ) {
+        if let Some(cloid) = self.resolve_client_order_index_for_venue(index, venue_order_id)
+            && let Some(identity) = self.order_identity(&cloid)
+        {
+            identity.record_reduction(quantity);
+        }
+    }
+
+    /// Substitute a numeric venue cloid only when its venue order is bound.
+    pub(crate) fn translate_order_cloid(&self, mut report: OrderStatusReport) -> OrderStatusReport {
+        if let Some(cloid) = report.client_order_id
+            && let Ok(index) = cloid.as_str().parse::<i64>()
+        {
+            let resolved = self
+                .resolve_client_order_index_for_venue(index, report.venue_order_id)
+                .unwrap_or_else(|| ClientOrderId::new(report.venue_order_id.as_str()));
+            report = report.with_client_order_id(resolved);
+        }
+
+        if let Some(identity) = report
+            .client_order_id
+            .and_then(|cloid| self.order_identity(&cloid))
+            && identity.matches_venue_order_id(report.venue_order_id)
+        {
+            if report.order_status == OrderStatus::Rejected && identity.accepted_was_emitted() {
+                report.order_status = OrderStatus::Canceled;
+            }
+
+            if report.order_type == OrderType::Limit
+                && STOP_ORDER_TYPES.contains(&identity.order_type)
+                && report.order_status == OrderStatus::Accepted
+            {
+                report.order_status = OrderStatus::Triggered;
+            }
+
+            report.order_type = identity.order_type;
+            report.trigger_price = report
+                .trigger_price
+                .or(identity.binding.lock().trigger_price);
+            report.contingency_type = identity.contingency_type;
+            report.linked_order_ids = identity.linked_order_ids.clone();
+            report.parent_order_id = identity.parent_order_id;
+            if report.quantity.is_zero()
+                && let Some(quantity) = identity.held_quantity
+            {
+                report.quantity = quantity;
+            }
+        }
+
+        report
+    }
+
+    pub(crate) fn apply_order_contingencies(
+        &self,
+        order: &LighterOrder,
+        mut report: OrderStatusReport,
+    ) -> OrderStatusReport {
+        let triggers: Vec<_> = [&order.to_trigger_order_id_0, &order.to_trigger_order_id_1]
+            .into_iter()
+            .filter(|id| !id.is_empty() && id.as_str() != "0")
+            .map(|id| self.client_order_id_for_link(id))
+            .collect();
+
+        if !triggers.is_empty() {
+            report.contingency_type = Some(ContingencyType::Oto);
+            report.linked_order_ids = Some(triggers);
+        } else if !order.to_cancel_order_id_0.is_empty() && order.to_cancel_order_id_0 != "0" {
+            report.contingency_type = Some(ContingencyType::Oco);
+            report.linked_order_ids = Some(vec![
+                self.client_order_id_for_link(&order.to_cancel_order_id_0),
+            ]);
+        }
+
+        if !order.parent_order_id.is_empty() && order.parent_order_id != "0" {
+            report.parent_order_id = Some(self.client_order_id_for_link(&order.parent_order_id));
+        }
+
+        report
+    }
+
+    fn client_order_id_for_link(&self, venue_id: &str) -> ClientOrderId {
+        let venue_id = VenueOrderId::new(venue_id);
+        self.venue_id_map
+            .iter()
+            .find_map(|entry| (*entry.value() == venue_id).then_some(*entry.key()))
+            .unwrap_or_else(|| ClientOrderId::new(venue_id.as_str()))
+    }
+
+    /// Preserve pending status across working reports and retain unresolved
+    /// modification context across terminal reports.
+    pub(crate) fn preserve_pending_order_status(
+        &self,
+        mut report: OrderStatusReport,
+    ) -> OrderStatusReport {
+        let Some(cloid) = report.client_order_id else {
+            return report;
+        };
+
+        if report.order_status.is_closed() {
+            if !self.has_pending_modify(&cloid) {
+                self.clear_pending_order_action(&cloid);
+            }
+
+            return report;
+        }
+
+        if !matches!(
+            report.order_status,
+            OrderStatus::Accepted | OrderStatus::Triggered | OrderStatus::PartiallyFilled,
+        ) {
+            return report;
+        }
+
+        report.order_status = match self.pending_order_action(&cloid) {
+            Some(PendingOrderAction::Modify) => OrderStatus::PendingUpdate,
+            Some(PendingOrderAction::Cancel) => OrderStatus::PendingCancel,
+            Some(PendingOrderAction::CancelUnmarked) | None => return report,
+        };
+        report
+    }
+
+    /// Substitute a numeric venue cloid only when its venue order is bound.
+    pub(crate) fn translate_fill_cloid(&self, mut report: FillReport) -> FillReport {
+        if let Some(cloid) = report.client_order_id
+            && let Ok(index) = cloid.as_str().parse::<i64>()
+        {
+            report.client_order_id = Some(
+                self.resolve_client_order_index_for_venue(index, report.venue_order_id)
+                    .unwrap_or_else(|| ClientOrderId::new(report.venue_order_id.as_str())),
+            );
+        }
+        report
+    }
+
+    /// Return the actual collision-probed index used for `cloid`.
+    pub(crate) fn client_order_index(&self, cloid: &ClientOrderId) -> Option<i64> {
+        self.order_identity(cloid)
+            .map(|identity| identity.client_order_index)
+    }
+
+    /// Look up the venue-assigned [`VenueOrderId`] for a Nautilus cloid.
+    pub(crate) fn lookup_venue_order_id(&self, cloid: &ClientOrderId) -> Option<VenueOrderId> {
+        self.venue_id_map.get(cloid).map(|e| *e.value())
+    }
+
+    /// Cache the most recent [`AccountState`] from the WS feed so
+    /// `query_account` can serve a snapshot synchronously.
+    pub(crate) fn cache_account_state(&self, state: AccountState) {
+        let mut guard = self.last_account_state.lock();
+        *guard = Some(state);
+    }
+
+    /// Return a clone of the cached [`AccountState`], if any.
+    pub(crate) fn snapshot_account_state(&self) -> Option<AccountState> {
+        self.last_account_state.lock().clone()
+    }
+
+    /// Drop the cached `AccountState` snapshot. Used at connect time so a
+    /// stale prior-session snapshot cannot satisfy the strict-await gate
+    /// when an initial venue frame fails to parse or omits balances.
+    pub(crate) fn clear_account_state_cache(&self) {
+        let mut guard = self.last_account_state.lock();
+        *guard = None;
+    }
+
+    /// Drop the cached position snapshot without emitting flat reports.
+    /// Used at connect time so a stale prior-session entry cannot leak past
+    /// the strict-await gate before the next `account_all_positions` frame
+    /// replaces the cache.
+    pub(crate) fn clear_position_cache(&self) {
+        let mut snapshot = self.position_snapshot.lock();
+        snapshot.reports.clear();
+        snapshot.skipped_market_ids = None;
+    }
+
+    pub(crate) fn invalidate_position_snapshot(&self) {
+        self.position_snapshot.lock().skipped_market_ids = None;
+    }
+
+    /// Replace the cache and coverage from an `account_all_positions` snapshot
+    /// and return the instrument ids that were present before but absent
+    /// after. The caller is expected to emit a flat
+    /// [`PositionStatusReport`] for each removed instrument; otherwise the
+    /// execution engine won't observe externally-closed positions.
+    /// Instruments absent from `reports` are evicted unless retained because
+    /// their venue rows were skipped. An empty report set clears the cache
+    /// when no instrument is retained.
+    pub(crate) fn replace_position_snapshot(
+        &self,
+        reports: &[PositionStatusReport],
+        retained: &[InstrumentId],
+        skipped_market_ids: &[i64],
+    ) -> Vec<InstrumentId> {
+        let mut snapshot = self.position_snapshot.lock();
+        let removed = replace_position_reports(&mut snapshot.reports, reports, retained);
+        snapshot.skipped_market_ids = Some(skipped_market_ids.iter().copied().collect());
+        removed
+    }
+
+    /// Apply live position updates without evicting instruments omitted from the frame.
+    /// The caller must emit a flat report for every returned removed instrument.
+    pub(crate) fn apply_position_update(
+        &self,
+        reports: &[PositionStatusReport],
+        closed: &[InstrumentId],
+        covered_market_ids: &[i64],
+        skipped_market_ids: &[i64],
+    ) -> Vec<InstrumentId> {
+        let mut snapshot = self.position_snapshot.lock();
+        let removed = update_position_reports(&mut snapshot.reports, reports, closed);
+        if let Some(skipped) = snapshot.skipped_market_ids.as_mut() {
+            for market_id in covered_market_ids {
+                skipped.remove(market_id);
+            }
+            skipped.extend(skipped_market_ids.iter().copied());
+        }
+        removed
+    }
+
+    /// Snapshot cached position reports and their coverage under one lock.
+    pub(crate) fn snapshot_positions_with_coverage(
+        &self,
+    ) -> (Vec<PositionStatusReport>, Option<AHashSet<i64>>) {
+        let snapshot = self.position_snapshot.lock();
+        (
+            snapshot.reports.values().cloned().collect(),
+            snapshot.skipped_market_ids.clone(),
+        )
+    }
+}
+
+fn replace_position_reports(
+    current: &mut AHashMap<InstrumentId, PositionStatusReport>,
+    snapshot: &[PositionStatusReport],
+    retained: &[InstrumentId],
+) -> Vec<InstrumentId> {
+    let new_ids: AHashSet<InstrumentId> = snapshot.iter().map(|r| r.instrument_id).collect();
+    let retained_ids: AHashSet<InstrumentId> = retained.iter().copied().collect();
+    let removed: Vec<InstrumentId> = current
+        .keys()
+        .filter(|id| !new_ids.contains(id) && !retained_ids.contains(id))
+        .copied()
+        .collect();
+
+    current.retain(|id, _| retained_ids.contains(id));
+    for report in snapshot {
+        current.insert(report.instrument_id, report.clone());
+    }
+    removed
+}
+
+fn update_position_reports(
+    current: &mut AHashMap<InstrumentId, PositionStatusReport>,
+    updates: &[PositionStatusReport],
+    closed: &[InstrumentId],
+) -> Vec<InstrumentId> {
+    let removed = closed
+        .iter()
+        .filter_map(|instrument_id| current.remove(instrument_id).map(|_| *instrument_id))
+        .collect();
+
+    for report in updates {
+        current.insert(report.instrument_id, report.clone());
+    }
+    removed
+}
+
+pub(crate) fn tx_hash_matches(left: &str, right: &str) -> bool {
+    let left = left
+        .strip_prefix("0x")
+        .or_else(|| left.strip_prefix("0X"))
+        .unwrap_or(left);
+    let right = right
+        .strip_prefix("0x")
+        .or_else(|| right.strip_prefix("0X"))
+        .unwrap_or(right);
+    left.eq_ignore_ascii_case(right)
+}
+
+/// Standalone derivation so the fixed-seed contract is testable without
+/// constructing a full dispatch state, and so the seed lives in one place.
+pub(crate) fn derive_client_order_index_static(cloid: &ClientOrderId) -> i64 {
+    let mut hasher = CLOID_HASHER.build_hasher();
+    hasher.write(cloid.as_str().as_bytes());
+    let h = hasher.finish();
+    // Mask to 31 positive bits (max ~2.1B). Lighter rejects larger values
+    // with `21727 invalid client order index`; the venue's accepted range
+    // is not documented but observed empirically. Using a smaller window
+    // also keeps collision risk negligible at session scale.
+    i64::from(h as u32 & CLOID_INDEX_MAX)
+}
+
+/// Linear probe: advance the candidate index by 1, wrapping inside the
+/// 31-bit venue-safe window. Used by [`WsDispatchState::register_cloid`]
+/// when the derived index collides with another in-flight cloid.
+fn next_probe_index(candidate: i64) -> i64 {
+    let next = candidate.wrapping_add(1);
+    if (0..=i64::from(CLOID_INDEX_MAX)).contains(&next) {
+        next
+    } else {
+        0
+    }
+}
+
+/// Drops the `ClientOrderId → VenueOrderId` mapping for an order that has
+/// reached a terminal status, since cancel/modify can no longer act on it.
+///
+/// The dispatch path separately moves terminal identity into the bounded
+/// replay cache. That cache keeps the probed client index available when a
+/// terminal status arrives before its trailing `account_all_trades` frame.
+pub(crate) fn evict_terminal_mappings(
+    report: &OrderStatusReport,
+    venue_id_map: &Arc<DashMap<ClientOrderId, VenueOrderId>>,
+) {
+    if let Some(cloid) = &report.client_order_id {
+        venue_id_map.remove(cloid);
+    }
+}
+
+/// Process-global instrument cache used by the HTTP report-gen path.
+///
+/// Avoids threading the live engine cache through every report parser; populated by
+/// the data and execution clients on bootstrap.
+pub(crate) static LIGHTER_INSTRUMENT_CACHE: LazyLock<DashMap<InstrumentId, InstrumentAny>> =
+    LazyLock::new(DashMap::new);
+
+/// Populate [`LIGHTER_INSTRUMENT_CACHE`] for downstream report parsers.
+pub(crate) fn cache_instruments_for_reports(instruments: &[InstrumentAny]) {
+    for instrument in instruments {
+        LIGHTER_INSTRUMENT_CACHE.insert(instrument.id(), instrument.clone());
+    }
+}
+
+/// Convert a Lighter HTTP `LighterOrder` into a Nautilus
+/// [`OrderStatusReport`], reusing the WS-side parser once the instrument has
+/// been resolved out of the process-global cache. Order timestamps are
+/// normalized inside the parser for either seconds or milliseconds input.
+///
+/// Translates the venue's numeric `client_order_index` echo back to the
+/// originating Nautilus [`ClientOrderId`] when available, so HTTP-driven
+/// reconciliation paths don't surface our own orders as external.
+pub(crate) fn parse_http_order_to_report(
+    order: &LighterOrder,
+    registry: &Arc<MarketRegistry>,
+    account_id: AccountId,
+    ts_init: UnixNanos,
+    dispatch: &WsDispatchState,
+) -> Option<OrderStatusReport> {
+    let instrument_id = registry.instrument_id(order.market_index)?;
+    let instrument = match LIGHTER_INSTRUMENT_CACHE.get(&instrument_id) {
+        Some(inst) => inst,
+        None => {
+            log::debug!("parse_http_order_to_report: instrument {instrument_id} not in cache");
+            return None;
+        }
+    };
+
+    match parse_ws_order_status_report(order, &instrument, account_id, ts_init) {
+        Ok(report) => Some(dispatch.apply_order_contingencies(order, report)),
+        Err(e) => {
+            log::warn!(
+                "parse_http_order_to_report: parse failed for order_index={}: {e}",
+                order.order_index,
+            );
+            None
+        }
+    }
+}
+
+/// Look up an acknowledged create by its exact client index and submission nonce.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "exact create identity and report context cross the REST translation boundary"
+)]
+pub(crate) async fn lookup_create_order_status_report(
+    http_client: &LighterHttpClient,
+    registry: &Arc<MarketRegistry>,
+    credential: &Credential,
+    account_id: AccountId,
+    instrument_id: InstrumentId,
+    client_order_id: ClientOrderId,
+    client_order_index: i64,
+    nonce: i64,
+    dispatch: &WsDispatchState,
+    clock: &'static AtomicTime,
+) -> anyhow::Result<Option<OrderStatusReport>> {
+    let market_index = registry
+        .market_index(&instrument_id)
+        .ok_or_else(|| anyhow::anyhow!("no Lighter market_index for instrument {instrument_id}"))?;
+    let auth = mint_auth_token(credential)?;
+    let query = Zeroizing::new(LighterAccountActiveOrdersQuery {
+        authorization: None,
+        auth: Some(auth.clone()),
+        account_index: credential.account_index(),
+        market_id: market_index,
+    });
+    let active = http_client
+        .get_account_active_orders(&query)
+        .await
+        .context("failed to fetch Lighter active orders")?;
+
+    let mut matches = active
+        .orders
+        .iter()
+        .filter(|order| order.client_order_index == client_order_index && order.nonce == nonce);
+    let Some(order) = matches.next() else {
+        return Ok(None);
+    };
+    anyhow::ensure!(
+        matches.next().is_none(),
+        "ambiguous Lighter active-order lookup for client_order_index {client_order_index} and nonce {nonce}",
+    );
+
+    let report =
+        parse_http_order_to_report(order, registry, account_id, clock.get_time_ns(), dispatch)
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "failed to parse Lighter active order {} for acknowledged create",
+                    order.order_index,
+                )
+            })?;
+
+    let report = dispatch
+        .translate_order_cloid(report)
+        .with_client_order_id(client_order_id);
+    Ok(Some(dispatch.preserve_pending_order_status(report)))
+}
+
+pub(crate) struct OrderReportLookup {
+    instrument_id: InstrumentId,
+    target_venue_index: Option<i64>,
+    target_client_index: Option<i64>,
+    supplied_cloid: Option<ClientOrderId>,
+}
+
+impl OrderReportLookup {
+    pub(crate) fn new(
+        registry: &Arc<MarketRegistry>,
+        dispatch: &WsDispatchState,
+        instrument_id: Option<InstrumentId>,
+        client_order_id: Option<&ClientOrderId>,
+        venue_order_id: Option<&VenueOrderId>,
+    ) -> anyhow::Result<Self> {
+        let instrument_id = instrument_id.ok_or_else(|| {
+            anyhow::anyhow!(
+                "Lighter order lookup requires an instrument_id (per-market REST query)"
+            )
+        })?;
+
+        let target_venue_index: Option<i64> = venue_order_id
+            .and_then(|voi| voi.as_str().parse::<i64>().ok())
+            .or_else(|| {
+                client_order_id
+                    .and_then(|cloid| dispatch.lookup_venue_order_id(cloid))
+                    .and_then(|voi| voi.as_str().parse::<i64>().ok())
+            });
+
+        let target_client_index: Option<i64> = client_order_id.map(|cloid| {
+            dispatch
+                .client_order_index(cloid)
+                .unwrap_or_else(|| dispatch.derive_client_order_index(cloid))
+        });
+
+        anyhow::ensure!(
+            registry.market_index(&instrument_id).is_some(),
+            "no Lighter market_index for instrument {instrument_id}"
+        );
+        Ok(Self {
+            instrument_id,
+            target_venue_index,
+            target_client_index,
+            supplied_cloid: client_order_id.copied(),
+        })
+    }
+
+    pub(crate) fn parse(
+        &self,
+        order: &LighterOrder,
+        registry: &Arc<MarketRegistry>,
+        account_id: AccountId,
+        ts_init: UnixNanos,
+        dispatch: &WsDispatchState,
+    ) -> anyhow::Result<(OrderStatusReport, Option<ClientOrderId>)> {
+        let market_index = registry
+            .market_index(&self.instrument_id)
+            .unwrap_or(order.market_index);
+
+        let report = parse_http_order_to_report(order, registry, account_id, ts_init, dispatch)
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "failed to parse matching Lighter order {} for market_index={market_index}",
+                    order.order_id
+                )
+            })?;
+
+        // A caller cloid needs its registered index; a derived index can identify a collision partner
+        let supplied_cloid = self
+            .supplied_cloid
+            .filter(|cloid| dispatch.client_order_index(cloid) == Some(order.client_order_index));
+        Ok((report, supplied_cloid))
+    }
+
+    pub(crate) fn finish(
+        &self,
+        dispatch: &WsDispatchState,
+        (report, supplied): (OrderStatusReport, Option<ClientOrderId>),
+    ) -> OrderStatusReport {
+        dispatch.preserve_pending_order_status(self.translate(dispatch, (report, supplied)))
+    }
+
+    pub(crate) fn translate(
+        &self,
+        dispatch: &WsDispatchState,
+        (report, supplied): (OrderStatusReport, Option<ClientOrderId>),
+    ) -> OrderStatusReport {
+        let mut report = dispatch.translate_order_cloid(report);
+
+        if let Some(cloid) = supplied {
+            report = report.with_client_order_id(cloid);
+        }
+
+        report
+    }
+}
+
+pub(crate) async fn collect_order(
+    http_client: &LighterHttpClient,
+    registry: &Arc<MarketRegistry>,
+    credential: &Credential,
+    lookup: &OrderReportLookup,
+) -> anyhow::Result<Option<LighterOrder>> {
+    collect_order_while_pending(http_client, registry, credential, lookup, || true).await
+}
+
+pub(crate) async fn collect_order_while_pending(
+    http_client: &LighterHttpClient,
+    registry: &Arc<MarketRegistry>,
+    credential: &Credential,
+    lookup: &OrderReportLookup,
+    is_pending: impl Fn() -> bool,
+) -> anyhow::Result<Option<LighterOrder>> {
+    if !is_pending() {
+        return Ok(None);
+    }
+
+    let market_index = registry
+        .market_index(&lookup.instrument_id)
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "no Lighter market_index for instrument {}",
+                lookup.instrument_id
+            )
+        })?;
+
+    let matches_order = |o: &LighterOrder| {
+        order_matches_lookup(
+            o.order_index,
+            o.client_order_index,
+            lookup.target_venue_index,
+            lookup.target_client_index,
+        )
+    };
+
+    let auth = mint_auth_token(credential)?;
+
+    if let Some(order) = collect_account_order(
+        http_client,
+        credential,
+        lookup,
+        market_index,
+        &auth,
+        &is_pending,
+    )
+    .await?
+    {
+        return Ok(Some(order));
+    }
+
+    if !is_pending() {
+        return Ok(None);
+    }
+
+    let query = Zeroizing::new(LighterAccountActiveOrdersQuery {
+        authorization: None,
+        auth: Some(auth.clone()),
+        account_index: credential.account_index(),
+        market_id: market_index,
+    });
+    let active = http_client
+        .get_account_active_orders(&query)
+        .await
+        .context("failed to fetch Lighter active orders")?;
+
+    if !is_pending() {
+        return Ok(None);
+    }
+
+    let mut active_matches = active.orders.iter().filter(|order| matches_order(order));
+    let active_match = active_matches.next();
+
+    if lookup.target_venue_index.is_none() {
+        anyhow::ensure!(
+            active_matches.next().is_none(),
+            "ambiguous Lighter active-order lookup for client_order_index {}",
+            lookup.target_client_index.unwrap_or_default(),
+        );
+    }
+
+    if let Some(order) = active_match {
+        return Ok(Some(order.clone()));
+    }
+
+    if lookup.target_venue_index.is_none() {
+        // Lighter reuses client indexes, so paginated inactive history cannot safely
+        // identify an order by client index alone.
+        return Ok(None);
+    }
+
+    // Fall back to inactive orders (filled / canceled). Pagination is followed
+    // because a single market can hold more than 200 historical inactive
+    // orders for a long-running account.
+    let mut cursor: Option<String> = None;
+    let mut seen_cursors = AHashSet::new();
+    let mut pages = 0_usize;
+
+    loop {
+        if !is_pending() {
+            return Ok(None);
+        }
+
+        pages += 1;
+        anyhow::ensure!(
+            pages <= MAX_RECONCILIATION_PAGES,
+            "Lighter inactive-order lookup exceeded {MAX_RECONCILIATION_PAGES} pages",
+        );
+        let query = Zeroizing::new(LighterAccountInactiveOrdersQuery {
+            authorization: None,
+            auth: Some(auth.clone()),
+            account_index: credential.account_index(),
+            market_id: Some(market_index),
+            ask_filter: None,
+            between_timestamps: None,
+            cursor: cursor.clone(),
+            limit: LIGHTER_REST_PAGE_SIZE,
+        });
+        let inactive = http_client
+            .get_account_inactive_orders(&query)
+            .await
+            .context("failed to fetch Lighter inactive orders")?;
+
+        if !is_pending() {
+            return Ok(None);
+        }
+
+        for order in &inactive.orders {
+            if matches_order(order) {
+                return Ok(Some(order.clone()));
+            }
+        }
+
+        match inactive.next_cursor {
+            Some(next) if !next.is_empty() => {
+                anyhow::ensure!(
+                    seen_cursors.insert(next.clone()),
+                    "Lighter inactive-order lookup repeated cursor `{next}`",
+                );
+                cursor = Some(next);
+            }
+            _ => break,
+        }
+    }
+
+    Ok(None)
+}
+
+async fn collect_account_order(
+    http_client: &LighterHttpClient,
+    credential: &Credential,
+    lookup: &OrderReportLookup,
+    market_index: i64,
+    auth: &SecretString,
+    is_pending: impl Fn() -> bool,
+) -> anyhow::Result<Option<LighterOrder>> {
+    let Some(client_order_index) = lookup.target_client_index else {
+        return Ok(None);
+    };
+
+    let query = Zeroizing::new(LighterAccountOrdersQuery {
+        authorization: None,
+        auth: Some(auth.clone()),
+        account_index: credential.account_index(),
+        client_order_indexes: vec![client_order_index],
+    });
+
+    let response = match http_client.get_account_orders(&query).await {
+        Ok(response) => response,
+        Err(_) => {
+            log::debug!(
+                "Lighter accountOrders lookup failed, falling back to per-market order queries"
+            );
+            return Ok(None);
+        }
+    };
+
+    if !is_pending() {
+        return Ok(None);
+    }
+
+    let mut matches = response.orders.iter().filter(|order| {
+        if order.market_index != market_index {
+            return false;
+        }
+
+        if lookup.target_venue_index.is_none() && order.status.is_terminal() {
+            return false;
+        }
+
+        order_matches_lookup(
+            order.order_index,
+            order.client_order_index,
+            lookup.target_venue_index,
+            lookup.target_client_index,
+        )
+    });
+
+    let account_match = matches.next();
+
+    if lookup.target_venue_index.is_none() {
+        anyhow::ensure!(
+            matches.next().is_none(),
+            "ambiguous Lighter account-order lookup for client_order_index {client_order_index}",
+        );
+    }
+
+    if let Some(order) = account_match {
+        return Ok(Some(order.clone()));
+    }
+
+    Ok(None)
+}
+
+fn order_matches_lookup(
+    order_index: i64,
+    client_order_index: i64,
+    target_venue_index: Option<i64>,
+    target_client_index: Option<i64>,
+) -> bool {
+    match target_venue_index {
+        Some(target) => order_index == target,
+        None => target_client_index == Some(client_order_index),
+    }
+}
+
+fn mint_auth_token(credential: &Credential) -> anyhow::Result<SecretString> {
+    build_auth_token_for(credential).context("failed to mint Lighter auth token for order lookup")
+}
+
+/// Translate a Nautilus [`TimeInForce`] into the venue's `LighterTimeInForce`.
+///
+/// For limit-style orders, `Day` is mapped through `GoodTillTime` because
+/// the venue has no `DAY` concept; the engine handles end-of-day expiry on
+/// the client side.
+///
+/// `post_only` overrides the TIF mapping when set: Lighter exposes a
+/// dedicated `PostOnly` TIF (slot 2) which the venue treats as a maker-only
+/// order, so post-only takes precedence over the order's nominal TIF.
+///
+/// Plain market orders use IOC on the wire. Conditional market orders
+/// (`STOP_MARKET` / `MARKET_IF_TOUCHED`) also use IOC as the post-trigger
+/// execution instruction, but their trigger lifetime is controlled by a
+/// positive `OrderExpiry`.
+///
+/// FOK ("fill or kill") is rejected because Lighter has no native
+/// fill-or-kill primitive: routing FOK as IOC would let a partial fill
+/// satisfy the request, violating the FOK guarantee.
+pub(crate) fn nautilus_to_lighter_tif(
+    order_type: OrderType,
+    tif: TimeInForce,
+    post_only: bool,
+) -> anyhow::Result<LighterTimeInForce> {
+    if post_only {
+        return Ok(LighterTimeInForce::PostOnly);
+    }
+
+    if order_type == OrderType::Market {
+        return match tif {
+            TimeInForce::Gtc | TimeInForce::Ioc => Ok(LighterTimeInForce::ImmediateOrCancel),
+            TimeInForce::Fok => anyhow::bail!(
+                "Lighter has no fill-or-kill TIF; reject FOK at the strategy or use IOC explicitly",
+            ),
+            other => anyhow::bail!(
+                "Lighter market orders support only TimeInForce::Gtc or TimeInForce::Ioc, was TimeInForce::{other:?}",
+            ),
+        };
+    }
+
+    if is_conditional_market_order(order_type) {
+        return match tif {
+            TimeInForce::Gtc | TimeInForce::Day | TimeInForce::Gtd => {
+                Ok(LighterTimeInForce::ImmediateOrCancel)
+            }
+            TimeInForce::Ioc => anyhow::bail!(
+                "Lighter conditional market orders require a positive expiry; Nautilus IOC cannot be represented because the venue uses IOC for post-trigger execution",
+            ),
+            TimeInForce::Fok => anyhow::bail!(
+                "Lighter has no fill-or-kill TIF; reject FOK at the strategy or use IOC explicitly",
+            ),
+            other => anyhow::bail!(
+                "Lighter conditional market orders do not support TimeInForce::{other:?}",
+            ),
+        };
+    }
+
+    match tif {
+        TimeInForce::Ioc => Ok(LighterTimeInForce::ImmediateOrCancel),
+        TimeInForce::Fok => anyhow::bail!(
+            "Lighter has no fill-or-kill TIF; reject FOK at the strategy or use IOC explicitly",
+        ),
+        TimeInForce::Gtc | TimeInForce::Day | TimeInForce::Gtd => {
+            Ok(LighterTimeInForce::GoodTillTime)
+        }
+        other => anyhow::bail!("Lighter does not support TimeInForce::{other:?}"),
+    }
+}
+
+/// Translate a Nautilus [`OrderType`] into the venue's [`LighterOrderType`]
+/// discriminant for use in `CreateOrder` tx bodies.
+pub(crate) fn nautilus_to_lighter_order_type(
+    order_type: OrderType,
+) -> anyhow::Result<LighterOrderType> {
+    LighterOrderType::try_from(order_type)
+        .map_err(|e| anyhow::anyhow!("unsupported Nautilus order type for Lighter: {e}"))
+}
+
+/// Compute the venue-side `order_expiry` (millis) for a Nautilus order.
+///
+/// - `MARKET`: `ORDER_EXPIRY_IOC` (`0`) because it has no resting trigger
+///   lifetime.
+/// - Conditional orders: positive expiry from `GTD` or the default GTC window.
+///   Lighter uses `TimeInForce` as the post-trigger execution instruction,
+///   while `OrderExpiry` controls how long the trigger can rest.
+/// - `Gtd` with an explicit expire_time: the millisecond timestamp, provided
+///   it is within the venue's 5-minute to 30-day lifetime range. When
+///   `use_gtd` is false, the strategy expiry must fit within the venue's
+///   default 28-day fallback window; the strategy's local GTD manager
+///   (`manage_gtd_expiry`) sends the cancel. The native 5-minute lower bound
+///   is intentionally not applied in this mode.
+/// - `Ioc` / `Fok`: `ORDER_EXPIRY_IOC` (`0`): Lighter requires this exact
+///   value for IOC semantics; any other value is rejected by the sequencer.
+/// - `Gtc` / `Day` / `Gtd` without expiry: `now_ms + ORDER_EXPIRY_DEFAULT_GTC_MS`.
+///   The adapter uses an explicit 28-day expiry for these TIFs because the
+///   venue has rejected `-1` with `21711 invalid expiry`.
+pub(crate) fn order_expiry_for(
+    order_type: OrderType,
+    tif: &TimeInForce,
+    expire_time: Option<UnixNanos>,
+    now_ms: i64,
+    use_gtd: bool,
+) -> anyhow::Result<i64> {
+    if order_type == OrderType::Market {
+        return Ok(ORDER_EXPIRY_IOC);
+    }
+
+    if matches!(tif, TimeInForce::Gtd)
+        && let Some(ts) = expire_time
+    {
+        let expiry_ms = (ts.as_u64() / 1_000_000) as i64;
+
+        if !use_gtd {
+            // Lighter has no GTC wire discriminant for resting limit orders: the
+            // venue TIF stays `GoodTillTime`. The strategy expiry must fit in
+            // the fallback window so the venue cannot cancel it first. The
+            // local manager still owns the actual strategy expiry, including
+            // expiries shorter than the venue's native minimum.
+            let default_expiry_ms = now_ms.saturating_add(ORDER_EXPIRY_DEFAULT_GTC_MS);
+            anyhow::ensure!(
+                expiry_ms <= default_expiry_ms,
+                "Lighter locally managed GTD expire_time must be no more than 28 days from now; use native GTD for longer expiries",
+            );
+            log::warn!(
+                "Lighter GTD submitted with default expiry because use_gtd=false. Enable manage_gtd_expiry on the submitting strategy"
+            );
+            return Ok(default_expiry_ms);
+        }
+
+        let min_expiry_ms = now_ms.saturating_add(ORDER_EXPIRY_MIN_GTD_MS);
+        let max_expiry_ms = now_ms.saturating_add(ORDER_EXPIRY_MAX_GTD_MS);
+        anyhow::ensure!(
+            expiry_ms >= min_expiry_ms,
+            "Lighter GTD expire_time must be at least 5 minutes from now (plus 1 second transport margin)",
+        );
+        anyhow::ensure!(
+            expiry_ms <= max_expiry_ms,
+            "Lighter GTD expire_time must be no more than 30 days from now",
+        );
+        return Ok(expiry_ms);
+    }
+
+    if is_conditional_order(order_type) && matches!(tif, TimeInForce::Ioc) {
+        return Ok(now_ms.saturating_add(ORDER_EXPIRY_DEFAULT_GTC_MS));
+    }
+
+    if matches!(tif, TimeInForce::Ioc | TimeInForce::Fok) {
+        return Ok(ORDER_EXPIRY_IOC);
+    }
+
+    Ok(now_ms.saturating_add(ORDER_EXPIRY_DEFAULT_GTC_MS))
+}
+
+fn is_conditional_market_order(order_type: OrderType) -> bool {
+    matches!(
+        order_type,
+        OrderType::StopMarket | OrderType::MarketIfTouched
+    )
+}
+
+fn is_conditional_order(order_type: OrderType) -> bool {
+    matches!(
+        order_type,
+        OrderType::StopMarket
+            | OrderType::StopLimit
+            | OrderType::MarketIfTouched
+            | OrderType::LimitIfTouched
+    )
+}
+
+/// Convert a Nautilus [`Quantity`] to the venue's signed-i64 base-asset tick
+/// representation, given the instrument's size precision.
+pub(crate) fn quantity_to_ticks(quantity: &Quantity, decimals: u8) -> anyhow::Result<i64> {
+    let scaled = quantity.as_decimal() * Decimal::from(10_i64.pow(u32::from(decimals)));
+    decimal_trunc_to_i64(scaled)
+        .with_context(|| format!("quantity `{quantity}` overflows i64 at precision {decimals}"))
+}
+
+/// Convert a Nautilus [`Price`] to the venue's `u32` quote-asset tick
+/// representation, given the instrument's price precision.
+pub(crate) fn price_to_ticks(price: &Price, decimals: u8) -> anyhow::Result<u32> {
+    let scaled = price.as_decimal() * Decimal::from(10_i64.pow(u32::from(decimals)));
+    let value = decimal_trunc_to_i64(scaled)
+        .with_context(|| format!("price `{price}` overflows i64 at precision {decimals}"))?;
+    u32::try_from(value).with_context(|| {
+        format!("price `{price}` overflows u32 (Lighter limit) at precision {decimals}")
+    })
+}
+
+/// Truncate a [`Decimal`] toward zero and convert to `i64`, returning an
+/// error if the truncated value does not fit. Avoids the
+/// `decimal.to_string().split('.').parse()` round-trip the previous
+/// implementations used; runs on every exec submit and modify.
+fn decimal_trunc_to_i64(value: Decimal) -> anyhow::Result<i64> {
+    value
+        .trunc()
+        .to_i64()
+        .ok_or_else(|| anyhow::anyhow!("decimal `{value}` does not fit in i64"))
+}
+
+/// Derive a worst-acceptable price (in venue ticks) for `MARKET` /
+/// `STOP_MARKET` / `MARKET_IF_TOUCHED` orders. Buys widen `base` upward,
+/// sells downward, by `slippage_bps`; the result rounds conservatively at
+/// `price_precision` so the venue cap never under-shoots the budget.
+pub(crate) fn derive_market_order_price_ticks(
+    base: Decimal,
+    is_buy: bool,
+    price_precision: u8,
+    slippage_bps: u32,
+) -> anyhow::Result<u32> {
+    let slippage = Decimal::new(i64::from(slippage_bps), 4);
+    let widened = if is_buy {
+        base * (Decimal::ONE + slippage)
+    } else {
+        base * (Decimal::ONE - slippage)
+    };
+
+    let scale = Decimal::from(10_i64.pow(u32::from(price_precision)));
+    let scaled = widened * scale;
+    let rounded = if is_buy {
+        scaled.ceil()
+    } else {
+        scaled.floor()
+    };
+    let value = decimal_trunc_to_i64(rounded).with_context(|| {
+        format!("derived market price `{widened}` overflows i64 at precision {price_precision}",)
+    })?;
+
+    // Lighter rejects `price = 0` as `21702 invalid price`.
+    anyhow::ensure!(
+        value > 0,
+        "derived market price `{widened}` rounds to 0 ticks at precision {price_precision} (slippage_bps={slippage_bps}); reduce slippage or increase price precision",
+    );
+    u32::try_from(value).with_context(|| {
+        format!("derived market price `{widened}` overflows u32 at precision {price_precision}",)
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{future::Future, str::FromStr};
+
+    use nautilus_core::UUID4;
+    use nautilus_model::{
+        enums::{AccountType, LiquiditySide, OrderSide, OrderStatus, OrderType, PositionSide},
+        identifiers::{AccountId, StrategyId, TradeId, TraderId},
+        orders::Order,
+        reports::FillReport,
+        types::Money,
+    };
+    use rstest::rstest;
+
+    use super::*;
+
+    impl WsDispatchState {
+        pub(crate) fn set_pending_order_action(
+            &self,
+            cloid: ClientOrderId,
+            action: PendingOrderAction,
+        ) {
+            let mut state =
+                self.pending_order_actions
+                    .entry(cloid)
+                    .or_insert(PendingOrderActionState {
+                        action,
+                        submission: None,
+                        modify: None,
+                        cancel_commands: Vec::new(),
+                    });
+
+            state.action = action;
+            state.submission = None;
+        }
+
+        pub(crate) fn clear_pending_order_action_if(
+            &self,
+            cloid: &ClientOrderId,
+            action: PendingOrderAction,
+        ) -> bool {
+            let Entry::Occupied(mut entry) = self.pending_order_actions.entry(*cloid) else {
+                return false;
+            };
+
+            if entry.get().action != action {
+                return false;
+            }
+
+            if action != PendingOrderAction::Modify && entry.get().modify.is_some() {
+                entry.get_mut().action = PendingOrderAction::Modify;
+                entry.get_mut().submission = None;
+            } else {
+                entry.remove();
+            }
+
+            true
+        }
+
+        pub(crate) fn set_pending_cancel_nonce(
+            &self,
+            cloid: &ClientOrderId,
+            connection_epoch: u64,
+            nonce: i64,
+            emit_cancel_rejected: bool,
+        ) {
+            if let Some(mut state) = self.pending_order_actions.get_mut(cloid)
+                && state.action == PendingOrderAction::cancel(emit_cancel_rejected)
+            {
+                if state
+                    .submission
+                    .as_ref()
+                    .is_some_and(|submission| submission.identity == (connection_epoch, nonce))
+                {
+                    return;
+                }
+
+                state.submission = Some(PendingCancel {
+                    command_id: UUID4::new(),
+                    identity: (connection_epoch, nonce),
+                    cancellation: CancellationToken::new().drop_guard(),
+                });
+            }
+        }
+    }
+
+    fn cloid(s: &str) -> ClientOrderId {
+        ClientOrderId::new(s)
+    }
+
+    fn voi(s: &str) -> VenueOrderId {
+        VenueOrderId::new(s)
+    }
+
+    fn stub_open_order_status_report(client_order_id_str: &str) -> OrderStatusReport {
+        OrderStatusReport::new(
+            AccountId::from("LIGHTER-TEST"),
+            InstrumentId::from("ETH-PERP.LIGHTER"),
+            Some(ClientOrderId::new(client_order_id_str)),
+            VenueOrderId::new("281476929510110"),
+            OrderSide::Sell.into(),
+            OrderType::Limit,
+            TimeInForce::Gtc,
+            OrderStatus::Accepted,
+            Quantity::from("0.01"),
+            Quantity::from("0"),
+            UnixNanos::from(1),
+            UnixNanos::from(2),
+            UnixNanos::from(3),
+            None,
+        )
+    }
+
+    fn stub_canceled_status_report(client_order_id_str: &str) -> OrderStatusReport {
+        let mut r = stub_open_order_status_report(client_order_id_str);
+        r.order_status = OrderStatus::Canceled;
+        r
+    }
+
+    fn stub_position_report(instrument: &str, qty: &str) -> PositionStatusReport {
+        PositionStatusReport::new(
+            AccountId::from("LIGHTER-TEST"),
+            InstrumentId::from(instrument),
+            PositionSide::Long,
+            Quantity::from(qty),
+            UnixNanos::from(1),
+            UnixNanos::from(2),
+            None,
+            None,
+            None,
+        )
+    }
+
+    /// `snapshots` are applied in order; the cache is queried with `filter`
+    /// after the last and compared against `expected`.
+    #[rstest]
+    #[case::empty_unfiltered(vec![vec![]], None, vec![])]
+    #[case::empty_filtered(vec![vec![]], Some("ETH-PERP.LIGHTER"), vec![])]
+    #[case::single_unfiltered(
+        vec![vec![("ETH-PERP.LIGHTER", "1.5")]],
+        None,
+        vec![("ETH-PERP.LIGHTER", "1.5")],
+    )]
+    #[case::single_filtered_matching(
+        vec![vec![("ETH-PERP.LIGHTER", "1.5")]],
+        Some("ETH-PERP.LIGHTER"),
+        vec![("ETH-PERP.LIGHTER", "1.5")],
+    )]
+    #[case::single_filtered_nonmatching(
+        vec![vec![("ETH-PERP.LIGHTER", "1.5")]],
+        Some("DOGE-PERP.LIGHTER"),
+        vec![],
+    )]
+    #[case::successive_snapshots_overwrite_same_instrument(
+        vec![
+            vec![("ETH-PERP.LIGHTER", "1.5")],
+            vec![("ETH-PERP.LIGHTER", "2.5")],
+        ],
+        None,
+        vec![("ETH-PERP.LIGHTER", "2.5")],
+    )]
+    #[case::multi_instrument_filter_matches_one(
+        vec![vec![("ETH-PERP.LIGHTER", "1.0"), ("BTC-PERP.LIGHTER", "0.1")]],
+        Some("BTC-PERP.LIGHTER"),
+        vec![("BTC-PERP.LIGHTER", "0.1")],
+    )]
+    #[case::closed_position_evicted_by_subsequent_snapshot(
+        vec![
+            vec![("ETH-PERP.LIGHTER", "1.0"), ("BTC-PERP.LIGHTER", "0.1")],
+            vec![("BTC-PERP.LIGHTER", "0.1")],
+        ],
+        None,
+        vec![("BTC-PERP.LIGHTER", "0.1")],
+    )]
+    #[case::all_positions_closed_by_empty_snapshot(
+        vec![
+            vec![("ETH-PERP.LIGHTER", "1.0")],
+            vec![],
+        ],
+        None,
+        vec![],
+    )]
+    fn replace_positions_matrix(
+        #[case] snapshots: Vec<Vec<(&str, &str)>>,
+        #[case] filter: Option<&str>,
+        #[case] expected: Vec<(&str, &str)>,
+    ) {
+        let state = WsDispatchState::new();
+
+        for snapshot in snapshots {
+            let frame: Vec<PositionStatusReport> = snapshot
+                .into_iter()
+                .map(|(instrument, qty)| stub_position_report(instrument, qty))
+                .collect();
+            state.replace_position_snapshot(&frame, &[], &[]);
+        }
+
+        let (mut result, _) = state.snapshot_positions_with_coverage();
+        if let Some(instrument_id) = filter.map(InstrumentId::from) {
+            result.retain(|report| report.instrument_id == instrument_id);
+        }
+
+        let mut actual: Vec<(String, String)> = result
+            .into_iter()
+            .map(|r| (r.instrument_id.to_string(), r.quantity.to_string()))
+            .collect();
+        let mut expected_owned: Vec<(String, String)> = expected
+            .into_iter()
+            .map(|(i, q)| (i.to_string(), q.to_string()))
+            .collect();
+        actual.sort();
+        expected_owned.sort();
+        assert_eq!(actual, expected_owned);
+    }
+
+    #[rstest]
+    fn replace_positions_with_empty_input_clears_cache() {
+        // Anchors the contract the consumption loop relies on for the
+        // `Reconnected` and `connect()` cache-drop paths.
+        let state = WsDispatchState::new();
+        state.replace_position_snapshot(
+            &[stub_position_report("ETH-PERP.LIGHTER", "1.0")],
+            &[],
+            &[],
+        );
+        assert_eq!(state.snapshot_positions_with_coverage().0.len(), 1);
+
+        state.replace_position_snapshot(&[], &[], &[]);
+
+        assert!(state.snapshot_positions_with_coverage().0.is_empty());
+    }
+
+    #[rstest]
+    fn replace_positions_except_keeps_only_retained_absent_positions() {
+        let state = WsDispatchState::new();
+        state.replace_position_snapshot(
+            &[
+                stub_position_report("ETH-PERP.LIGHTER", "1.0"),
+                stub_position_report("BTC-PERP.LIGHTER", "2.0"),
+                stub_position_report("DOGE-PERP.LIGHTER", "4.0"),
+            ],
+            &[],
+            &[],
+        );
+
+        let removed = state.replace_position_snapshot(
+            &[stub_position_report("ETH-PERP.LIGHTER", "3.0")],
+            &[InstrumentId::from("BTC-PERP.LIGHTER")],
+            &[],
+        );
+
+        let mut actual: Vec<(String, String)> = state
+            .snapshot_positions_with_coverage()
+            .0
+            .into_iter()
+            .map(|r| (r.instrument_id.to_string(), r.quantity.to_string()))
+            .collect();
+        actual.sort();
+
+        assert_eq!(removed, vec![InstrumentId::from("DOGE-PERP.LIGHTER")]);
+        assert_eq!(
+            actual,
+            vec![
+                ("BTC-PERP.LIGHTER".to_string(), "2.0".to_string()),
+                ("ETH-PERP.LIGHTER".to_string(), "3.0".to_string()),
+            ],
+        );
+    }
+
+    #[rstest]
+    fn update_positions_merges_rows_and_removes_only_explicit_closures() {
+        let state = WsDispatchState::new();
+        state.replace_position_snapshot(
+            &[
+                stub_position_report("ETH-PERP.LIGHTER", "1.0"),
+                stub_position_report("BTC-PERP.LIGHTER", "2.0"),
+            ],
+            &[],
+            &[],
+        );
+
+        let removed = state.apply_position_update(
+            &[stub_position_report("ETH-PERP.LIGHTER", "3.0")],
+            &[InstrumentId::from("DOGE-PERP.LIGHTER")],
+            &[],
+            &[],
+        );
+
+        assert!(removed.is_empty());
+        let mut actual: Vec<(String, String)> = state
+            .snapshot_positions_with_coverage()
+            .0
+            .into_iter()
+            .map(|report| {
+                (
+                    report.instrument_id.to_string(),
+                    report.quantity.to_string(),
+                )
+            })
+            .collect();
+        actual.sort();
+        assert_eq!(
+            actual,
+            vec![
+                ("BTC-PERP.LIGHTER".to_string(), "2.0".to_string()),
+                ("ETH-PERP.LIGHTER".to_string(), "3.0".to_string()),
+            ],
+        );
+
+        let removed =
+            state.apply_position_update(&[], &[InstrumentId::from("BTC-PERP.LIGHTER")], &[], &[]);
+
+        assert_eq!(removed, vec![InstrumentId::from("BTC-PERP.LIGHTER")]);
+        let positions = state.snapshot_positions_with_coverage().0;
+        assert_eq!(positions.len(), 1);
+        assert_eq!(
+            positions[0].instrument_id,
+            InstrumentId::from("ETH-PERP.LIGHTER")
+        );
+        assert_eq!(positions[0].quantity, Quantity::from("3.0"));
+    }
+
+    #[rstest]
+    fn derive_client_order_index_is_deterministic_within_state() {
+        let state = WsDispatchState::new();
+        let cid = cloid("MY-ORDER-001");
+        let a = state.derive_client_order_index(&cid);
+        let b = state.derive_client_order_index(&cid);
+        assert_eq!(a, b);
+        assert!(a >= 0, "derived index must be non-negative");
+    }
+
+    #[rstest]
+    fn derive_client_order_index_is_stable_across_instances() {
+        // The hasher uses a fixed seed so a fresh client (after a process
+        // restart) derives the same `client_order_index` for the same
+        // ClientOrderId. Without this, REST-based query_order cannot
+        // recover orders submitted by a prior instance.
+        let cid = cloid("RESTART-RECOVERY-ORDER");
+        let a = WsDispatchState::new().derive_client_order_index(&cid);
+        let b = WsDispatchState::new().derive_client_order_index(&cid);
+        assert_eq!(a, b);
+    }
+
+    #[rstest]
+    fn derive_client_order_index_separates_distinct_cloids() {
+        let state = WsDispatchState::new();
+        let a = state.derive_client_order_index(&cloid("ORDER-A"));
+        let b = state.derive_client_order_index(&cloid("ORDER-B"));
+        assert_ne!(a, b, "distinct cloids should map to distinct indexes");
+    }
+
+    #[rstest]
+    fn register_cloid_returns_index_on_first_registration() {
+        let state = WsDispatchState::new();
+        let cid = cloid("ORDER-A");
+        let derived = state.derive_client_order_index(&cid);
+
+        let chosen = state.register_cloid(derived, cid).unwrap();
+
+        assert_eq!(chosen, derived);
+        assert_eq!(state.cloid_map.get(&chosen).map(|e| *e.value()), Some(cid));
+    }
+
+    #[rstest]
+    fn register_cloid_is_idempotent_for_same_cloid() {
+        // A retry of the same submit must reuse the assigned slot, not
+        // probe forward (which would waste 31-bit space and break the
+        // reverse lookup for the venue's echo).
+        let state = WsDispatchState::new();
+        let cid = cloid("ORDER-A");
+        let derived = state.derive_client_order_index(&cid);
+
+        let first = state.register_cloid(derived, cid).unwrap();
+        let second = state.register_cloid(derived, cid).unwrap();
+
+        assert_eq!(first, second);
+        assert_eq!(state.cloid_map.len(), 1);
+    }
+
+    #[rstest]
+    fn register_cloid_probes_forward_on_collision() {
+        // Two distinct cloids with the same derived index: the second must
+        // probe to a different slot rather than overwrite the first.
+        let state = WsDispatchState::new();
+        let first_cid = cloid("ORDER-A");
+        let second_cid = cloid("ORDER-B");
+        // Force a collision by inserting at the same index the second
+        // registration will derive.
+        let collision_index = 42;
+        state.cloid_map.insert(collision_index, first_cid);
+
+        let chosen = state.register_cloid(collision_index, second_cid).unwrap();
+
+        assert_ne!(
+            chosen, collision_index,
+            "collided second cloid must land in a distinct slot",
+        );
+        assert_eq!(
+            state.cloid_map.get(&collision_index).map(|e| *e.value()),
+            Some(first_cid),
+        );
+        assert_eq!(
+            state.cloid_map.get(&chosen).map(|e| *e.value()),
+            Some(second_cid)
+        );
+    }
+
+    #[rstest]
+    fn register_cloid_probe_exhaustion_preserves_existing_mappings() {
+        let state = WsDispatchState::new();
+        let initial_index = 42;
+        let existing: Vec<_> = (0..=CLOID_INDEX_PROBE_LIMIT)
+            .map(|attempt| {
+                let index = initial_index + i64::try_from(attempt).unwrap();
+                let cid = cloid(&format!("EXISTING-{attempt}"));
+                state.cloid_map.insert(index, cid);
+                (index, cid)
+            })
+            .collect();
+
+        let result = state.register_cloid(initial_index, cloid("NEW-ORDER"));
+
+        assert!(result.is_err());
+        assert_eq!(state.cloid_map.len(), existing.len());
+        for (index, cid) in existing {
+            assert_eq!(
+                state.cloid_map.get(&index).map(|entry| *entry.value()),
+                Some(cid),
+            );
+        }
+    }
+
+    #[rstest]
+    fn store_snapshot_is_idempotent_for_same_shape() {
+        // The dispatcher compares against the stored snapshot to decide
+        // whether an Open frame is a modify ack. Storing the same shape
+        // twice must surface no diff.
+        let state = WsDispatchState::new();
+        let cid = cloid("SNAPSHOT-CLOID");
+        let shape = OrderShapeSnapshot {
+            quantity: Quantity::from("0.01"),
+            price: Some(Price::from("2352.74")),
+            trigger_price: None,
+        };
+
+        state.store_snapshot(cid, shape.clone());
+
+        assert_eq!(state.snapshot_for(&cid).as_ref(), Some(&shape));
+    }
+
+    #[rstest]
+    fn store_snapshot_replaces_on_modify() {
+        let state = WsDispatchState::new();
+        let cid = cloid("SNAPSHOT-CLOID-2");
+        let first = OrderShapeSnapshot {
+            quantity: Quantity::from("0.01"),
+            price: Some(Price::from("2352.74")),
+            trigger_price: None,
+        };
+        let second = OrderShapeSnapshot {
+            quantity: Quantity::from("0.02"),
+            price: Some(Price::from("2400.00")),
+            trigger_price: None,
+        };
+
+        state.store_snapshot(cid, first);
+        state.store_snapshot(cid, second.clone());
+
+        assert_eq!(state.snapshot_for(&cid).as_ref(), Some(&second));
+    }
+
+    #[rstest]
+    fn triggered_emitted_dedupes_repeats() {
+        let state = WsDispatchState::new();
+        let cid = cloid("TRIGGER-CLOID");
+
+        assert!(state.mark_triggered_emitted(cid), "first mark inserts");
+        assert!(
+            !state.mark_triggered_emitted(cid),
+            "second mark is suppressed",
+        );
+        assert!(state.triggered_was_emitted(&cid));
+    }
+
+    #[rstest]
+    fn trade_dedup_cache_evicts_oldest_marker() {
+        let dedup = TradeDedupCache::new(2);
+        let first = TradeId::new("1");
+        let second = TradeId::new("2");
+        let third = TradeId::new("3");
+
+        dedup.insert(first, TradeDedupSource::Live);
+        dedup.insert(second, TradeDedupSource::Live);
+        dedup.insert(third, TradeDedupSource::Live);
+
+        assert!(!dedup.contains(&first));
+        assert!(dedup.contains(&second));
+        assert!(dedup.contains(&third));
+    }
+
+    #[rstest]
+    fn retired_order_cache_evicts_oldest_identity_and_index() {
+        let cache = RetiredOrderCache::new(2);
+        let identities = [
+            (cloid("RETIRED-1"), 1),
+            (cloid("RETIRED-2"), 2),
+            (cloid("RETIRED-3"), 3),
+        ];
+
+        for (cid, index) in identities {
+            cache.insert(
+                cid,
+                OrderIdentity::new(
+                    InstrumentId::from("ETH-PERP.LIGHTER"),
+                    StrategyId::new("S-T"),
+                    OrderSide::Buy,
+                    OrderType::Limit,
+                    index,
+                ),
+            );
+        }
+
+        assert_eq!(cache.cloid_for_index(1), None);
+        assert!(cache.identity_for_cloid(&cloid("RETIRED-1")).is_none());
+        assert_eq!(cache.cloid_for_index(2), Some(cloid("RETIRED-2")));
+        assert_eq!(cache.cloid_for_index(3), Some(cloid("RETIRED-3")));
+    }
+
+    #[rstest]
+    fn register_cloid_does_not_reuse_retired_index() {
+        let state = WsDispatchState::new();
+        let retired = cloid("RETIRED");
+        let replacement = cloid("REPLACEMENT");
+        let retired_index = 42;
+
+        state.register_cloid(retired_index, retired).unwrap();
+        state.register_order_identity(
+            retired,
+            OrderIdentity::new(
+                InstrumentId::from("ETH-PERP.LIGHTER"),
+                StrategyId::new("S-T"),
+                OrderSide::Buy,
+                OrderType::Limit,
+                retired_index,
+            ),
+        );
+        state.retire_order_identity(&retired);
+
+        let chosen = state.register_cloid(retired_index, replacement).unwrap();
+
+        assert_ne!(chosen, retired_index);
+        assert_eq!(
+            state.resolve_client_order_index(retired_index),
+            Some(retired)
+        );
+        assert_eq!(state.resolve_client_order_index(chosen), Some(replacement));
+    }
+
+    #[rstest]
+    fn seed_accepted_from_report_requires_tracked_identity() {
+        let state = WsDispatchState::new();
+        let cid = cloid("REPORT-ACCEPTED");
+        let report = stub_open_order_status_report(cid.as_str());
+
+        state.seed_accepted_from_report(&report);
+        assert!(!state.accepted_was_emitted(&cid));
+
+        state.register_order_identity(
+            cid,
+            OrderIdentity::new(
+                InstrumentId::from("ETH-PERP.LIGHTER"),
+                StrategyId::new("S-T"),
+                OrderSide::Buy,
+                OrderType::Limit,
+                1,
+            ),
+        );
+        state.seed_accepted_from_report(&report);
+
+        assert!(state.accepted_was_emitted(&cid));
+    }
+
+    #[rstest]
+    #[case::submitted(OrderStatus::Submitted)]
+    #[case::pending_update(OrderStatus::PendingUpdate)]
+    #[case::pending_cancel(OrderStatus::PendingCancel)]
+    #[case::accepted(OrderStatus::Accepted)]
+    #[case::triggered(OrderStatus::Triggered)]
+    #[case::partially_filled(OrderStatus::PartiallyFilled)]
+    #[case::filled(OrderStatus::Filled)]
+    #[case::canceled(OrderStatus::Canceled)]
+    #[case::expired(OrderStatus::Expired)]
+    fn seed_accepted_from_report_marks_accepted_lifecycle_statuses(#[case] status: OrderStatus) {
+        let state = WsDispatchState::new();
+        let cid = ClientOrderId::new(format!("REPORT-{status:?}"));
+        state.register_order_identity(
+            cid,
+            OrderIdentity::new(
+                InstrumentId::from("ETH-PERP.LIGHTER"),
+                StrategyId::new("S-T"),
+                OrderSide::Buy,
+                OrderType::Limit,
+                1,
+            ),
+        );
+
+        let mut report = stub_open_order_status_report(cid.as_str());
+        report.order_status = status;
+        state.seed_accepted_from_report(&report);
+
+        assert!(state.accepted_was_emitted(&cid));
+    }
+
+    #[rstest]
+    fn seed_accepted_from_report_skips_rejected_report() {
+        let state = WsDispatchState::new();
+        let cid = cloid("REPORT-REJECTED");
+        state.register_order_identity(
+            cid,
+            OrderIdentity::new(
+                InstrumentId::from("ETH-PERP.LIGHTER"),
+                StrategyId::new("S-T"),
+                OrderSide::Buy,
+                OrderType::Limit,
+                1,
+            ),
+        );
+
+        let mut report = stub_open_order_status_report(cid.as_str());
+        report.order_status = OrderStatus::Rejected;
+        state.seed_accepted_from_report(&report);
+
+        assert!(!state.accepted_was_emitted(&cid));
+    }
+
+    #[rstest]
+    fn accepted_state_survives_more_than_ten_thousand_newer_orders() {
+        let state = WsDispatchState::new();
+        let early = cloid("EARLY-RESTING-ORDER");
+        state.register_order_identity(
+            early,
+            OrderIdentity::new(
+                InstrumentId::from("ETH-PERP.LIGHTER"),
+                StrategyId::new("S-T"),
+                OrderSide::Buy,
+                OrderType::Limit,
+                1,
+            ),
+        );
+        assert!(state.claim_accepted_emission(&early));
+
+        for index in 2..=10_002 {
+            let newer = ClientOrderId::new(format!("NEWER-{index}"));
+            state.register_order_identity(
+                newer,
+                OrderIdentity::new(
+                    InstrumentId::from("ETH-PERP.LIGHTER"),
+                    StrategyId::new("S-T"),
+                    OrderSide::Buy,
+                    OrderType::Limit,
+                    index,
+                ),
+            );
+            assert!(state.claim_accepted_emission(&newer));
+        }
+
+        assert!(state.accepted_was_emitted(&early));
+        assert!(
+            !state.claim_accepted_emission(&early),
+            "the still-active early order must not emit a second OrderAccepted",
+        );
+    }
+
+    #[rstest]
+    fn active_context_survives_terminal_and_trade_replay_eviction() {
+        let mut state = WsDispatchState::new();
+        state.retired_orders = Arc::new(RetiredOrderCache::new(2));
+        state.seen_trade_ids = Arc::new(TradeDedupCache::new(2));
+        let active = cloid("ACTIVE-CONTEXT");
+        let instrument_id = InstrumentId::from("ETH-PERP.LIGHTER");
+        let strategy_id = StrategyId::from("REPLAY-001");
+        let venue_order_id = VenueOrderId::from("501");
+
+        let identity = OrderIdentity::new(
+            instrument_id,
+            strategy_id,
+            OrderSide::Sell,
+            OrderType::StopLimit,
+            1,
+        );
+
+        let shape = OrderShapeSnapshot {
+            quantity: Quantity::from("0.0420"),
+            price: Some(Price::from("2345.67")),
+            trigger_price: Some(Price::from("2350.12")),
+        };
+
+        state.register_cloid(1, active).unwrap();
+        state.register_order_identity(active, identity.clone());
+        state.mark_order_submission(&active, 41);
+        state.store_snapshot(active, shape.clone());
+        assert_eq!(
+            state.resolve_live_order_cloid("1", venue_order_id),
+            Some(active)
+        );
+        assert!(state.claim_accepted_emission(&active));
+        assert!(state.mark_triggered_emitted(active));
+
+        for index in 2..=4 {
+            let retired = ClientOrderId::new(format!("RETIRED-{index}"));
+            state.register_cloid(index, retired).unwrap();
+            state.register_order_identity(
+                retired,
+                OrderIdentity::new(
+                    instrument_id,
+                    strategy_id,
+                    OrderSide::Buy,
+                    OrderType::Limit,
+                    index,
+                ),
+            );
+            state.retire_order_identity(&retired);
+            assert!(state.mark_trade_seen(TradeId::new(index.to_string())));
+        }
+
+        assert!(
+            state
+                .retired_orders
+                .identity_for_cloid(&cloid("RETIRED-2"))
+                .is_none()
+        );
+        assert!(!state.seen_trade_ids.contains(&TradeId::from("2")));
+        let retained = state.order_identities.get(&active).unwrap();
+        assert!(retained.shares_submission(&identity));
+        assert_eq!(retained.instrument_id, instrument_id);
+        assert_eq!(retained.strategy_id, strategy_id);
+        assert_eq!(retained.order_side, OrderSide::Sell);
+        assert_eq!(retained.order_type, OrderType::StopLimit);
+        assert_eq!(retained.client_order_index, 1);
+        assert_eq!(retained.venue_order_id(), Some(venue_order_id));
+        assert_eq!(state.snapshot_for(&active), Some(shape));
+        assert_eq!(
+            state.resolve_client_order_index_for_venue(1, venue_order_id),
+            Some(active)
+        );
+        assert!(state.accepted_was_emitted(&active));
+        assert!(state.triggered_was_emitted(&active));
+        assert!(!state.claim_accepted_emission(&active));
+    }
+
+    #[rstest]
+    fn seed_accepted_from_report_marks_submitted_report() {
+        let state = WsDispatchState::new();
+        let cid = cloid("REPORT-SUBMITTED");
+        state.register_order_identity(
+            cid,
+            OrderIdentity::new(
+                InstrumentId::from("ETH-PERP.LIGHTER"),
+                StrategyId::new("S-T"),
+                OrderSide::Buy,
+                OrderType::Limit,
+                1,
+            ),
+        );
+
+        let mut report = stub_open_order_status_report(cid.as_str());
+        report.order_status = OrderStatus::Submitted;
+        state.seed_accepted_from_report(&report);
+
+        assert!(state.accepted_was_emitted(&cid));
+    }
+
+    #[rstest]
+    fn forget_order_identity_clears_snapshot_and_triggered() {
+        // Failed dispatch cleanup clears all per-order state. Terminal venue
+        // events use `retire_order_identity` instead so trailing fills retain
+        // their identity and accepted marker.
+        let state = WsDispatchState::new();
+        let cid = cloid("TERMINAL-CLEANUP");
+        let identity = OrderIdentity::new(
+            InstrumentId::from("ETH-PERP.LIGHTER"),
+            StrategyId::new("S-T"),
+            OrderSide::Buy,
+            OrderType::Limit,
+            1,
+        );
+
+        state.register_order_identity(cid, identity);
+        state.mark_accepted_emitted(cid);
+        state.mark_triggered_emitted(cid);
+        state.store_snapshot(
+            cid,
+            OrderShapeSnapshot {
+                quantity: Quantity::from("0.01"),
+                price: Some(Price::from("2352.74")),
+                trigger_price: None,
+            },
+        );
+
+        state.forget_order_identity(&cid);
+
+        assert!(state.snapshot_for(&cid).is_none());
+        assert!(!state.triggered_was_emitted(&cid));
+        assert!(!state.accepted_was_emitted(&cid));
+    }
+
+    #[rstest]
+    fn mark_trade_seen_dedupes_repeats() {
+        let state = WsDispatchState::new();
+        let trade_id = TradeId::new("19209006902");
+
+        let first = state.mark_trade_seen(trade_id);
+        let second = state.mark_trade_seen(trade_id);
+
+        assert!(first, "first observation is new");
+        assert!(!second, "repeat observation is suppressed");
+    }
+
+    #[rstest]
+    fn order_identity_lifecycle_register_then_forget() {
+        let state = WsDispatchState::new();
+        let cid = cloid("ORDER-LIFECYCLE");
+        let identity = OrderIdentity::new(
+            InstrumentId::from("ETH-PERP.LIGHTER"),
+            StrategyId::new("S-T"),
+            OrderSide::Buy,
+            OrderType::Limit,
+            1,
+        );
+
+        state.register_order_identity(cid, identity);
+        assert!(state.order_identities.contains_key(&cid));
+
+        state.mark_accepted_emitted(cid);
+        assert!(state.accepted_was_emitted(&cid));
+
+        state.forget_order_identity(&cid);
+        assert!(!state.order_identities.contains_key(&cid));
+        assert!(!state.accepted_was_emitted(&cid));
+    }
+
+    #[rstest]
+    fn stale_create_rejection_preserves_replacement_generation() {
+        let state = WsDispatchState::new();
+        let cid = cloid("CREATE-GENERATION");
+        let index = 42;
+        state.register_cloid(index, cid).unwrap();
+        state.register_order_identity(
+            cid,
+            OrderIdentity::new(
+                InstrumentId::from("ETH-PERP.LIGHTER"),
+                StrategyId::new("S-T"),
+                OrderSide::Buy,
+                OrderType::Limit,
+                index,
+            ),
+        );
+        state.mark_order_submission(&cid, 10);
+
+        state.register_order_identity(
+            cid,
+            OrderIdentity::new(
+                InstrumentId::from("ETH-PERP.LIGHTER"),
+                StrategyId::new("S-T"),
+                OrderSide::Buy,
+                OrderType::Limit,
+                index,
+            ),
+        );
+        state.mark_order_submission(&cid, 11);
+
+        assert!(!state.observe_create_submission(&cid, index, 10, voi("281476929510110")));
+        assert!(state.lookup_venue_order_id(&cid).is_none());
+        assert!(!state.reject_create_submission(&cid, index, 10, None));
+        assert!(state.cloid_map.contains_key(&index));
+        assert!(state.create_submission_is_pending(&cid, index, 11));
+        let reconnected_epoch = AtomicU64::new(1);
+        assert!(!state.reject_create_submission(&cid, index, 11, Some((&reconnected_epoch, 0)),));
+        assert!(state.create_submission_is_pending(&cid, index, 11));
+        assert!(state.reject_create_submission(&cid, index, 11, None));
+        assert!(!state.cloid_map.contains_key(&index));
+        assert!(state.order_identity(&cid).is_none());
+    }
+
+    #[rstest]
+    fn translate_order_cloid_substitutes_known_index() {
+        let state = WsDispatchState::new();
+        let original = cloid("MY-ORDER-001");
+        state.register_cloid(42, original).unwrap();
+        state.register_order_identity(
+            original,
+            OrderIdentity::new(
+                InstrumentId::from("ETH-PERP.LIGHTER"),
+                StrategyId::new("S-T"),
+                OrderSide::Buy,
+                OrderType::Limit,
+                42,
+            ),
+        );
+        state.mark_order_submission(&original, 9);
+
+        let report = stub_open_order_status_report("42");
+        assert_eq!(
+            state.resolve_live_order_cloid("42", report.venue_order_id),
+            Some(original),
+        );
+        let translated = state.translate_order_cloid(report);
+
+        assert_eq!(translated.client_order_id, Some(original));
+    }
+
+    #[rstest]
+    fn translate_order_cloid_uses_venue_id_for_unknown_index() {
+        let state = WsDispatchState::new();
+        let report = stub_open_order_status_report("99");
+        let translated = state.translate_order_cloid(report);
+
+        assert_eq!(
+            translated.client_order_id.map(|c| c.to_string()),
+            Some("281476929510110".to_string()),
+        );
+    }
+
+    #[rstest]
+    fn translate_order_cloid_passes_through_non_integer_cloid() {
+        let state = WsDispatchState::new();
+        let report = stub_open_order_status_report("not-an-int");
+        let translated = state.translate_order_cloid(report);
+
+        assert_eq!(
+            translated.client_order_id.map(|c| c.to_string()),
+            Some("not-an-int".to_string()),
+        );
+    }
+
+    #[rstest]
+    #[case(
+        PendingOrderAction::Modify,
+        OrderStatus::Accepted,
+        OrderStatus::PendingUpdate
+    )]
+    #[case(
+        PendingOrderAction::Modify,
+        OrderStatus::Triggered,
+        OrderStatus::PendingUpdate
+    )]
+    #[case(
+        PendingOrderAction::Modify,
+        OrderStatus::PartiallyFilled,
+        OrderStatus::PendingUpdate
+    )]
+    #[case(
+        PendingOrderAction::Cancel,
+        OrderStatus::Accepted,
+        OrderStatus::PendingCancel
+    )]
+    #[case(
+        PendingOrderAction::Cancel,
+        OrderStatus::Triggered,
+        OrderStatus::PendingCancel
+    )]
+    #[case(
+        PendingOrderAction::Cancel,
+        OrderStatus::PartiallyFilled,
+        OrderStatus::PendingCancel
+    )]
+    fn preserve_pending_order_status_maps_working_report(
+        #[case] action: PendingOrderAction,
+        #[case] venue_status: OrderStatus,
+        #[case] expected: OrderStatus,
+    ) {
+        let state = WsDispatchState::new();
+        let cid = ClientOrderId::new(format!("PENDING-{action:?}-{venue_status:?}"));
+        state.set_pending_order_action(cid, action);
+        let mut report = stub_open_order_status_report(cid.as_str());
+        report.order_status = venue_status;
+
+        let preserved = state.preserve_pending_order_status(report);
+
+        assert_eq!(preserved.client_order_id, Some(cid));
+        assert_eq!(
+            preserved.venue_order_id,
+            VenueOrderId::new("281476929510110"),
+        );
+        assert_eq!(preserved.order_status, expected);
+        assert_eq!(preserved.quantity, Quantity::from("0.01"));
+        assert_eq!(preserved.price, None);
+        assert_eq!(preserved.trigger_price, None);
+        assert_eq!(state.pending_order_action(&cid), Some(action));
+    }
+
+    #[rstest]
+    fn preserve_pending_order_status_clears_terminal_action() {
+        let state = WsDispatchState::new();
+        let cid = cloid("PENDING-TERMINAL");
+        state.set_pending_order_action(cid, PendingOrderAction::Modify);
+        let mut report = stub_open_order_status_report(cid.as_str());
+        report.order_status = OrderStatus::Filled;
+
+        let preserved = state.preserve_pending_order_status(report);
+
+        assert_eq!(preserved.client_order_id, Some(cid));
+        assert_eq!(preserved.order_status, OrderStatus::Filled);
+        assert_eq!(preserved.quantity, Quantity::from("0.01"));
+        assert_eq!(preserved.price, None);
+        assert_eq!(preserved.trigger_price, None);
+        assert_eq!(state.pending_order_action(&cid), None);
+    }
+
+    #[rstest]
+    fn clear_pending_order_action_if_keeps_different_action() {
+        let state = WsDispatchState::new();
+        let cid = cloid("PENDING-DIFFERENT");
+        state.set_pending_order_action(cid, PendingOrderAction::Cancel);
+
+        assert!(!state.clear_pending_order_action_if(&cid, PendingOrderAction::Modify));
+        assert_eq!(
+            state.pending_order_action(&cid),
+            Some(PendingOrderAction::Cancel),
+        );
+    }
+
+    fn stub_fill_report(client_order_id_str: &str) -> FillReport {
+        FillReport::new(
+            AccountId::from("LIGHTER-TEST"),
+            InstrumentId::from("ETH-PERP.LIGHTER"),
+            VenueOrderId::new("281476929510102"),
+            TradeId::new("19209006902"),
+            OrderSide::Buy,
+            Quantity::from("0.1336"),
+            Price::from("2352.73"),
+            Money::from("0.000196 USDC"),
+            LiquiditySide::Taker,
+            Some(ClientOrderId::new(client_order_id_str)),
+            None,
+            UnixNanos::from(1),
+            UnixNanos::from(2),
+            Some(UUID4::new()),
+        )
+    }
+
+    // Fill-side cloid translation mirrors the order-side path: a numeric
+    // client id substitutes to the originating Nautilus cloid only when the
+    // venue order id matches its bound identity. Unknown numerics use the
+    // venue order id because Lighter can reuse client indexes over time.
+    #[rstest]
+    fn translate_fill_cloid_substitutes_known_index() {
+        let state = WsDispatchState::new();
+        let original = cloid("MY-ORDER-001");
+        state.register_cloid(42, original).unwrap();
+        state.register_order_identity(
+            original,
+            OrderIdentity::new(
+                InstrumentId::from("ETH-PERP.LIGHTER"),
+                StrategyId::new("S-T"),
+                OrderSide::Buy,
+                OrderType::Limit,
+                42,
+            ),
+        );
+        state.mark_order_submission(&original, 9);
+
+        let report = stub_fill_report("42");
+        assert_eq!(
+            state.resolve_live_trade_cloid("42", report.venue_order_id),
+            Some(original),
+        );
+        let translated = state.translate_fill_cloid(report);
+
+        assert_eq!(translated.client_order_id, Some(original));
+    }
+
+    #[rstest]
+    fn translate_fill_cloid_uses_venue_id_for_unknown_index() {
+        let state = WsDispatchState::new();
+        let report = stub_fill_report("99");
+        let translated = state.translate_fill_cloid(report);
+
+        assert_eq!(
+            translated.client_order_id.map(|c| c.to_string()),
+            Some("281476929510102".to_string()),
+        );
+    }
+
+    #[rstest]
+    fn translate_fill_cloid_passes_through_non_integer_cloid() {
+        let state = WsDispatchState::new();
+        let report = stub_fill_report("not-an-int");
+        let translated = state.translate_fill_cloid(report);
+
+        assert_eq!(
+            translated.client_order_id.map(|c| c.to_string()),
+            Some("not-an-int".to_string()),
+        );
+    }
+
+    #[rstest]
+    fn reused_unknown_index_produces_distinct_external_cloids() {
+        let state = WsDispatchState::new();
+        let first = state.translate_order_cloid(stub_open_order_status_report("99"));
+        let mut second_report = stub_open_order_status_report("99");
+        second_report.venue_order_id = VenueOrderId::new("281476929510111");
+        let second = state.translate_order_cloid(second_report);
+
+        assert_eq!(
+            first.client_order_id,
+            Some(ClientOrderId::new("281476929510110")),
+        );
+        assert_eq!(
+            second.client_order_id,
+            Some(ClientOrderId::new("281476929510111")),
+        );
+        assert_ne!(first.client_order_id, second.client_order_id);
+    }
+
+    #[rstest]
+    fn known_index_with_wrong_venue_id_uses_external_cloid() {
+        let state = WsDispatchState::new();
+        let original = cloid("MY-ORDER-001");
+        state.register_cloid(42, original).unwrap();
+        state.register_order_identity(
+            original,
+            OrderIdentity::new(
+                InstrumentId::from("ETH-PERP.LIGHTER"),
+                StrategyId::new("S-T"),
+                OrderSide::Buy,
+                OrderType::Limit,
+                42,
+            ),
+        );
+        state.mark_order_submission(&original, 9);
+        assert_eq!(
+            state.resolve_live_order_cloid("42", VenueOrderId::new("281476929510109")),
+            Some(original),
+        );
+
+        let translated = state.translate_order_cloid(stub_open_order_status_report("42"));
+
+        assert_eq!(
+            translated.client_order_id,
+            Some(ClientOrderId::new("281476929510110")),
+        );
+    }
+
+    #[rstest]
+    fn explicit_venue_lookup_does_not_fall_through_to_client_index() {
+        assert!(!order_matches_lookup(100, 42, Some(101), Some(42)));
+        assert!(order_matches_lookup(101, 99, Some(101), Some(42)));
+        assert!(order_matches_lookup(100, 42, None, Some(42)));
+    }
+
+    #[rstest]
+    fn evict_terminal_mappings_drops_venue_id_map_only() {
+        // cloid_map is intentionally retained so a trailing
+        // account_all_trades frame can still translate its numeric
+        // client_order_index back to the original cloid even after the
+        // terminal-status frame arrived first.
+        let cloid_map: Arc<DashMap<i64, ClientOrderId>> = Arc::new(DashMap::new());
+        let venue_id_map: Arc<DashMap<ClientOrderId, VenueOrderId>> = Arc::new(DashMap::new());
+        let original = cloid("MY-ORDER-001");
+        cloid_map.insert(42, original);
+        venue_id_map.insert(original, voi("281476929510110"));
+
+        let report = stub_canceled_status_report("MY-ORDER-001");
+        evict_terminal_mappings(&report, &venue_id_map);
+
+        assert!(
+            cloid_map.get(&42).is_some(),
+            "cloid_map must survive terminal status to translate trailing fills",
+        );
+        assert!(venue_id_map.get(&original).is_none());
+    }
+
+    #[rstest]
+    fn evict_terminal_mappings_no_op_for_missing_cloid() {
+        let venue_id_map: Arc<DashMap<ClientOrderId, VenueOrderId>> = Arc::new(DashMap::new());
+        let mut report = stub_canceled_status_report("MY-ORDER-001");
+        report.client_order_id = None;
+
+        evict_terminal_mappings(&report, &venue_id_map);
+        assert_eq!(venue_id_map.len(), 0);
+    }
+
+    #[rstest]
+    #[case(TimeInForce::Ioc, LighterTimeInForce::ImmediateOrCancel)]
+    #[case(TimeInForce::Gtc, LighterTimeInForce::GoodTillTime)]
+    #[case(TimeInForce::Day, LighterTimeInForce::GoodTillTime)]
+    #[case(TimeInForce::Gtd, LighterTimeInForce::GoodTillTime)]
+    fn nautilus_to_lighter_tif_supported_variants(
+        #[case] input: TimeInForce,
+        #[case] expected: LighterTimeInForce,
+    ) {
+        assert_eq!(
+            nautilus_to_lighter_tif(OrderType::Limit, input, false).unwrap(),
+            expected
+        );
+    }
+
+    #[rstest]
+    fn nautilus_to_lighter_tif_market_orders_use_ioc() {
+        assert_eq!(
+            nautilus_to_lighter_tif(OrderType::Market, TimeInForce::Gtc, false).unwrap(),
+            LighterTimeInForce::ImmediateOrCancel,
+        );
+        assert_eq!(
+            nautilus_to_lighter_tif(OrderType::Market, TimeInForce::Ioc, false).unwrap(),
+            LighterTimeInForce::ImmediateOrCancel,
+        );
+    }
+
+    #[rstest]
+    #[case(TimeInForce::Day)]
+    #[case(TimeInForce::Gtd)]
+    fn nautilus_to_lighter_tif_market_orders_reject_resting_tifs(#[case] tif: TimeInForce) {
+        let err = nautilus_to_lighter_tif(OrderType::Market, tif, false).unwrap_err();
+        assert!(err.to_string().contains("market orders"));
+    }
+
+    #[rstest]
+    #[case(OrderType::StopMarket)]
+    #[case(OrderType::MarketIfTouched)]
+    fn nautilus_to_lighter_tif_conditional_market_orders_use_ioc_wire_tif(
+        #[case] order_type: OrderType,
+    ) {
+        for tif in [TimeInForce::Gtc, TimeInForce::Day, TimeInForce::Gtd] {
+            assert_eq!(
+                nautilus_to_lighter_tif(order_type, tif, false).unwrap(),
+                LighterTimeInForce::ImmediateOrCancel,
+            );
+        }
+    }
+
+    #[rstest]
+    fn nautilus_to_lighter_tif_conditional_market_orders_reject_nautilus_ioc() {
+        let err =
+            nautilus_to_lighter_tif(OrderType::StopMarket, TimeInForce::Ioc, false).unwrap_err();
+        assert!(err.to_string().contains("positive expiry"));
+    }
+
+    #[rstest]
+    #[case(OrderType::StopLimit)]
+    #[case(OrderType::LimitIfTouched)]
+    fn nautilus_to_lighter_tif_conditional_limit_orders_allow_ioc(#[case] order_type: OrderType) {
+        assert_eq!(
+            nautilus_to_lighter_tif(order_type, TimeInForce::Ioc, false).unwrap(),
+            LighterTimeInForce::ImmediateOrCancel,
+        );
+    }
+
+    #[rstest]
+    #[case(TimeInForce::Gtc)]
+    #[case(TimeInForce::Gtd)]
+    #[case(TimeInForce::Ioc)]
+    fn nautilus_to_lighter_tif_post_only_overrides_base_tif(#[case] tif: TimeInForce) {
+        // post_only=true must take precedence regardless of the nominal TIF
+        // because Lighter exposes a dedicated PostOnly slot.
+        assert_eq!(
+            nautilus_to_lighter_tif(OrderType::Limit, tif, true).unwrap(),
+            LighterTimeInForce::PostOnly,
+        );
+    }
+
+    #[rstest]
+    fn nautilus_to_lighter_tif_rejects_fok() {
+        // Lighter has no fill-or-kill primitive; mapping FOK to IOC would
+        // let a partial fill satisfy the order. Reject explicitly.
+        let err = nautilus_to_lighter_tif(OrderType::Limit, TimeInForce::Fok, false).unwrap_err();
+        assert!(err.to_string().contains("fill-or-kill"));
+    }
+
+    #[rstest]
+    #[case(TimeInForce::AtTheOpen)]
+    #[case(TimeInForce::AtTheClose)]
+    fn nautilus_to_lighter_tif_unsupported_variants_error(#[case] tif: TimeInForce) {
+        let err = nautilus_to_lighter_tif(OrderType::Limit, tif, false).unwrap_err();
+        assert!(err.to_string().contains("does not support"));
+    }
+
+    const NOW_MS: i64 = 1_700_000_000_000;
+
+    #[rstest]
+    fn order_expiry_for_gtd_with_expiry_returns_millis() {
+        let expiry_ms = NOW_MS + ORDER_EXPIRY_MIN_GTD_MS + 123;
+        let ts = UnixNanos::from((expiry_ms as u64) * 1_000_000);
+        assert_eq!(
+            order_expiry_for(OrderType::Limit, &TimeInForce::Gtd, Some(ts), NOW_MS, true).unwrap(),
+            expiry_ms,
+        );
+    }
+
+    #[rstest]
+    #[case::too_short(ORDER_EXPIRY_MIN_GTD_MS - 1, "at least 5 minutes")]
+    #[case::too_long(ORDER_EXPIRY_MAX_GTD_MS + 1, "no more than 30 days")]
+    fn order_expiry_for_rejects_gtd_outside_venue_range(
+        #[case] offset_ms: i64,
+        #[case] expected: &str,
+    ) {
+        let ts = UnixNanos::from(((NOW_MS + offset_ms) as u64) * 1_000_000);
+        let error = order_expiry_for(OrderType::Limit, &TimeInForce::Gtd, Some(ts), NOW_MS, true)
+            .unwrap_err();
+
+        assert!(error.to_string().contains(expected));
+    }
+
+    #[rstest]
+    fn order_expiry_for_managed_gtd_ignores_short_strategy_expiry() {
+        // With use_gtd=false the strategy's short expire_time must not be used as
+        // the venue expiry: the order rests on the default 28-day window and the
+        // strategy's manage_gtd_expiry timer cancels it locally.
+        let expiry_ms = NOW_MS + 60_000; // 1 minute: below the venue minimum
+        let ts = UnixNanos::from((expiry_ms as u64) * 1_000_000);
+
+        assert_eq!(
+            order_expiry_for(OrderType::Limit, &TimeInForce::Gtd, Some(ts), NOW_MS, false).unwrap(),
+            NOW_MS + ORDER_EXPIRY_DEFAULT_GTC_MS,
+        );
+    }
+
+    #[rstest]
+    fn order_expiry_for_managed_gtd_rejects_expiry_beyond_fallback_window() {
+        // A local timer cannot preserve an expiry after the venue has already
+        // removed the order, so an expiry beyond the 28-day fallback is denied.
+        let expiry_ms = NOW_MS + ORDER_EXPIRY_DEFAULT_GTC_MS + 1;
+        let ts = UnixNanos::from((expiry_ms as u64) * 1_000_000);
+
+        let error = order_expiry_for(OrderType::Limit, &TimeInForce::Gtd, Some(ts), NOW_MS, false)
+            .unwrap_err();
+
+        assert!(error.to_string().contains("locally managed GTD"));
+        assert!(error.to_string().contains("28 days"));
+    }
+
+    #[rstest]
+    #[case(OrderType::StopMarket)]
+    #[case(OrderType::MarketIfTouched)]
+    fn order_expiry_for_managed_gtd_applies_to_conditional_orders(#[case] order_type: OrderType) {
+        let expiry_ms = NOW_MS + 60_000;
+        let ts = UnixNanos::from((expiry_ms as u64) * 1_000_000);
+
+        assert_eq!(
+            order_expiry_for(order_type, &TimeInForce::Gtd, Some(ts), NOW_MS, false).unwrap(),
+            NOW_MS + ORDER_EXPIRY_DEFAULT_GTC_MS,
+        );
+    }
+
+    #[rstest]
+    fn order_expiry_for_managed_gtd_leaves_other_tifs_unchanged() {
+        // The opt-out only rewrites the explicit GTD expiry path; GTC and IOC
+        // never carried a strategy expiry and must keep their existing values.
+        assert_eq!(
+            order_expiry_for(OrderType::Limit, &TimeInForce::Gtc, None, NOW_MS, false).unwrap(),
+            NOW_MS + ORDER_EXPIRY_DEFAULT_GTC_MS,
+        );
+        assert_eq!(
+            order_expiry_for(OrderType::Limit, &TimeInForce::Ioc, None, NOW_MS, false).unwrap(),
+            ORDER_EXPIRY_IOC,
+        );
+    }
+
+    #[rstest]
+    #[case(TimeInForce::Gtc, None)]
+    #[case(TimeInForce::Day, None)]
+    #[case(TimeInForce::Gtd, None)]
+    fn order_expiry_for_default_returns_now_plus_28d(
+        #[case] tif: TimeInForce,
+        #[case] expire: Option<UnixNanos>,
+    ) {
+        assert_eq!(
+            order_expiry_for(OrderType::Limit, &tif, expire, NOW_MS, true).unwrap(),
+            NOW_MS + ORDER_EXPIRY_DEFAULT_GTC_MS,
+        );
+    }
+
+    #[rstest]
+    #[case(TimeInForce::Ioc)]
+    #[case(TimeInForce::Fok)]
+    fn order_expiry_for_ioc_returns_zero(#[case] tif: TimeInForce) {
+        // Lighter requires `0` for IOC semantics; -1 is rejected as an
+        // invalid expiry timestamp by the sequencer.
+        assert_eq!(
+            order_expiry_for(OrderType::Limit, &tif, None, NOW_MS, true).unwrap(),
+            ORDER_EXPIRY_IOC
+        );
+    }
+
+    #[rstest]
+    fn order_expiry_for_market_orders_returns_zero() {
+        assert_eq!(
+            order_expiry_for(OrderType::Market, &TimeInForce::Gtc, None, NOW_MS, true).unwrap(),
+            ORDER_EXPIRY_IOC
+        );
+    }
+
+    #[rstest]
+    #[case(OrderType::StopMarket)]
+    #[case(OrderType::MarketIfTouched)]
+    fn order_expiry_for_conditional_market_orders_uses_positive_expiry(
+        #[case] order_type: OrderType,
+    ) {
+        assert_eq!(
+            order_expiry_for(order_type, &TimeInForce::Gtc, None, NOW_MS, true).unwrap(),
+            NOW_MS + ORDER_EXPIRY_DEFAULT_GTC_MS,
+        );
+    }
+
+    #[rstest]
+    #[case(OrderType::StopMarket)]
+    #[case(OrderType::MarketIfTouched)]
+    fn order_expiry_for_conditional_market_gtd_with_expiry_returns_millis(
+        #[case] order_type: OrderType,
+    ) {
+        let expiry_ms = NOW_MS + ORDER_EXPIRY_MIN_GTD_MS + 456;
+        let ts = UnixNanos::from((expiry_ms as u64) * 1_000_000);
+        assert_eq!(
+            order_expiry_for(order_type, &TimeInForce::Gtd, Some(ts), NOW_MS, true).unwrap(),
+            expiry_ms,
+        );
+    }
+
+    #[rstest]
+    #[case(OrderType::StopLimit)]
+    #[case(OrderType::LimitIfTouched)]
+    fn order_expiry_for_conditional_limit_ioc_uses_positive_expiry(#[case] order_type: OrderType) {
+        assert_eq!(
+            order_expiry_for(order_type, &TimeInForce::Ioc, None, NOW_MS, true).unwrap(),
+            NOW_MS + ORDER_EXPIRY_DEFAULT_GTC_MS,
+        );
+    }
+
+    fn position_at(instrument: &str) -> PositionStatusReport {
+        stub_position_report(instrument, "1")
+    }
+
+    #[rstest]
+    #[case::empty_to_single(&[], &["ETH-PERP.LIGHTER"], &[])]
+    #[case::one_removed(
+        &["ETH-PERP.LIGHTER", "BTC-PERP.LIGHTER"],
+        &["ETH-PERP.LIGHTER"],
+        &["BTC-PERP.LIGHTER"],
+    )]
+    #[case::all_closed(&["ETH-PERP.LIGHTER"], &[], &["ETH-PERP.LIGHTER"])]
+    #[case::two_removed(
+        &["ETH-PERP.LIGHTER", "BTC-PERP.LIGHTER", "DOGE-PERP.LIGHTER"],
+        &["DOGE-PERP.LIGHTER"],
+        &["BTC-PERP.LIGHTER", "ETH-PERP.LIGHTER"],
+    )]
+    #[case::full_swap(
+        &["ETH-PERP.LIGHTER"],
+        &["BTC-PERP.LIGHTER"],
+        &["ETH-PERP.LIGHTER"],
+    )]
+    fn replace_positions_returns_removed_ids(
+        #[case] prior: &[&str],
+        #[case] next: &[&str],
+        #[case] expected_removed: &[&str],
+    ) {
+        // Pins the contract the consumption loop relies on to emit flat
+        // PositionStatusReports for externally-closed positions.
+        // Regression to `Vec::new()` would silently swallow closures.
+        let state = WsDispatchState::new();
+        let prior_reports: Vec<PositionStatusReport> =
+            prior.iter().map(|i| position_at(i)).collect();
+        state.replace_position_snapshot(&prior_reports, &[], &[]);
+
+        let next_reports: Vec<PositionStatusReport> = next.iter().map(|i| position_at(i)).collect();
+        let mut removed = state.replace_position_snapshot(&next_reports, &[], &[]);
+        removed.sort();
+        let mut expected: Vec<InstrumentId> = expected_removed
+            .iter()
+            .map(|i| InstrumentId::from(*i))
+            .collect();
+        expected.sort();
+
+        assert_eq!(removed, expected);
+    }
+
+    #[rstest]
+    fn derive_client_order_index_fits_in_31_bits() {
+        // Venue rejects values above 2^31-1 with `21727 invalid client
+        // order index`. Property-style: derive a wide range of distinct
+        // cloids and assert each result stays inside the venue-safe
+        // window. A mask widening regression would fail here even with
+        // a single value out of bounds.
+        let state = WsDispatchState::new();
+        for n in 0..512u32 {
+            let cid = ClientOrderId::new(format!("ORDER-{n}").as_str());
+            let derived = state.derive_client_order_index(&cid);
+            assert!(derived >= 0, "negative derived index: {derived}");
+            assert!(
+                derived <= 0x7FFF_FFFF,
+                "index {derived} exceeds 31-bit venue cap",
+            );
+        }
+    }
+
+    #[rstest]
+    fn quantity_to_ticks_scales_by_decimals() {
+        let qty = Quantity::from("0.1336");
+        assert_eq!(quantity_to_ticks(&qty, 4).unwrap(), 1_336);
+    }
+
+    // Sanity check: an i64-overflowing quantity must surface the i64-stage
+    // error rather than silently truncating. The Decimal multiplication
+    // pushes well past i64::MAX so `decimal_trunc_to_i64` short-circuits.
+    // A precision-0 quantity at 1e10 is well inside the Nautilus
+    // `Quantity` raw cap (~3.4e29 with high-precision), but scaling by
+    // `10^16` pushes it to 1e26 - far past i64::MAX (~9.22e18). The
+    // wrapping `with_context` must surface the typed overflow message
+    // rather than silently truncating.
+    #[rstest]
+    fn quantity_to_ticks_rejects_i64_overflow() {
+        let qty = Quantity::from_decimal_dp(Decimal::from(10_000_000_000_i64), 0).unwrap();
+        let err = quantity_to_ticks(&qty, 16).unwrap_err();
+        assert!(
+            err.to_string().contains("overflows i64"),
+            "expected i64 overflow error, was: {err}",
+        );
+    }
+
+    #[rstest]
+    fn price_to_ticks_scales_by_decimals() {
+        let price = Price::from("2352.74");
+        assert_eq!(price_to_ticks(&price, 2).unwrap(), 235_274);
+    }
+
+    #[rstest]
+    fn price_to_ticks_rejects_overflow_above_u32() {
+        let price = Price::from("100000000.00");
+        let err = price_to_ticks(&price, 2).unwrap_err();
+        assert!(err.to_string().contains("overflows u32"));
+    }
+
+    // Pins `decimal_trunc_to_i64` semantics directly so its truncation
+    // (toward zero) and overflow contract is asserted independently of any
+    // caller that happens to feed it integer-valued Decimals.
+    #[rstest]
+    #[case::positive_fractional_truncs_toward_zero("3.9", 3)]
+    #[case::negative_fractional_truncs_toward_zero("-3.9", -3)]
+    #[case::integer_passes_through("42", 42)]
+    #[case::zero("0", 0)]
+    fn decimal_trunc_to_i64_truncates_toward_zero(#[case] input: &str, #[case] expected: i64) {
+        let d = Decimal::from_str(input).unwrap();
+        assert_eq!(decimal_trunc_to_i64(d).unwrap(), expected);
+    }
+
+    #[rstest]
+    fn decimal_trunc_to_i64_rejects_above_i64_max() {
+        // i64::MAX is 9223372036854775807; 9.3e18 is above it.
+        let d = Decimal::from_str("9300000000000000000").unwrap();
+        let err = decimal_trunc_to_i64(d).unwrap_err();
+        assert!(
+            err.to_string().contains("does not fit in i64"),
+            "expected i64 fit error, was: {err}",
+        );
+    }
+
+    #[rstest]
+    #[case::buy_widen(Decimal::new(10_000, 2), true, 2, 50, 10_050)]
+    #[case::sell_widen(Decimal::new(10_000, 2), false, 2, 50, 9_950)]
+    #[case::buy_ceil(Decimal::new(7_915_055, 2), true, 2, 1, 7_915_847)]
+    #[case::sell_floor(Decimal::new(7_915_055, 2), false, 2, 1, 7_914_263)]
+    #[case::zero_bps_buy(Decimal::new(123_456, 2), true, 2, 0, 123_456)]
+    #[case::zero_bps_sell(Decimal::new(123_456, 2), false, 2, 0, 123_456)]
+    #[case::maximum_bps_buy(Decimal::new(10_000, 2), true, 2, 9_999, 19_999)]
+    #[case::maximum_bps_sell(Decimal::new(10_000, 2), false, 2, 9_999, 1)]
+    fn derive_market_order_price_ticks_cases(
+        #[case] base: Decimal,
+        #[case] is_buy: bool,
+        #[case] price_precision: u8,
+        #[case] slippage_bps: u32,
+        #[case] expected: u32,
+    ) {
+        let ticks =
+            derive_market_order_price_ticks(base, is_buy, price_precision, slippage_bps).unwrap();
+        assert_eq!(ticks, expected);
+    }
+
+    #[rstest]
+    #[case::excess_sell_slippage(Decimal::new(10_000, 2), false, 2, 10_000)]
+    #[case::underflow_at_precision(Decimal::new(5, 6), false, 4, 50)]
+    fn derive_market_order_price_ticks_rejects_zero_cap(
+        #[case] base: Decimal,
+        #[case] is_buy: bool,
+        #[case] price_precision: u8,
+        #[case] slippage_bps: u32,
+    ) {
+        let err = derive_market_order_price_ticks(base, is_buy, price_precision, slippage_bps)
+            .unwrap_err();
+        assert!(err.to_string().contains("rounds to 0 ticks"));
+    }
+
+    fn stub_pending_create(
+        client_order_id: &str,
+        nonce: i64,
+        submitted_at_ns: u64,
+    ) -> PendingSendTx {
+        use nautilus_model::orders::builder::OrderTestBuilder;
+
+        let order = OrderTestBuilder::new(OrderType::Market)
+            .instrument_id(InstrumentId::from("ETH-PERP.LIGHTER"))
+            .client_order_id(ClientOrderId::new(client_order_id))
+            .quantity(Quantity::from("0.01"))
+            .build();
+        PendingSendTx {
+            batch_id: None,
+            connection_epoch: 0,
+            kind: PendingSendTxKind::Create {
+                order: Box::new(order),
+                client_order_index: nonce,
+            },
+            submitted_at: UnixNanos::from(submitted_at_ns),
+            nonce,
+            api_key_index: 0,
+            tx_hash: format!("hash{nonce:02x}"),
+        }
+    }
+
+    fn stub_pending_other(nonce: i64, submitted_at_ns: u64) -> PendingSendTx {
+        PendingSendTx {
+            batch_id: None,
+            connection_epoch: 0,
+            kind: PendingSendTxKind::Other,
+            submitted_at: UnixNanos::from(submitted_at_ns),
+            nonce,
+            api_key_index: 0,
+            tx_hash: format!("hash{nonce:02x}"),
+        }
+    }
+
+    fn pending_cloid(p: &PendingSendTx) -> Option<ClientOrderId> {
+        match &p.kind {
+            PendingSendTxKind::Create { order, .. } => Some(order.client_order_id()),
+            PendingSendTxKind::Cancel {
+                client_order_id, ..
+            }
+            | PendingSendTxKind::Modify {
+                client_order_id, ..
+            } => Some(*client_order_id),
+            PendingSendTxKind::CreateGroup { .. } | PendingSendTxKind::Other => None,
+        }
+    }
+
+    #[rstest]
+    fn enqueue_then_pop_head_is_fifo_across_kinds() {
+        // Pins FIFO order across mixed kinds: cancel/modify/leverage entries
+        // share the queue with creates so the venue ACK order is preserved.
+        // Without this, a non-create ACK would pop a pending create and the
+        // real create rejection would land unattributed.
+        let state = WsDispatchState::new();
+        let now = UnixNanos::from(1_000_000_000);
+
+        state.enqueue_pending_sendtx(stub_pending_create("A", 10, now.as_u64()));
+        state.enqueue_pending_sendtx(stub_pending_other(11, now.as_u64() + 1));
+        state.enqueue_pending_sendtx(stub_pending_create("B", 12, now.as_u64() + 2));
+
+        let first = state.pop_pending_sendtx_head().expect("head present");
+        assert_eq!(pending_cloid(&first), Some(cloid("A")));
+        let second = state.pop_pending_sendtx_head().expect("second present");
+        assert!(matches!(second.kind, PendingSendTxKind::Other));
+        let third = state.pop_pending_sendtx_head().expect("third present");
+        assert_eq!(pending_cloid(&third), Some(cloid("B")));
+        assert!(state.pop_pending_sendtx_head().is_none());
+    }
+
+    #[rstest]
+    #[case::ack(false)]
+    #[case::rejection(true)]
+    fn hashless_response_preserves_single_batch_member(#[case] within_window: bool) {
+        let state = WsDispatchState::new();
+        let mut pending = stub_pending_other(17, 1_000_000_000);
+        pending.batch_id = Some("cancel-batch:member".to_string());
+        state.enqueue_pending_sendtx(pending);
+
+        let popped = if within_window {
+            state.pop_pending_sendtx_if_only_within(0, UnixNanos::from(1_500_000_000), 1_000)
+        } else {
+            state.pop_pending_sendtx_if_only(0)
+        };
+
+        assert!(popped.is_none());
+        let remaining = state.drain_pending_sendtx(0);
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].nonce, 17);
+        assert_eq!(
+            remaining[0].batch_id.as_deref(),
+            Some("cancel-batch:member")
+        );
+        assert_eq!(remaining[0].tx_hash, "hash11");
+    }
+
+    #[rstest]
+    fn pop_within_window_attributes_only_recent_head() {
+        let state = WsDispatchState::new();
+        let submitted_ns = 1_000_000_000_u64;
+        state.enqueue_pending_sendtx(stub_pending_create("A", 1, submitted_ns));
+
+        let within = UnixNanos::from(submitted_ns + 500 * 1_000_000);
+        assert!(
+            state
+                .pop_pending_sendtx_if_only_within(0, within, 1_000)
+                .is_some(),
+        );
+
+        state.enqueue_pending_sendtx(stub_pending_create("B", 2, submitted_ns));
+        let outside = UnixNanos::from(submitted_ns + 1_500 * 1_000_000);
+        assert!(
+            state
+                .pop_pending_sendtx_if_only_within(0, outside, 1_000)
+                .is_none(),
+            "outside the attribution window the head must not pop",
+        );
+        assert_eq!(state.pending_sendtx_len(), 1, "head must remain queued");
+    }
+
+    #[rstest]
+    fn enqueue_does_not_prune_stale_entries() {
+        // A stale head must be preserved so a late ACK / rejection still pops
+        // the entry it belongs to.
+        let state = WsDispatchState::new();
+        state.enqueue_pending_sendtx(stub_pending_create("stale", 1, 0));
+        state.enqueue_pending_sendtx(stub_pending_create("fresh", 2, 600_000 * 1_000_000));
+
+        assert_eq!(
+            state.pending_sendtx_len(),
+            2,
+            "stale head must be preserved"
+        );
+        let head = state.pop_pending_sendtx_head().expect("stale at head");
+        assert_eq!(pending_cloid(&head), Some(cloid("stale")));
+    }
+
+    #[rstest]
+    fn remove_pending_by_nonce_targets_the_matching_entry() {
+        // Nonce-based removal works regardless of kind (cancel/modify have
+        // no cloid to remove by; only the captured nonce is unique).
+        let state = WsDispatchState::new();
+        let now = UnixNanos::from(1_000_000_000);
+        state.enqueue_pending_sendtx(stub_pending_create("A", 10, now.as_u64()));
+        state.enqueue_pending_sendtx(stub_pending_other(11, now.as_u64() + 1));
+
+        let removed = state
+            .remove_pending_sendtx_by_nonce(0, 11)
+            .expect("nonce 11 removed");
+        assert!(matches!(removed.kind, PendingSendTxKind::Other));
+        assert_eq!(removed.nonce, 11);
+        assert_eq!(state.pending_sendtx_len(), 1);
+
+        let head = state.pop_pending_sendtx_head().expect("A still queued");
+        assert_eq!(pending_cloid(&head), Some(cloid("A")));
+    }
+
+    #[rstest]
+    fn remove_pending_by_hash_targets_the_matching_entry() {
+        // Hash removal must attribute regardless of queue position so an
+        // out-of-order venue response never pops the wrong entry.
+        let state = WsDispatchState::new();
+        let now = UnixNanos::from(1_000_000_000);
+        state.enqueue_pending_sendtx(stub_pending_create("A", 10, now.as_u64()));
+        state.enqueue_pending_sendtx(stub_pending_other(11, now.as_u64() + 1));
+        state.enqueue_pending_sendtx(stub_pending_create("B", 12, now.as_u64() + 2));
+
+        let removed = state
+            .remove_pending_sendtx_by_hash(0, "hash0b")
+            .expect("hash for nonce 11 removed");
+        assert_eq!(removed.nonce, 11);
+        assert_eq!(state.pending_sendtx_len(), 2);
+
+        assert!(
+            state.remove_pending_sendtx_by_hash(0, "hash0b").is_none(),
+            "removed hash must not match again",
+        );
+
+        let upper = state
+            .remove_pending_sendtx_by_hash(0, "0xHASH0C")
+            .expect("hash comparison is case-insensitive and prefix-tolerant");
+        assert_eq!(pending_cloid(&upper), Some(cloid("B")));
+
+        let head = state.pop_pending_sendtx_head().expect("A still queued");
+        assert_eq!(pending_cloid(&head), Some(cloid("A")));
+    }
+
+    #[rstest]
+    fn drain_pending_returns_all_entries_in_order() {
+        let state = WsDispatchState::new();
+        let now = UnixNanos::from(1_000_000_000);
+        state.enqueue_pending_sendtx(stub_pending_create("A", 10, now.as_u64()));
+        state.enqueue_pending_sendtx(stub_pending_other(11, now.as_u64() + 1));
+
+        let drained = state.drain_pending_sendtx(0);
+
+        assert_eq!(drained.len(), 2);
+        assert_eq!(drained[0].nonce, 10);
+        assert_eq!(drained[1].nonce, 11);
+        assert_eq!(state.pending_sendtx_len(), 0);
+        assert!(state.drain_pending_sendtx(0).is_empty());
+    }
+
+    #[rstest]
+    fn reconnect_drain_keeps_replacement_epoch_enqueues_on_both_sides_of_cleanup() {
+        let state = WsDispatchState::new();
+        let mut disconnected = stub_pending_create("OLD", 10, 10);
+        disconnected.connection_epoch = 4;
+        let mut replacement_before_cleanup = stub_pending_other(11, 11);
+        replacement_before_cleanup.connection_epoch = 5;
+
+        state.enqueue_pending_sendtx(disconnected);
+        state.enqueue_pending_sendtx(replacement_before_cleanup);
+
+        let drained = state.drain_pending_sendtx(4);
+        assert_eq!(drained.len(), 1);
+        assert_eq!(drained[0].connection_epoch, 4);
+        assert_eq!(drained[0].nonce, 10);
+        assert_eq!(pending_cloid(&drained[0]), Some(cloid("OLD")));
+
+        {
+            let queue = state.pending_sendtx.lock();
+            assert_eq!(queue.len(), 1);
+            assert_eq!(queue[0].connection_epoch, 5);
+            assert_eq!(queue[0].nonce, 11);
+            assert!(matches!(queue[0].kind, PendingSendTxKind::Other));
+        }
+
+        let mut replacement_after_cleanup = stub_pending_create("NEW", 12, 12);
+        replacement_after_cleanup.connection_epoch = 5;
+        state.enqueue_pending_sendtx(replacement_after_cleanup);
+
+        let queue = state.pending_sendtx.lock();
+        assert_eq!(queue.len(), 2);
+        assert_eq!(
+            queue
+                .iter()
+                .map(|pending| (pending.connection_epoch, pending.nonce))
+                .collect::<Vec<_>>(),
+            vec![(5, 11), (5, 12)],
+        );
+        assert!(matches!(queue[0].kind, PendingSendTxKind::Other));
+        assert_eq!(pending_cloid(&queue[1]), Some(cloid("NEW")));
+    }
+
+    #[rstest]
+    fn account_streams_ready_starts_pending() {
+        let ready = AccountStreamsReady::new();
+        assert!(!ready.all_ready());
+        assert_eq!(
+            ready.pending(),
+            vec!["orders", "trades", "positions", "assets", "user_stats"]
+        );
+    }
+
+    #[rstest]
+    fn account_streams_ready_all_marked_is_ready() {
+        let ready = AccountStreamsReady::new();
+        ready.mark_orders();
+        ready.mark_trades();
+        ready.mark_positions();
+        ready.mark_assets();
+        ready.mark_user_stats();
+        assert!(ready.all_ready());
+        assert!(ready.pending().is_empty());
+    }
+
+    #[rstest]
+    fn account_streams_ready_partial_marks_keep_pending_list() {
+        let ready = AccountStreamsReady::new();
+        ready.mark_orders();
+        ready.mark_positions();
+        assert!(!ready.all_ready());
+        assert_eq!(ready.pending(), vec!["trades", "assets", "user_stats"]);
+    }
+
+    #[tokio::test]
+    async fn account_streams_ready_await_all_returns_when_all_marked() {
+        let ready = AccountStreamsReady::new();
+        ready.mark_orders();
+        ready.mark_trades();
+        ready.mark_positions();
+        ready.mark_assets();
+        ready.mark_user_stats();
+        ready
+            .await_all(Duration::from_millis(50))
+            .await
+            .expect("await_all should return immediately when all flags are set");
+    }
+
+    #[tokio::test]
+    async fn account_streams_ready_await_all_wakes_when_streams_arrive() {
+        let ready = std::sync::Arc::new(AccountStreamsReady::new());
+        let producer = std::sync::Arc::clone(&ready);
+        let (pending_tx, pending_rx) = tokio::sync::oneshot::channel();
+        let mut pending_tx = Some(pending_tx);
+        let wait = ready.await_all(Duration::from_secs(30));
+        tokio::pin!(wait);
+
+        let producer = tokio::spawn(async move {
+            pending_rx.await.expect("readiness waiter parked");
+            producer.mark_orders();
+            producer.mark_trades();
+            producer.mark_positions();
+            producer.mark_assets();
+            producer.mark_user_stats();
+        });
+
+        // Await the waiter before the producer so its completion cannot supply the wakeup
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            std::future::poll_fn(|cx| {
+                let result = wait.as_mut().poll(cx);
+                if result.is_pending()
+                    && let Some(tx) = pending_tx.take()
+                {
+                    tx.send(()).expect("readiness producer alive");
+                }
+
+                result
+            }),
+        )
+        .await
+        .expect("marks must wake the waiter before its deadline")
+        .expect("await_all should observe the marks");
+
+        assert!(pending_tx.is_none(), "waiter must initially be pending");
+        producer.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn account_streams_ready_await_all_times_out_with_pending_list() {
+        let ready = AccountStreamsReady::new();
+        ready.mark_orders();
+        ready.mark_trades();
+
+        let err = ready
+            .await_all(Duration::from_millis(20))
+            .await
+            .unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("positions"),
+            "should list pending streams: {msg}"
+        );
+        assert!(msg.contains("assets"), "should list pending streams: {msg}");
+    }
+
+    #[rstest]
+    fn account_streams_ready_mark_is_idempotent() {
+        let ready = AccountStreamsReady::new();
+        ready.mark_orders();
+        // Second call must not panic and must not change readiness state.
+        ready.mark_orders();
+        assert!(!ready.all_ready());
+        assert!(!ready.pending().contains(&"orders"));
+    }
+
+    #[rstest]
+    fn clear_position_cache_drops_entries_without_emitting() {
+        // Pins the connect-time clear used to keep stale prior-session
+        // positions from leaking past the strict-await gate when the
+        // venue's initial `account_all_positions` frame is empty.
+        let state = WsDispatchState::new();
+        state.replace_position_snapshot(
+            &[stub_position_report("ETH-PERP.LIGHTER", "1.0")],
+            &[],
+            &[],
+        );
+        assert!(!state.snapshot_positions_with_coverage().0.is_empty());
+
+        state.clear_position_cache();
+
+        let (reports, coverage) = state.snapshot_positions_with_coverage();
+        assert!(reports.is_empty());
+        assert_eq!(coverage, None);
+    }
+
+    #[rstest]
+    fn position_snapshot_coverage_requires_current_complete_market_row() {
+        let state = WsDispatchState::new();
+
+        assert_eq!(state.snapshot_positions_with_coverage().1, None);
+
+        state.replace_position_snapshot(&[], &[], &[]);
+        assert_eq!(
+            state.snapshot_positions_with_coverage().1,
+            Some(AHashSet::new()),
+        );
+
+        state.replace_position_snapshot(&[], &[], &[0]);
+        assert_eq!(
+            state.snapshot_positions_with_coverage().1,
+            Some(AHashSet::from_iter([0])),
+        );
+
+        state.apply_position_update(&[], &[], &[0], &[1]);
+        assert_eq!(
+            state.snapshot_positions_with_coverage().1,
+            Some(AHashSet::from_iter([1])),
+        );
+
+        state.apply_position_update(&[], &[], &[1], &[]);
+        assert_eq!(
+            state.snapshot_positions_with_coverage().1,
+            Some(AHashSet::new()),
+        );
+
+        state.invalidate_position_snapshot();
+        state.apply_position_update(&[], &[], &[0], &[]);
+        assert_eq!(state.snapshot_positions_with_coverage().1, None);
+    }
+
+    #[rstest]
+    fn position_snapshot_updates_reports_and_coverage_together() {
+        let state = WsDispatchState::new();
+        let initial = stub_position_report("ETH-PERP.LIGHTER", "1.0");
+
+        state.replace_position_snapshot(std::slice::from_ref(&initial), &[], &[1]);
+        let (reports, coverage) = state.snapshot_positions_with_coverage();
+
+        assert_eq!(reports.len(), 1);
+        assert_eq!(reports[0].instrument_id, initial.instrument_id);
+        assert_eq!(reports[0].quantity, initial.quantity);
+        assert_eq!(coverage, Some(AHashSet::from_iter([1])));
+
+        let updated = stub_position_report("ETH-PERP.LIGHTER", "2.0");
+        state.apply_position_update(std::slice::from_ref(&updated), &[], &[1], &[2]);
+        let (reports, coverage) = state.snapshot_positions_with_coverage();
+
+        assert_eq!(reports.len(), 1);
+        assert_eq!(reports[0].instrument_id, updated.instrument_id);
+        assert_eq!(reports[0].quantity, updated.quantity);
+        assert_eq!(coverage, Some(AHashSet::from_iter([2])));
+    }
+
+    #[rstest]
+    fn clear_account_state_cache_drops_snapshot() {
+        // Pins the connect-time clear that prevents a stale account state
+        // from satisfying `query_account` after the new session's initial
+        // assets frame failed to parse.
+        let state = WsDispatchState::new();
+        let account_state = AccountState::new(
+            AccountId::from("LIGHTER-TEST"),
+            AccountType::Margin,
+            vec![],
+            vec![],
+            true,
+            UUID4::new(),
+            UnixNanos::from(1),
+            UnixNanos::from(2),
+            None,
+        );
+        state.cache_account_state(account_state);
+        assert!(state.snapshot_account_state().is_some());
+
+        state.clear_account_state_cache();
+
+        assert!(state.snapshot_account_state().is_none());
+    }
+
+    #[rstest]
+    fn account_streams_ready_reset_clears_flags() {
+        // Pins the contract `connect()` relies on for retry / reconnect:
+        // a fully-marked handle must clear back to pending so a new WS
+        // session does not short-circuit the gate with stale state.
+        let ready = AccountStreamsReady::new();
+        ready.mark_orders();
+        ready.mark_trades();
+        ready.mark_positions();
+        ready.mark_assets();
+        ready.mark_user_stats();
+        assert!(ready.all_ready());
+
+        ready.reset();
+        assert!(!ready.all_ready());
+        assert_eq!(
+            ready.pending(),
+            vec!["orders", "trades", "positions", "assets", "user_stats"]
+        );
+    }
+    #[rstest]
+    #[case(PendingOrderAction::Cancel, true)]
+    #[case(PendingOrderAction::CancelUnmarked, false)]
+    fn pending_cancel_nonce_does_not_clear_a_newer_action(
+        #[case] action: PendingOrderAction,
+        #[case] emit_cancel_rejected: bool,
+    ) {
+        let state = WsDispatchState::new();
+        let id = ClientOrderId::from("CANCEL-GENERATION");
+        state.set_pending_order_action(id, action);
+        state.set_pending_cancel_nonce(&id, 3, 41, emit_cancel_rejected);
+        assert_eq!(state.pending_cancel_nonce(&id), Some((3, 41)));
+        let old = state.pending_cancel_token(&id, 3, 41).unwrap();
+        assert!(!old.is_cancelled());
+        state.set_pending_order_action(id, action);
+        assert_eq!(state.pending_cancel_nonce(&id), None);
+        assert!(old.is_cancelled());
+        state.set_pending_cancel_nonce(&id, 3, 42, emit_cancel_rejected);
+        let current = state.pending_cancel_token(&id, 3, 42).unwrap();
+        state.set_pending_cancel_nonce(&id, 3, 42, emit_cancel_rejected);
+        assert!(!state.clear_pending_cancel_if_nonce(&id, 3, 41));
+        assert!(!state.clear_pending_cancel_if_nonce(&id, 2, 42));
+        assert_eq!(state.pending_cancel_nonce(&id), Some((3, 42)));
+        assert!(!current.is_cancelled());
+        assert!(state.pending_cancel_token(&id, 2, 42).is_none());
+        assert!(state.pending_cancel_token(&id, 3, 41).is_none());
+        assert!(state.clear_pending_cancel_if_nonce(&id, 3, 42));
+        assert!(current.is_cancelled());
+        assert_eq!(state.pending_order_action(&id), None);
+        state.set_pending_order_action(id, PendingOrderAction::Modify);
+        state.set_pending_cancel_nonce(&id, 3, 43, emit_cancel_rejected);
+        assert_eq!(state.pending_cancel_nonce(&id), None);
+        assert!(!state.clear_pending_cancel_if_nonce(&id, 3, 43));
+        assert_eq!(
+            state.pending_order_action(&id),
+            Some(PendingOrderAction::Modify)
+        );
+    }
+
+    #[rstest]
+    #[case::new_nonce(42)]
+    #[case::reused_nonce(41)]
+    fn cancel_promotion_consumes_command_once(#[case] nonce: i64) {
+        let state = WsDispatchState::new();
+        let id = cloid("CANCEL-PROMOTION");
+        let first = UUID4::new();
+        let second = UUID4::new();
+        state.register_cancel_command(id, first, true);
+        assert!(state.promote_pending_cancel(&id, first, 3, 41, true));
+        let old = state.pending_cancel_token(&id, 3, 41).unwrap();
+        state.register_cancel_command(id, second, false);
+
+        assert_eq!(state.pending_cancel_identity(&id), Some((first, (3, 41))));
+        assert_eq!(
+            state.pending_order_action(&id),
+            Some(PendingOrderAction::Cancel)
+        );
+        assert!(!old.is_cancelled());
+        assert!(state.promote_pending_cancel(&id, second, 3, nonce, false));
+
+        let current = state.pending_cancel_token(&id, 3, nonce).unwrap();
+        assert!(!state.promote_pending_cancel(&id, second, 3, nonce, false));
+        assert!(!state.promote_pending_cancel(&id, first, 3, 41, true));
+        assert!(!state.clear_pending_cancel_if_command(&id, first));
+        assert_eq!(
+            state.pending_cancel_identity(&id),
+            Some((second, (3, nonce)))
+        );
+        assert_eq!(
+            state.pending_order_action(&id),
+            Some(PendingOrderAction::CancelUnmarked)
+        );
+        assert!(old.is_cancelled());
+        assert!(!current.is_cancelled());
+    }
+
+    #[rstest]
+    #[case::marked(true)]
+    #[case::unmarked(false)]
+    fn cancel_refusal_preserves_submitted_and_queued_commands(#[case] marked: bool) {
+        let state = WsDispatchState::new();
+        let id = cloid("CANCEL-QUEUED");
+        let first = UUID4::new();
+        let refused = UUID4::new();
+        let queued = UUID4::new();
+
+        let modification = ModifyOrder::new(
+            TraderId::from("TESTER-001"),
+            None,
+            StrategyId::from("S-001"),
+            InstrumentId::from("ETH-PERP.LIGHTER"),
+            id,
+            Some(VenueOrderId::from("789")),
+            Some(Quantity::from("0.2000")),
+            Some(Price::from("2362.00")),
+            None,
+            UUID4::new(),
+            UnixNanos::default(),
+            None,
+            None,
+        );
+        state.register_cancel_command(id, first, marked);
+        state.promote_pending_cancel(&id, first, 3, 41, marked);
+        let token = state.pending_cancel_token(&id, 3, 41).unwrap();
+        state.register_cancel_command(id, refused, !marked);
+        state.register_cancel_command(id, queued, !marked);
+
+        assert!(state.clear_pending_cancel_if_command(&id, refused));
+        assert!(!state.promote_pending_cancel(&id, refused, 3, 42, !marked));
+        assert_eq!(state.pending_cancel_identity(&id), Some((first, (3, 41))));
+        assert_eq!(
+            state.pending_order_action(&id),
+            Some(PendingOrderAction::cancel(marked))
+        );
+        assert!(!token.is_cancelled());
+        assert!(state.clear_pending_cancel_if_command(&id, first));
+        assert_eq!(state.pending_cancel_identity(&id), None);
+        assert_eq!(
+            state.pending_order_action(&id),
+            Some(PendingOrderAction::cancel(!marked))
+        );
+        assert!(!state.set_pending_modify_action(&modification));
+        assert!(token.is_cancelled());
+        assert!(state.clear_pending_cancel_if_command(&id, queued));
+        assert_eq!(state.pending_order_action(&id), None);
+        assert!(state.set_pending_modify_action(&modification));
+    }
+
+    #[rstest]
+    fn cancel_terminal_report_invalidates_queued_promotions() {
+        let state = WsDispatchState::new();
+        let id = cloid("CANCEL-TERMINAL");
+        let first = UUID4::new();
+        let second = UUID4::new();
+        state.register_cancel_command(id, first, true);
+        state.promote_pending_cancel(&id, first, 3, 41, true);
+        let token = state.pending_cancel_token(&id, 3, 41).unwrap();
+        state.register_cancel_command(id, second, false);
+        let mut report = stub_open_order_status_report(id.as_str());
+        report.order_status = OrderStatus::Canceled;
+        let report = state.preserve_pending_order_status(report);
+
+        assert_eq!(report.order_status, OrderStatus::Canceled);
+        assert!(!state.promote_pending_cancel(&id, second, 3, 42, false));
+        assert_eq!(state.pending_cancel_identity(&id), None);
+        assert_eq!(state.pending_order_action(&id), None);
+        assert!(token.is_cancelled());
+    }
+
+    #[rstest]
+    #[case::marked(PendingOrderAction::Cancel, true)]
+    #[case::unmarked(PendingOrderAction::CancelUnmarked, false)]
+    fn cancel_probe_retirement_preserves_current_and_newer_submissions(
+        #[case] action: PendingOrderAction,
+        #[case] emit_rejected: bool,
+    ) {
+        let state = WsDispatchState::new();
+        let ids = [
+            ClientOrderId::from("CANCEL-OLD"),
+            ClientOrderId::from("CANCEL-CURRENT"),
+            ClientOrderId::from("CANCEL-NEWER"),
+        ];
+        let mut tokens = Vec::new();
+
+        for (i, id) in ids.iter().enumerate() {
+            let epoch = i as u64 + 1;
+            let nonce = i as i64 + 41;
+            state.set_pending_order_action(*id, action);
+            state.set_pending_cancel_nonce(id, epoch, nonce, emit_rejected);
+            tokens.push(state.pending_cancel_token(id, epoch, nonce).unwrap());
+        }
+
+        state.stop_cancel_probes_before(2);
+        state.stop_cancel_probes_before(1);
+        assert_eq!(
+            tokens
+                .iter()
+                .map(CancellationToken::is_cancelled)
+                .collect::<Vec<_>>(),
+            vec![true, false, false]
+        );
+
+        for (i, id) in ids.iter().enumerate() {
+            assert_eq!(
+                state.pending_cancel_nonce(id),
+                Some((i as u64 + 1, i as i64 + 41))
+            );
+            assert_eq!(state.pending_order_action(id), Some(action));
+        }
+
+        state.clear_pending_order_action(&ids[1]);
+        assert_eq!(
+            tokens
+                .iter()
+                .map(CancellationToken::is_cancelled)
+                .collect::<Vec<_>>(),
+            vec![true, true, false]
+        );
+        assert_eq!(state.pending_cancel_nonce(&ids[1]), None);
+        assert_eq!(state.pending_cancel_nonce(&ids[2]), Some((3, 43)));
+    }
+
+    #[rstest]
+    fn cancel_probe_retirement_preserves_overlapping_modify() {
+        let state = WsDispatchState::new();
+        let id = ClientOrderId::from("CANCEL-WITH-MODIFY");
+
+        let command = ModifyOrder::new(
+            TraderId::from("TESTER-001"),
+            None,
+            StrategyId::from("S-001"),
+            InstrumentId::from("ETH-PERP.LIGHTER"),
+            id,
+            Some(VenueOrderId::from("789")),
+            Some(Quantity::from("0.2000")),
+            Some(Price::from("2362.00")),
+            None,
+            UUID4::new(),
+            UnixNanos::default(),
+            None,
+            None,
+        );
+        assert!(state.set_pending_modify_action(&command));
+        state.set_pending_modify_nonce(&id, command.command_id, 1, 40);
+        state.set_pending_order_action(id, PendingOrderAction::Cancel);
+        state.set_pending_cancel_nonce(&id, 1, 41, true);
+        let token = state.pending_cancel_token(&id, 1, 41).unwrap();
+        state.stop_cancel_probes_before(2);
+        assert!(token.is_cancelled());
+        assert_eq!(state.pending_cancel_nonce(&id), Some((1, 41)));
+        assert_eq!(state.pending_modify_nonce(&id), Some((1, 40)));
+        assert_eq!(
+            state.pending_order_action(&id),
+            Some(PendingOrderAction::Cancel)
+        );
+        assert!(state.clear_pending_cancel_if_nonce(&id, 1, 41));
+        assert_eq!(
+            state.pending_order_action(&id),
+            Some(PendingOrderAction::Modify)
+        );
+        assert_eq!(state.pending_modify_nonce(&id), Some((1, 40)));
+    }
+}

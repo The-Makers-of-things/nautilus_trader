@@ -1,0 +1,432 @@
+# -------------------------------------------------------------------------------------------------
+#  Copyright (C) 2015-2026 Nautech Systems Pty Ltd. All rights reserved.
+#  https://nautechsystems.io
+#
+#  Licensed under the GNU Lesser General Public License Version 3.0 (the "License");
+#  You may not use this file except in compliance with the License.
+#  You may obtain a copy of the License at https://www.gnu.org/licenses/lgpl-3.0.en.html
+#
+#  Unless required by applicable law or agreed to in writing, software
+#  distributed under the License is distributed on an "AS IS" BASIS,
+#  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+#  See the License for the specific language governing permissions and
+#  limitations under the License.
+# -------------------------------------------------------------------------------------------------
+"""
+Test polymarket loader behavior.
+"""
+
+import json
+from collections.abc import Iterator
+from datetime import UTC
+from datetime import datetime
+from http.server import BaseHTTPRequestHandler
+from http.server import ThreadingHTTPServer
+from threading import Thread
+from types import SimpleNamespace
+from typing import ClassVar
+from urllib.parse import parse_qs
+from urllib.parse import urlparse
+
+import pytest
+
+from nautilus_trader.adapters.polymarket import PolymarketDataLoader
+from nautilus_trader.model import BinaryOption
+
+
+CONDITION_ID = "0xcondition"
+YES_TOKEN = "101"
+NO_TOKEN = "202"
+V2_YES_TOKEN = "303"
+V2_NO_TOKEN = "404"
+
+
+def _gamma_market(slug: str = "test-market") -> dict[str, object]:
+    return {
+        "id": "100001",
+        "conditionId": CONDITION_ID,
+        "questionID": "0xquestion",
+        "version": "v3"
+        if slug == "unknown-gamma"
+        else "v2"
+        if slug.startswith("v2-") and slug != "v2-clob"
+        else "v1",
+        "clobTokenIds": json.dumps([YES_TOKEN, NO_TOKEN]),
+        "positionIds": [V2_YES_TOKEN, V2_NO_TOKEN],
+        "outcomes": json.dumps(["Yes", "No"]),
+        "resolutionStatus": "resolved",
+        "outcomePrices": json.dumps(["1", "0"]),
+        "question": "Will the loader test pass?",
+        "description": "Test market",
+        "startDate": "2026-01-01T00:00:00Z",
+        "endDate": "2026-12-31T00:00:00Z",
+        "active": False,
+        "closed": True,
+        "closedTime": "2026-06-01T00:00:00Z",
+        "umaResolutionStatus": "resolved",
+        "resolutionSource": "https://example.com/result",
+        "acceptingOrders": False,
+        "enableOrderBook": True,
+        "orderPriceMinTickSize": 0.01,
+        "slug": slug,
+        "negRisk": False,
+        "events": [],
+    }
+
+
+def _clob_market(slug: str) -> dict[str, object]:
+    version = "v2" if slug.startswith("v2-") and slug != "v2-gamma" else "v1"
+    yes_token, no_token = (V2_YES_TOKEN, V2_NO_TOKEN) if version == "v2" else (YES_TOKEN, NO_TOKEN)
+
+    tokens: list[dict[str, object]] = [
+        {"token_id": yes_token, "outcome": "Yes", "winner": True},
+        {"token_id": no_token, "outcome": "No", "winner": False},
+    ]
+
+    if slug.endswith("-reordered"):
+        tokens.reverse()
+
+    if slug == "empty-tokens":
+        tokens.clear()
+    elif slug == "empty-id":
+        tokens[0]["token_id"] = ""
+    elif slug == "malformed-market":
+        tokens.pop()
+
+    return {
+        "version": version,
+        "condition_id": CONDITION_ID,
+        "closed": True,
+        "tokens": tokens,
+    }
+
+
+def _trade(asset: str, timestamp: int, suffix: str) -> dict[str, object]:
+    return {
+        "token_id": asset,
+        "condition_id": CONDITION_ID,
+        "side": "BUY",
+        "price": 0.60,
+        "size": 10.0,
+        "timestamp": timestamp,
+        "transaction_hash": f"0x{suffix}",
+    }
+
+
+def _trades_page(slug: str) -> dict[str, object]:
+    yes_token, no_token = (
+        (V2_YES_TOKEN, V2_NO_TOKEN) if slug.startswith("v2-") else (YES_TOKEN, NO_TOKEN)
+    )
+
+    return {
+        "data": [
+            _trade(yes_token, 1_710_000_005, "f"),
+            _trade(yes_token, 1_710_000_004, "e"),
+            _trade(yes_token, 1_710_000_003, "d"),
+            _trade(yes_token, 1_710_000_002, "c"),
+            _trade(no_token, 1_710_000_001, "b"),
+            _trade(yes_token, 1_710_000_000, "a"),
+        ],
+        "pagination": {
+            "limit": 1000,
+            "offset": 0,
+            "has_more": False,
+            "next_cursor": None,
+        },
+    }
+
+
+class _PolymarketRequestHandler(BaseHTTPRequestHandler):
+    query_log: ClassVar[list[tuple[str, dict[str, list[str]]]]] = []
+    current_slug = "test-market"
+
+    def do_GET(self) -> None:
+        """
+        Do get.
+        """
+        parsed = urlparse(self.path)
+        query = parse_qs(parsed.query)
+        self.query_log.append((parsed.path, query))
+        if parsed.path.startswith("/markets/slug/"):
+            self._send_market_by_slug(parsed.path)
+        elif parsed.path == "/markets/keyset":
+            self._send_json(self._markets(query))
+        elif parsed.path == "/events/keyset":
+            self._send_json({"events": [self._event()], "next_cursor": None})
+        elif parsed.path == "/events":
+            slug = query.get("slug", [""])[0]
+            self._send_json([] if slug == "missing-event" else [self._event(slug)])
+        elif parsed.path == "/tags":
+            self._send_json([{"id": "1", "label": "Test", "slug": "test"}])
+        elif parsed.path == "/public-search":
+            self._send_json({"markets": [_gamma_market()], "events": [self._event()]})
+        elif parsed.path == "/v2/trades":
+            self._send_json(_trades_page(self.current_slug))
+        elif parsed.path.startswith("/markets/"):
+            self._send_json(_clob_market(self.current_slug))
+        else:
+            self.send_error(404)
+
+    def _send_market_by_slug(self, path: str) -> None:
+        slug = path.removeprefix("/markets/slug/")
+        type(self).current_slug = slug
+        if slug == "missing-market":
+            self.send_error(404)
+        elif slug == "malformed-response":
+            self._send_json({"id": "broken"})
+        else:
+            self._send_json(_gamma_market(slug))
+
+    def log_message(self, _format: str, *_args: object) -> None:
+        """
+        Log message.
+        """
+        return
+
+    def _markets(self, query: dict[str, list[str]]) -> dict[str, object]:
+        slug = query.get("slug", ["test-market"])[0]
+        if "slug" in query:
+            type(self).current_slug = slug
+
+        if slug == "missing-market":
+            markets: list[dict[str, object]] = []
+        elif slug == "malformed-response":
+            markets = [{"id": "broken"}]
+        else:
+            market = _gamma_market(slug)
+            if "condition_ids" in query:
+                market["feeSchedule"] = {
+                    "exponent": 2.0,
+                    "rate": 0.02,
+                    "takerOnly": True,
+                    "rebateRate": 0.0,
+                }
+            markets = [market]
+        return {"markets": markets, "next_cursor": None}
+
+    @staticmethod
+    def _event(slug: str = "test-event") -> dict[str, object]:
+        markets = [_gamma_market()]
+
+        if slug == "unsupported-protocol-event":
+            unsupported = _gamma_market("unknown-gamma")
+            unsupported["id"] = "100002"
+            unsupported["conditionId"] = "0xunsupported"
+            markets.append(unsupported)
+
+        return {
+            "id": "200001",
+            "slug": slug,
+            "title": "Test event",
+            "active": False,
+            "closed": True,
+            "markets": markets,
+        }
+
+    def _send_json(self, value: object) -> None:
+        body = json.dumps(value).encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+
+@pytest.fixture
+def polymarket_api() -> Iterator[SimpleNamespace]:
+    """
+    Polymarket api.
+    """
+    _PolymarketRequestHandler.query_log = []
+    _PolymarketRequestHandler.current_slug = "test-market"
+    server = ThreadingHTTPServer(("127.0.0.1", 0), _PolymarketRequestHandler)
+    thread = Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    address = f"http://127.0.0.1:{server.server_port}"
+
+    try:
+        yield SimpleNamespace(address=address, query_log=_PolymarketRequestHandler.query_log)
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("version", ["v1", "v2"])
+@pytest.mark.parametrize("reordered", [False, True])
+async def test_loader_factory_and_historical_window(
+    polymarket_api: SimpleNamespace,
+    version: str,
+    reordered: bool,
+) -> None:
+    """
+    Test loader factory and historical window.
+    """
+    address = polymarket_api.address
+    slug = "v2-market" if version == "v2" else "test-market"
+    if reordered:
+        slug += "-reordered"
+    selected_token = V2_YES_TOKEN if version == "v2" else YES_TOKEN
+    loader = await PolymarketDataLoader.from_market_slug(
+        slug,
+        token_index=0,
+        base_url_http=address,
+        base_url_gamma=address,
+        base_url_data_api=address,
+    )
+
+    trades = await loader.load_trades(
+        start=datetime.fromtimestamp(1_710_000_002, tz=UTC),
+        end=datetime.fromtimestamp(1_710_000_004, tz=UTC),
+        limit=2,
+    )
+
+    assert isinstance(loader.instrument, BinaryOption)
+    assert loader.token_id == selected_token
+    assert str(loader.instrument.raw_symbol) == selected_token
+    assert str(loader.instrument.id) == f"{CONDITION_ID}-{selected_token}.POLYMARKET"
+    assert loader.condition_id == CONDITION_ID
+    assert loader.instrument.description == "Will the loader test pass?"
+    assert loader.instrument.info["description"] == "Test market"
+    assert loader.instrument.info["market_version"] == version
+    assert loader.instrument.outcome == "Yes"
+    assert [trade.instrument_id for trade in trades] == [loader.instrument.id] * 2
+    assert [trade.ts_event for trade in trades] == [
+        1_710_000_002_000_000_000,
+        1_710_000_003_000_000_000,
+    ]
+    assert loader.resolution_metadata["closed"] is True
+    assert loader.resolution_metadata["tokens"][1 if reordered else 0]["winner"] is True
+    assert "closed" not in loader.instrument.info
+    assert "winner" not in loader.instrument.info
+    assert any("condition_ids" in query for _, query in polymarket_api.query_log)
+    trades_queries = [query for path, query in polymarket_api.query_log if path == "/v2/trades"]
+    assert trades_queries
+    # The v2 condition feed ignores start/end bounds, so the window filters
+    # locally and the wire carries neither parameter.
+    for query in trades_queries:
+        assert query.get("condition") == [CONDITION_ID]
+        assert "start" not in query
+        assert "end" not in query
+
+
+@pytest.mark.asyncio
+async def test_loader_discovery_and_event_factory(polymarket_api: SimpleNamespace) -> None:
+    """
+    Test loader discovery and event factory.
+    """
+    address = polymarket_api.address
+
+    market = await PolymarketDataLoader.query_market_by_slug("test-market", address)
+    details = await PolymarketDataLoader.query_market_details(CONDITION_ID, address)
+    event = await PolymarketDataLoader.query_event_by_slug("test-event", address)
+    markets = await PolymarketDataLoader.query_markets({"is_active": False}, address)
+    events = await PolymarketDataLoader.query_events({"active": False}, address)
+    tags = await PolymarketDataLoader.query_tags(address)
+    search = await PolymarketDataLoader.query_search("test", base_url_gamma=address)
+    loaders = await PolymarketDataLoader.from_event_slug(
+        "test-event",
+        token_index=1,
+        base_url_http=address,
+        base_url_gamma=address,
+        base_url_data_api=address,
+    )
+
+    assert market["slug"] == "test-market"
+    assert details["condition_id"] == CONDITION_ID
+    assert event["slug"] == "test-event"
+    assert markets[0]["conditionId"] == CONDITION_ID
+    assert events[0]["id"] == "200001"
+    assert tags == [{"id": "1", "label": "Test", "slug": "test"}]
+    assert search["markets"][0]["id"] == "100001"
+    assert len(loaders) == 1
+    assert loaders[0].token_id == NO_TOKEN
+    assert ("/markets/slug/test-market", {}) in polymarket_api.query_log
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("slug", "message"),
+    [
+        ("missing-market", "Market with slug 'missing-market' not found"),
+        ("empty-tokens", "No tokens found"),
+        ("empty-id", "has an empty token ID"),
+        ("malformed-market", "CLOB outcome IDs or labels do not match Gamma market outcomes"),
+        ("unknown-gamma", "Unsupported Polymarket data protocol v3; expected v1 or v2"),
+        (
+            "v2-gamma",
+            "CLOB market protocol does not match Gamma market protocol",
+        ),
+        ("v2-clob", "CLOB market protocol does not match Gamma market protocol"),
+    ],
+)
+async def test_loader_rejects_invalid_market_data(
+    polymarket_api: SimpleNamespace,
+    slug: str,
+    message: str,
+) -> None:
+    """
+    Test loader rejects invalid market data.
+    """
+    address = polymarket_api.address
+
+    with pytest.raises(ValueError, match=message):
+        await PolymarketDataLoader.from_market_slug(
+            slug,
+            base_url_http=address,
+            base_url_gamma=address,
+            base_url_data_api=address,
+        )
+
+
+@pytest.mark.asyncio
+async def test_loader_rejects_missing_event_and_malformed_response(
+    polymarket_api: SimpleNamespace,
+) -> None:
+    """
+    Test loader rejects missing event and malformed response.
+    """
+    address = polymarket_api.address
+
+    with pytest.raises(ValueError, match="Event with slug 'missing-event' not found"):
+        await PolymarketDataLoader.from_event_slug(
+            "missing-event",
+            base_url_http=address,
+            base_url_gamma=address,
+            base_url_data_api=address,
+        )
+
+    with pytest.raises(RuntimeError, match="missing field"):
+        await PolymarketDataLoader.query_market_by_slug("malformed-response", address)
+
+
+def test_loader_rejects_negative_token_index() -> None:
+    """
+    Test loader rejects negative token index.
+    """
+    with pytest.raises(ValueError, match="Token index -1 cannot be negative"):
+        PolymarketDataLoader.from_market_slug("test-market", token_index=-1)
+
+
+@pytest.mark.asyncio
+async def test_loader_rejects_event_with_unsupported_market(
+    polymarket_api: SimpleNamespace,
+) -> None:
+    """
+    Test mixed events reject unsupported markets before CLOB hydration.
+    """
+    address = polymarket_api.address
+    with pytest.raises(
+        ValueError,
+        match="Unsupported Polymarket data protocol v3; expected v1 or v2",
+    ):
+        await PolymarketDataLoader.from_event_slug(
+            "unsupported-protocol-event",
+            base_url_http=address,
+            base_url_gamma=address,
+            base_url_data_api=address,
+        )
+
+    assert ("/markets/0xcondition", {}) in polymarket_api.query_log
+    assert not any(path == "/markets/0xunsupported" for path, _ in polymarket_api.query_log)

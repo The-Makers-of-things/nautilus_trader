@@ -1,47 +1,228 @@
 # Contributing to NautilusTrader
 
-Involvement from the trading community is a goal for this project. All help is welcome!
-Developers can open issues on GitHub to discuss proposed enhancements/changes, or
-to make bug reports.
+Thank you for helping improve NautilusTrader. High-quality contributions from the trading
+community are welcome. This guide explains how to prepare a complete, review-ready pull request.
+For questions, ask in
+[GitHub Discussions](https://github.com/nautechsystems/nautilus_trader/discussions) or on
+[Discord](https://discord.gg/NautilusTrader).
 
-It's a best practice to keep all discussions regarding changes to the codebase public.
+> [!IMPORTANT]
+>
+> Never report a security vulnerability as a public issue. Follow [SECURITY.md](SECURITY.md) instead.
 
-To contribute, the following steps should be followed;
+## Review standard
 
-- Open an issue on GitHub to discuss your proposal.
+**NautilusTrader can execute live trades involving real capital. Errors can cause financial loss, so
+all pull requests are held to a very high standard for correctness, reliability, testing, clarity,
+and maintainability.**
 
-- Once everyone is on the same page, take a fork of the `develop` branch (or ensure all upstream changes are merged).
+Maintainers appreciate the time and care a high-quality pull request requires, with or without AI.
+They review complete, locally validated pull requests thoroughly. Merge decisions still depend on
+evidence that the change meets this standard. When a contribution's expected review and maintenance
+cost is disproportionate to its value to the project, maintainers may decline it. Contributors must
+resolve blocking feedback before a pull request merges, either by updating the change or agreeing
+with a maintainer on another resolution.
 
-- Install and setup pre-commit so that the pre-commit hook will be picked up on
-  your local machine. This will automatically run various checks, auto-formatters
-  and linting tools. Further information can be found here https://pre-commit.com/.
+## Contribution assessment
 
-- Install the latest version of isort `pip install -U isort` (used in the pre-commit).
+AI coding agents have increased the volume of submissions maintainers receive from new
+contributors. **We are raising the bar on contribution quality to protect the correctness and
+maintainability of NautilusTrader.** Maintainers do not lower review standards to merge
+contributions faster or accept unnecessary complexity because code is easy to generate.
 
-- Before committing it's a good practice to run `pre-commit run --all-files` yourself.
+**We prioritize contributions from people who actively use NautilusTrader and understand the
+problems their changes solve**. Explain the problem or use case in the issue or pull request and
+keep the change within the [project's scope](ROADMAP.md#open-source-scope). You do not need to
+share proprietary strategy details. First-time and occasional contributors are welcome when
+their work meets this standard, including documentation, tooling, and specialist contributions.
 
-- It's recommended you install _Redis_ with a default configuration, so that integration
-  tests will pass on your machine.
+Maintainers may decline drive-by pull requests that shift investigation, validation, or follow-up
+onto maintainers, such as speculative refactors, fixes the contributor cannot explain, or submissions
+with blocking review feedback left unaddressed. Contributions that put collecting GitHub activity
+ahead of understanding, verifying, and following through on the work (portfolio padding) are
+not welcome. The [small-fix exception](#start-with-an-issue) waives prior agreement, not the
+quality and validation requirements.
 
-- Open a pull request (PR) on the `develop` branch with a summary comment.
+When prioritizing review, assessing submissions, or checking compliance with project policy,
+maintainers may weigh new contributors' public GitHub history. A high rate of issues, comments,
+or pull requests across many unrelated projects can raise concerns about the care and human
+review behind each submission. Maintainers assess these patterns alongside the submitted work
+and the contributor's responses, and may decline contributions when that combined evidence raises
+reasonable concerns about meaningful human direction and review, adequate validation, or
+disproportionate maintainer effort. Activity volume alone does not establish portfolio padding
+or a policy violation.
 
-- The CI system will run the full test-suite over your code including all unit and integration tests, so please include appropriate tests
-  with the PR.
+Local validation remains required under the
+[local check requirements](#run-local-checks-and-follow-repository-rules), and summaries of results
+remain optional. Maintainers may request specific evidence when they need it to assess a change.
 
-- [Codacy](https://www.codacy.com/) will perform an automated code review. Please
-  fix any issues which cause a failed check, and add the commit to your PR.
+## Commercial conflicts
 
-- You'll also be required to sign a standard Contributor License Agreement (CLA), which is
-  administered automatically through CLAassisant.
+NautilusTrader provides a free and open-source framework to help quant traders and firms research,
+develop, and deploy trading strategies and systems. The project builds its own commercial offerings
+around the engine. The contribution process is not intended to support the development or promotion
+of competing commercial products.
 
-- We will endeavour to review your code expeditiously, there may be some
-  feedback on needed changes before merging.
+Before contributing, disclose any ownership, employment, sponsorship, or other commercial
+relationship with a product that may compete with the project's offerings. Maintainers assess
+competition against both announced offerings and products we are planning or developing, across local
+and cloud deployments.
 
-### Tips
-- Conform to the established coding practices, see _Coding Standards_ in the
-  [Developer Guide](https://nautilus-trader.readthedocs.io/en/latest/developer_guide/overview.html).
+Maintainers may decline or close issues and pull requests where a contributor's commercial activities
+conflict with the project's commercial direction. They may also ask the contributor to pause
+contributions.
 
-- Keep PR's small and focused.
-- Reference the related GitHub issue(s) in the PR comment.
+Maintainers apply this policy consistently to comparable situations to avoid implying support for
+or endorsement of competing products through ongoing collaboration. This policy governs participation
+in the contribution process and does not change the project's [license](LICENSE).
 
-Thank you for your interest in _NautilusTrader_!
+## Use of AI
+
+If you use AI tools, you remain responsible for every submission. Read and follow the
+[AI Policy](AI_POLICY.md), which explains the requirements for human direction, review,
+communication, and attribution.
+
+## Limit open issues and pull requests
+
+**Keep at most one open issue and one open pull request in this repository at a time, unless a
+maintainer explicitly agrees to or requests more.** This keeps maintainer time from becoming
+concentrated on one contributor's work. Maintainers may close additional issues or pull requests.
+
+**Do not comment across many issues or pull requests.** Comment only where you have relevant,
+verified information to add. Even useful comments, spread widely, can concentrate maintainer time
+on one contributor's activity. Ping maintainers only when the work is blocked on their input, and
+allow at least a week before pinging again.
+
+## Start with an issue
+
+**Before starting a substantial change, such as a new feature, integration, or design change,
+open a GitHub issue or comment on a relevant existing issue, then wait for a maintainer to agree
+on the problem and approach**. Small, self-contained fixes, such as typos, obvious documentation
+corrections, or narrowly scoped bug fixes with focused tests, do not need prior agreement. Pull
+requests for more substantial changes without prior discussion and agreement may be closed without
+review. Early agreement is the quickest way to avoid work that can't be merged.
+
+**Before opening a pull request, read the issue discussion and check for existing offers to implement
+the work, or other open pull requests.** Do not open a competing pull request when another contributor
+has already offered to implement the work or has one under review. Comment on the existing issue with
+useful context or an alternative approach so contributors and maintainers can coordinate. Pull
+requests opened without that coordination may be closed without review. If that offer or pull request
+appears inactive, ask there and wait for a maintainer to confirm that the work is available before
+opening.
+
+Check the [open-source scope](ROADMAP.md#open-source-scope) first so your idea fits what the project
+maintains, and read the [Code of Conduct](CODE_OF_CONDUCT.md).
+
+You also need to sign the [Contributor License Agreement](CLA.md) before we can merge your work.
+[CLA Assistant](https://cla-assistant.io/) prompts you automatically on your first PR.
+
+> [!NOTE]
+>
+> **New integrations** are a major undertaking for the project and require discussion and approval
+> before any PR is opened. See
+> [ROADMAP: Community-contributed integrations](ROADMAP.md#community-contributed-integrations) for
+> the process, and [ADAPTERS.md](ADAPTERS.md) for adapter tiers, community listings, and support
+> boundaries.
+
+## Find the right package
+
+The Rust workspace lives under `crates/`, and the PyO3 Python package lives under `python/`. See
+[MIGRATION_V2.md](MIGRATION_V2.md) when porting code from the legacy v1 package on `develop_v1`.
+If you aren't sure where a change belongs, ask in the issue.
+
+## Set up your environment
+
+Fork the repository and branch from `develop`, merging upstream changes regularly to keep your fork
+current. Then follow the [Environment setup guide](docs/developer_guide/environment_setup.md) for
+Rust, Python, and uv. With those in place, install the pinned development tools. This includes
+[prek](https://github.com/j178/prek), which runs file checks before each commit and validates the
+commit message before Git records it:
+
+```bash
+cargo install cargo-binstall --version "$(bash scripts/cargo-tool-version.sh cargo-binstall)" --locked
+make install-tools
+prek install
+```
+
+`prek install` installs both hook types configured by the repository.
+
+`make install-tools` reads shared pins from `.nautilus-engineering/tools.toml` and
+NautilusTrader-specific pins from `Cargo.toml` and `tools.toml`. See
+[Install development tools](docs/developer_guide/environment_setup.md#2-install-development-tools)
+for the full list, what each tool does, and which tools install separately.
+
+## Make your change
+
+Include tests that cover changed behavior or logic. Running the relevant target locally first saves
+a round trip:
+
+- `make cargo-test` runs the Rust tests.
+- `make pytest` runs the Python tests, building the extension and stubs first.
+
+Rust tests use `#[rstest]` rather than `#[test]`, including non-parameterized ones, and pre-commit
+enforces this (`#[tokio::test]` is fine for async tests). See
+[Testing](docs/developer_guide/testing.md) for the wider conventions.
+
+Follow the established coding practices in the
+[Developer Guide](https://nautilustrader.io/docs/latest/developer_guide/). For documentation changes,
+follow the style guide in `docs/developer_guide/docs.md` (use sentence case for headings H2 and
+below).
+
+## Before you open a PR
+
+### Prepare a review-ready change
+
+Open a pull request only when the change is complete, locally validated, and ready for maintainer
+review, unless a maintainer asks for an early draft. Do not use draft or work-in-progress pull
+requests as a development workspace. Develop and iterate on your branch before opening the pull
+request.
+
+### Run local checks and follow repository rules
+
+Complete these requirements before opening or updating a pull request:
+
+- Run `make format`, then run `make pre-commit` in your local environment. Confirm it passes before
+  opening a pull request or pushing an update to one.
+- Run all tests relevant to the change locally. You may summarize relevant validation in the pull
+  request when it helps reviewers, but exact commands and full output are not required.
+- If you changed PyO3 bindings or the Rust docs behind them, run `make py-stubs` and commit the
+  generated output. These stubs are generated rather than hand-edited, and CI fails on drift. See
+  [Generated Python artifacts](docs/developer_guide/rust.md#generated-python-artifacts).
+- Give new Rust files the standard copyright header. See
+  [File header requirements](docs/developer_guide/rust.md#file-header-requirements).
+- Do not update `RELEASES.md`. Maintainers keep it current to avoid frequent merge conflicts.
+- Do not use [Conventional Commits](https://www.conventionalcommits.org/) syntax for commit messages
+  or PR titles. Follow [Commit messages](docs/developer_guide/coding_standards.md#commit-messages)
+  instead. PR titles matter because a squash merge turns the PR title into the commit subject.
+- Do not put an issue or pull request number in a commit subject or PR title, including a trailing
+  `(#9999)`. The squash merge appends that number for you, so a hand-written one duplicates it.
+  Reference issues from the commit body instead, such as `Resolves #4534`.
+
+For higher assurance, you can also run `make pre-flight`, which performs the project's broad local
+validation suite. It does not replace `make pre-commit`.
+
+### Use CI responsibly
+
+Project CI confirms a change that you have already validated locally. **Do not rely on an open pull
+request as the primary development loop.** Each push starts another CI run. Frequent incremental
+pushes consume compute, cancel work in progress, and make the Actions history harder to read, which
+can obscure meaningful failures.
+
+Batch related corrections into coherent updates. After review feedback, make the changes locally,
+rerun the relevant checks and tests, then push the complete update. If a platform, access, or local
+resource constraint prevents a relevant check, discuss the limitation with a maintainer before
+requesting review and state it clearly in the pull request.
+
+### Open the pull request
+
+Open the PR against `develop` with a concise summary and a reference to any relevant GitHub issue.
+Keep it small and focused, which makes review much faster.
+
+Make the PR description accurate, specific, and easy to review. Remove generic or bloated prose
+that could hide important details.
+
+By opening a PR, you confirm that you have read this guide and, if you used AI, the
+[AI Policy](AI_POLICY.md). You also confirm that you understand and can explain every submitted
+change and all information in the PR description.
+
+We typically respond to pull requests within a couple of days.

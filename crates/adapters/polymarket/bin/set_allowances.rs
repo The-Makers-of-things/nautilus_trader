@@ -1,0 +1,235 @@
+// -------------------------------------------------------------------------------------------------
+//  Copyright (C) 2015-2026 Nautech Systems Pty Ltd. All rights reserved.
+//  https://nautechsystems.io
+//
+//  Licensed under the GNU Lesser General Public License Version 3.0 (the "License");
+//  You may not use this file except in compliance with the License.
+//  You may obtain a copy of the License at https://www.gnu.org/licenses/lgpl-3.0.en.html
+//
+//  Unless required by applicable law or agreed to in writing, software
+//  distributed under the License is distributed on an "AS IS" BASIS,
+//  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+//  See the License for the specific language governing permissions and
+//  limitations under the License.
+// -------------------------------------------------------------------------------------------------
+
+//! Sets Polygon CTF approvals, or V2 trading approvals with `--v2-pusd-limit <amount>`.
+//!
+//! V2 uses the Deposit Wallet funder when distinct from the signer, otherwise the EOA.
+//! The Relayer rejects bounded Deposit Wallet exchange approvals; trading requires existing
+//! approvals. EOA mode submits directly on-chain.
+//!
+//! # Usage
+//!
+//! ```sh
+//! POLYMARKET_PK=0x... cargo run -p nautilus-polymarket --features allowances --bin polymarket-set-allowances
+//! ```
+//!
+//! Set an explicit V2 pUSD limit, including BUY fees:
+//!
+//! ```sh
+//! cargo run -p nautilus-polymarket --features allowances --bin polymarket-set-allowances -- --v2-pusd-limit 5
+//! ```
+
+use std::str::FromStr;
+
+use alloy::{
+    network::{EthereumWallet, ReceiptResponse},
+    providers::ProviderBuilder,
+    signers::local::PrivateKeySigner,
+    transports::http::reqwest::{Client, redirect::Policy},
+};
+use alloy_primitives::Address;
+use nautilus_polymarket::{
+    common::credential::{EvmPrivateKey, RelayerApiKey},
+    positions::{PolymarketPositionClient, PolymarketPositionOutcome, amounts::pusd_to_base_units},
+    signing::eip712::{PolymarketApproval, approval_plan, approval_plan_v2},
+};
+use rust_decimal::Decimal;
+
+const DEFAULT_POLYGON_RPC_URL: &str = "https://polygon.drpc.org";
+const POLYGON_CHAIN_ID: u64 = 137;
+
+alloy::sol! {
+    #[sol(rpc)]
+    interface Erc20 {
+        function approve(address spender, uint256 value) external returns (bool);
+    }
+
+    #[sol(rpc)]
+    interface Erc1155 {
+        function setApprovalForAll(address operator, bool approved) external;
+    }
+}
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    dotenvy::dotenv().ok();
+    let private_key =
+        std::env::var("POLYMARKET_PK").expect("POLYMARKET_PK environment variable must be set");
+    let rpc_url =
+        std::env::var("POLYGON_RPC_URL").unwrap_or_else(|_| DEFAULT_POLYGON_RPC_URL.to_string());
+
+    let mut args = std::env::args().skip(1);
+
+    let limit = match args.next().as_deref() {
+        None => None,
+        Some("--v2-pusd-limit") => Some(Decimal::from_str(
+            &args.next().ok_or("Missing V2 pUSD limit")?,
+        )?),
+        Some(_) => return Err("Expected --v2-pusd-limit <amount>".into()),
+    };
+
+    if args.next().is_some() {
+        return Err("Unexpected allowance argument".into());
+    }
+
+    let funder = std::env::var("POLYMARKET_FUNDER").ok();
+    let deposit_wallet = if limit.is_some() {
+        match funder {
+            Some(funder)
+                if Address::from_str(&funder)?
+                    != PrivateKeySigner::from_str(&private_key)?.address() =>
+            {
+                Some(funder)
+            }
+            _ => None,
+        }
+    } else {
+        None
+    };
+
+    if let Some(funder) = deposit_wallet {
+        let key = EvmPrivateKey::new(&private_key)?;
+        let limit = limit.ok_or("Deposit Wallet approvals require --v2-pusd-limit <amount>")?;
+        let relayer_key = RelayerApiKey::resolve(None, None)?;
+        let client =
+            PolymarketPositionClient::new(&key, &funder, relayer_key, None, None, None, None)?
+                .with_rpc_url(rpc_url);
+        let outcome = client.approve_v2_trading(limit).await?.wait().await?;
+        match outcome {
+            PolymarketPositionOutcome::Confirmed { .. } => {
+                println!("Confirmed Deposit Wallet V2 trading approvals");
+            }
+            _ => return Err("Deposit Wallet approvals were not confirmed".into()),
+        }
+
+        Ok(())
+    } else {
+        run(&private_key, &rpc_url, limit).await
+    }
+}
+
+async fn run(
+    private_key: &str,
+    rpc_url: &str,
+    v2_pusd_limit: Option<Decimal>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let private_key = EvmPrivateKey::new(private_key)?;
+    let signer = PrivateKeySigner::from_str(private_key.as_hex())?;
+    let wallet = EthereumWallet::from(signer);
+    let client = Client::builder().redirect(Policy::none()).build()?;
+    let provider = ProviderBuilder::new()
+        .with_chain_id(POLYGON_CHAIN_ID)
+        .wallet(wallet)
+        .connect_reqwest(client, rpc_url.parse()?);
+
+    let approvals: Vec<_> = match v2_pusd_limit {
+        Some(limit) => approval_plan_v2(pusd_to_base_units(limit)?)
+            .into_iter()
+            .collect(),
+        None => approval_plan().collect(),
+    };
+
+    for approval in approvals {
+        match approval {
+            PolymarketApproval::Collateral {
+                contract,
+                spender,
+                amount,
+            } => {
+                let collateral = Erc20::new(contract, provider.clone());
+                let call = collateral.approve(spender, amount);
+                let receipt = call.send().await?.get_receipt().await?;
+                receipt.ensure_success()?;
+                println!(
+                    "Approved pUSD collateral for {spender}: {}",
+                    receipt.transaction_hash(),
+                );
+            }
+            PolymarketApproval::ConditionalTokens {
+                contract,
+                operator,
+                approved,
+            } => {
+                let ctf = Erc1155::new(contract, provider.clone());
+                let call = ctf.setApprovalForAll(operator, approved);
+                let receipt = call.send().await?.get_receipt().await?;
+                receipt.ensure_success()?;
+                println!(
+                    "Approved position ledger {contract} for {operator}: {}",
+                    receipt.transaction_hash(),
+                );
+            }
+        }
+    }
+
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+
+    use axum::{Router, http::StatusCode};
+
+    use super::*;
+
+    #[tokio::test]
+    async fn test_allowance_requests_reject_redirects() {
+        let origin = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = origin.local_addr().unwrap();
+        let destination = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let target = destination.local_addr().unwrap();
+        let destination_requests = Arc::new(AtomicUsize::new(0));
+        let requests = destination_requests.clone();
+        let destination_router = Router::new().fallback(move || {
+            let requests = requests.clone();
+            async move {
+                requests.fetch_add(1, Ordering::SeqCst);
+                StatusCode::BAD_REQUEST
+            }
+        });
+
+        let destination_task = tokio::spawn(async move {
+            axum::serve(destination, destination_router).await.unwrap();
+        });
+        let origin_router = Router::new().fallback(move || async move {
+            (
+                StatusCode::TEMPORARY_REDIRECT,
+                [("location", format!("http://{target}/rpc"))],
+            )
+        });
+
+        let origin_task = tokio::spawn(async move {
+            axum::serve(origin, origin_router).await.unwrap();
+        });
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            run(
+                "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+                &format!("http://{addr}/rpc"),
+                None,
+            ),
+        )
+        .await;
+        origin_task.abort();
+        destination_task.abort();
+
+        assert_eq!(destination_requests.load(Ordering::SeqCst), 0);
+        assert!(result.unwrap().unwrap_err().to_string().contains("307"));
+    }
+}

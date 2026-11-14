@@ -1,0 +1,8663 @@
+// -------------------------------------------------------------------------------------------------
+//  Copyright (C) 2015-2026 Nautech Systems Pty Ltd. All rights reserved.
+//  https://nautechsystems.io
+//
+//  Licensed under the GNU Lesser General Public License Version 3.0 (the "License");
+//  You may not use this file except in compliance with the License.
+//  You may obtain a copy of the License at https://www.gnu.org/licenses/lgpl-3.0.en.html
+//
+//  Unless required by applicable law or agreed to in writing, software
+//  distributed under the License is distributed on an "AS IS" BASIS,
+//  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+//  See the License for the specific language governing permissions and
+//  limitations under the License.
+// -------------------------------------------------------------------------------------------------
+
+//! WebSocket message handler for Deribit.
+//!
+//! The handler runs in a dedicated Tokio task as the I/O boundary between the client
+//! orchestrator and the network layer. It exclusively owns the `WebSocketClient` and
+//! processes commands from the client via an unbounded channel.
+
+use std::{
+    collections::{HashSet, VecDeque},
+    sync::{
+        Arc,
+        atomic::{AtomicBool, AtomicU64, Ordering},
+    },
+};
+
+use ahash::{AHashMap, AHashSet};
+use futures_util::{StreamExt, future::BoxFuture};
+use indexmap::IndexMap;
+use nautilus_common::{
+    cache::fifo::{FifoCache, FifoCacheMap},
+    live::dst::time::{Duration, Instant},
+};
+use nautilus_core::{
+    AtomicSet, AtomicTime, UUID4, UnixNanos,
+    string::secret::{SecretString, zeroize_json_value},
+    time::get_atomic_clock_realtime,
+};
+use nautilus_live::book::{
+    BookSequenceOutcome, DEFAULT_BOOK_SNAPSHOT_TIMEOUT_SECS, snapshot::SnapshotGate,
+};
+use nautilus_model::{
+    data::{Bar, CustomData, Data, DataType, InstrumentStatus},
+    enums::{MarketStatusAction, OrderSide, OrderType},
+    events::{
+        AccountState, OrderAccepted, OrderCancelDenied, OrderCancelRejected, OrderFilled,
+        OrderModifyDenied, OrderModifyRejected, OrderRejected,
+    },
+    identifiers::{
+        AccountId, ClientOrderId, InstrumentId, StrategyId, Symbol, TradeId, TraderId, VenueOrderId,
+    },
+    instruments::{Instrument, InstrumentAny},
+    reports::FillReport,
+    types::Currency,
+};
+use nautilus_network::{
+    RECONNECTED,
+    error::SendError,
+    retry::{RetryManager, create_websocket_retry_manager},
+    websocket::{AuthTracker, SubscriptionState, WebSocketClient},
+};
+use parking_lot::Mutex;
+use rust_decimal::Decimal;
+use serde_json::value::RawValue;
+use tokio_tungstenite::tungstenite::Message;
+use tokio_util::sync::CancellationToken;
+use ustr::Ustr;
+
+use super::{
+    enums::{DeribitBookMsgType, DeribitHeartbeatType, DeribitWsChannel, DeribitWsMethod},
+    error::DeribitWsError,
+    failure::{
+        REASON_CANCELED, classify_deribit_command_failure, classify_deribit_venue_error,
+        sanitize_strategy_reason, terminal_reason,
+    },
+    messages::{
+        DeribitAuthResult, DeribitBookMsg, DeribitCancelAllByInstrumentParams, DeribitCancelParams,
+        DeribitChartMsg, DeribitEditParams, DeribitHeartbeatParams, DeribitInstrumentStateMsg,
+        DeribitJsonRpcRequest, DeribitJsonRpcResponse, DeribitOrderMsg, DeribitOrderParams,
+        DeribitOrderResponse, DeribitPerpetualMsg, DeribitPortfolioMsg, DeribitQuoteMsg,
+        DeribitSubscribeParams, DeribitTickerMsg, DeribitTradeMsg, DeribitUserTradeMsg,
+        DeribitVolatilityIndexMsg, DeribitWsMessage, NautilusWsMessage, parse_raw_message,
+    },
+    parse::{
+        OrderEventType, determine_order_event_type, parse_book_depth, parse_book_msg,
+        parse_chart_msg, parse_deribit_order_type, parse_order_accepted_with_client_order_id,
+        parse_order_canceled_with_client_order_id, parse_order_expired_with_client_order_id,
+        parse_order_updated_with_client_order_id, parse_perpetual_to_funding_rate, parse_quote_msg,
+        parse_ticker_to_index_price, parse_ticker_to_mark_price, parse_ticker_to_option_greeks,
+        parse_trades_data, parse_user_order_msg, parse_user_trade_msg, resolution_to_bar_type,
+    },
+};
+use crate::{
+    book::{
+        recovery::{BookRecovery, recover},
+        sync::{BookKey, BookSyncTracker, UnsubscribedOutcome},
+    },
+    common::{
+        consts::{DERIBIT_RATE_LIMIT_KEY_ORDER, DERIBIT_VENUE, DERIBIT_WS_SUBSCRIPTION_KEY},
+        enums::DeribitInstrumentState,
+        parse::{parse_portfolio_to_account_state, use_cost_for_bar_volume},
+    },
+    data_types::DeribitVolatilityIndex,
+};
+
+// Deribit documents a 32 kB frame limit: https://docs.deribit.com/articles/errors
+const SUBSCRIPTION_REQUEST_MAX_BYTES: usize = 32_000;
+
+// Bounds replay and terminal tombstone caches only, never pending or active ownership
+const REPLAY_CACHE_CAPACITY: usize = 10_000;
+
+/// Type of pending request for request ID correlation.
+#[derive(Debug, Clone)]
+pub enum PendingRequestType {
+    /// Authentication request.
+    Authenticate,
+    /// Subscribe request with requested channels.
+    Subscribe { channels: Vec<String> },
+    /// Unsubscribe request with requested channels.
+    Unsubscribe { channels: Vec<String> },
+    /// Set heartbeat request.
+    SetHeartbeat,
+    /// Test/ping request (heartbeat response).
+    Test,
+    /// Buy order request.
+    Buy {
+        client_order_id: ClientOrderId,
+        trader_id: TraderId,
+        strategy_id: StrategyId,
+        instrument_id: InstrumentId,
+        order_side: OrderSide,
+        order_type: OrderType,
+    },
+    /// Sell order request.
+    Sell {
+        client_order_id: ClientOrderId,
+        trader_id: TraderId,
+        strategy_id: StrategyId,
+        instrument_id: InstrumentId,
+        order_side: OrderSide,
+        order_type: OrderType,
+    },
+    /// Edit order request.
+    Edit {
+        causation_id: Option<UUID4>,
+        venue_order_id: Option<VenueOrderId>,
+        client_order_id: ClientOrderId,
+        trader_id: TraderId,
+        strategy_id: StrategyId,
+        instrument_id: InstrumentId,
+    },
+    /// Cancel order request.
+    Cancel {
+        causation_id: Option<UUID4>,
+        venue_order_id: Option<VenueOrderId>,
+        client_order_id: ClientOrderId,
+        trader_id: TraderId,
+        strategy_id: StrategyId,
+        instrument_id: InstrumentId,
+    },
+    /// Cancel all orders by instrument request.
+    CancelAllByInstrument { instrument_id: InstrumentId },
+    /// Get order state request.
+    GetOrderState {
+        client_order_id: ClientOrderId,
+        trader_id: TraderId,
+        strategy_id: StrategyId,
+        instrument_id: InstrumentId,
+    },
+}
+
+/// Commands sent from the client to the handler.
+#[allow(missing_debug_implementations)]
+pub enum HandlerCommand {
+    /// Set the active WebSocket client.
+    SetClient(WebSocketClient),
+    /// Disconnect the WebSocket.
+    Disconnect,
+    /// Authenticate with credentials.
+    Authenticate { auth_params: SecretString },
+    /// Enable heartbeat with interval.
+    SetHeartbeat { interval: u64 },
+    /// Initialize the instrument cache.
+    InitializeInstruments(Vec<InstrumentAny>),
+    /// Update a single instrument in the cache.
+    UpdateInstrument(Box<InstrumentAny>),
+    /// Subscribe to channels.
+    Subscribe { channels: Vec<String> },
+    /// Unsubscribe from channels.
+    Unsubscribe { channels: Vec<String> },
+    /// Submit a buy order.
+    Buy {
+        params: DeribitOrderParams,
+        client_order_id: ClientOrderId,
+        trader_id: TraderId,
+        strategy_id: StrategyId,
+        instrument_id: InstrumentId,
+    },
+    /// Submit a sell order.
+    Sell {
+        params: DeribitOrderParams,
+        client_order_id: ClientOrderId,
+        trader_id: TraderId,
+        strategy_id: StrategyId,
+        instrument_id: InstrumentId,
+    },
+    /// Edit an existing order.
+    Edit {
+        causation_id: Option<UUID4>,
+        params: DeribitEditParams,
+        client_order_id: ClientOrderId,
+        trader_id: TraderId,
+        strategy_id: StrategyId,
+        instrument_id: InstrumentId,
+    },
+    /// Cancel an existing order.
+    Cancel {
+        causation_id: Option<UUID4>,
+        params: DeribitCancelParams,
+        client_order_id: ClientOrderId,
+        trader_id: TraderId,
+        strategy_id: StrategyId,
+        instrument_id: InstrumentId,
+    },
+    /// Cancel all orders by instrument.
+    CancelAllByInstrument {
+        params: DeribitCancelAllByInstrumentParams,
+        instrument_id: InstrumentId,
+    },
+    /// Get order state.
+    GetOrderState {
+        order_id: String,
+        client_order_id: ClientOrderId,
+        trader_id: TraderId,
+        strategy_id: StrategyId,
+        instrument_id: InstrumentId,
+    },
+    /// Replace a book subscription for one recovery attempt.
+    RecoverBook {
+        instrument: Ustr,
+        channel: Option<String>,
+        cancel: CancellationToken,
+        gate: SnapshotGate,
+        completion: tokio::sync::oneshot::Sender<Result<(), DeribitWsError>>,
+        recovery: Arc<BookRecovery>,
+    },
+}
+
+/// Context for an order submitted via this handler.
+///
+/// Stores the submitted order identity for routing live order and trade updates.
+#[derive(Debug, Clone)]
+pub struct OrderContext {
+    pub client_order_id: ClientOrderId,
+    pub trader_id: TraderId,
+    pub strategy_id: StrategyId,
+    pub instrument_id: InstrumentId,
+    pub order_side: OrderSide,
+    pub order_type: OrderType,
+    pub accepted: bool,
+    pub last_order_signature: Option<OrderSignature>,
+}
+
+#[derive(Debug, Clone)]
+struct TerminalOrderContext {
+    context: OrderContext,
+    late_fills_as_reports: bool,
+}
+
+/// Order fields used to identify a venue amendment.
+pub type OrderSignature = (Decimal, Option<Decimal>, Option<Decimal>);
+
+/// Deribit WebSocket feed handler.
+///
+/// Runs in a dedicated Tokio task, processing commands and raw WebSocket messages.
+#[allow(missing_debug_implementations)]
+pub struct DeribitWsFeedHandler {
+    clock: &'static AtomicTime,
+    signal: Arc<AtomicBool>,
+    inner: Option<Arc<WebSocketClient>>,
+    cmd_rx: tokio::sync::mpsc::UnboundedReceiver<HandlerCommand>,
+    pending_command: Option<HandlerCommand>,
+    subscription_requests: VecDeque<(u64, String)>,
+    subscription_send: Option<SubscriptionSend>,
+    raw_rx: tokio::sync::mpsc::UnboundedReceiver<Message>,
+    out_tx: tokio::sync::mpsc::UnboundedSender<NautilusWsMessage>,
+    auth_tracker: AuthTracker,
+    subscriptions_state: SubscriptionState,
+    retry_manager: RetryManager<DeribitWsError>,
+    instruments_cache: AHashMap<Ustr, InstrumentAny>,
+    option_greeks_subs: Arc<AtomicSet<InstrumentId>>,
+    mark_price_subs: Arc<AtomicSet<InstrumentId>>,
+    index_price_subs: Arc<AtomicSet<InstrumentId>>,
+    request_id_counter: AtomicU64,
+    pending_requests: AHashMap<u64, PendingRequestType>,
+    book_recovery_requests: AHashMap<BookKey, AHashSet<u64>>,
+    account_id: Option<AccountId>,
+    order_contexts: AHashMap<VenueOrderId, OrderContext>,
+    // Pending submits stay owned until venue binding or a definitive terminal outcome
+    submitted_order_contexts: AHashMap<ClientOrderId, OrderContext>,
+
+    // Retain terminal ownership and whether later fills require report recovery
+    terminal_order_contexts:
+        FifoCacheMap<VenueOrderId, TerminalOrderContext, REPLAY_CACHE_CAPACITY>,
+
+    emitted_trades: FifoCache<(VenueOrderId, TradeId), REPLAY_CACHE_CAPACITY>,
+    pending_bars: AHashMap<String, Bar>,
+    bars_timestamp_on_close: bool,
+    last_account_states: AHashMap<String, AccountState>,
+    book_depth_subs: Arc<tokio::sync::Mutex<SubscriptionState>>,
+    book_sync: BookSyncTracker,
+    book_cmd_tx: Option<tokio::sync::mpsc::UnboundedSender<HandlerCommand>>,
+    book_snapshot_timeout: Duration,
+    book_stale_threshold: Duration,
+    book_monitor_last: Instant,
+    pending_outgoing: VecDeque<NautilusWsMessage>,
+    subscribe_errors: Arc<Mutex<Vec<String>>>,
+}
+
+impl DeribitWsFeedHandler {
+    /// Creates a new feed handler.
+    #[expect(clippy::too_many_arguments)]
+    #[must_use]
+    pub fn new(
+        signal: Arc<AtomicBool>,
+        cmd_rx: tokio::sync::mpsc::UnboundedReceiver<HandlerCommand>,
+        raw_rx: tokio::sync::mpsc::UnboundedReceiver<Message>,
+        out_tx: tokio::sync::mpsc::UnboundedSender<NautilusWsMessage>,
+        auth_tracker: AuthTracker,
+        subscriptions_state: SubscriptionState,
+        option_greeks_subs: Arc<AtomicSet<InstrumentId>>,
+        mark_price_subs: Arc<AtomicSet<InstrumentId>>,
+        index_price_subs: Arc<AtomicSet<InstrumentId>>,
+        account_id: Option<AccountId>,
+        bars_timestamp_on_close: bool,
+        subscribe_errors: Arc<Mutex<Vec<String>>>,
+    ) -> Self {
+        Self {
+            clock: get_atomic_clock_realtime(),
+            signal,
+            inner: None,
+            cmd_rx,
+            pending_command: None,
+            subscription_requests: VecDeque::new(),
+            subscription_send: None,
+            raw_rx,
+            out_tx,
+            auth_tracker,
+            subscriptions_state,
+            retry_manager: create_websocket_retry_manager(),
+            instruments_cache: AHashMap::new(),
+            option_greeks_subs,
+            mark_price_subs,
+            index_price_subs,
+            request_id_counter: AtomicU64::new(1),
+            pending_requests: AHashMap::new(),
+            book_recovery_requests: AHashMap::new(),
+            account_id,
+            order_contexts: AHashMap::new(),
+            submitted_order_contexts: AHashMap::new(),
+            terminal_order_contexts: FifoCacheMap::new(),
+            emitted_trades: FifoCache::new(),
+            pending_bars: AHashMap::new(),
+            bars_timestamp_on_close,
+            last_account_states: AHashMap::new(),
+            book_depth_subs: Arc::new(tokio::sync::Mutex::new(SubscriptionState::new('.'))),
+            book_sync: BookSyncTracker::default(),
+            book_cmd_tx: None,
+            book_snapshot_timeout: Duration::from_secs(DEFAULT_BOOK_SNAPSHOT_TIMEOUT_SECS),
+            book_stale_threshold: Duration::from_secs(120),
+            book_monitor_last: Instant::now(),
+            pending_outgoing: VecDeque::new(),
+            subscribe_errors,
+        }
+    }
+
+    /// Wires book recovery to the handler command channel with the configured timers.
+    pub(crate) fn set_book_sync(
+        &mut self,
+        cmd_tx: tokio::sync::mpsc::UnboundedSender<HandlerCommand>,
+        snapshot_timeout: Duration,
+        stale_threshold: Duration,
+    ) {
+        self.book_cmd_tx = Some(cmd_tx);
+        self.book_snapshot_timeout = snapshot_timeout;
+        self.book_stale_threshold = stale_threshold;
+    }
+
+    /// Sets the account ID for order/fill reports.
+    pub fn set_account_id(&mut self, account_id: AccountId) {
+        self.account_id = Some(account_id);
+    }
+
+    /// Returns the account ID.
+    #[must_use]
+    pub fn account_id(&self) -> Option<AccountId> {
+        self.account_id
+    }
+
+    fn clear_state(&mut self) {
+        let pending_count = self.pending_requests.len();
+        let bars_count = self.pending_bars.len();
+        let account_count = self.last_account_states.len();
+        let book_count = self.book_sync.len();
+        let outgoing_count = self.pending_outgoing.len();
+
+        self.pending_requests.clear();
+        self.book_recovery_requests.clear();
+        self.subscription_requests.clear();
+        self.subscription_send = None;
+        self.pending_bars.clear();
+        self.last_account_states.clear();
+        self.book_sync.reset_on_reconnect();
+        self.pending_outgoing.clear();
+
+        log::debug!(
+            "Reset state: pending_requests={pending_count}, pending_bars={bars_count}, \
+            account_states={account_count}, book_sync={book_count}, \
+            pending_outgoing={outgoing_count}"
+        );
+    }
+
+    pub(crate) fn set_book_depth_subs(&mut self, subs: Arc<tokio::sync::Mutex<SubscriptionState>>) {
+        self.book_depth_subs = subs;
+    }
+
+    /// Generates a unique request ID.
+    fn next_request_id(&self) -> u64 {
+        self.request_id_counter.fetch_add(1, Ordering::Relaxed)
+    }
+
+    /// Returns the current timestamp.
+    fn ts_init(&self) -> UnixNanos {
+        self.clock.get_time_ns()
+    }
+
+    async fn send_tracked_request(
+        &mut self,
+        request_id: u64,
+        payload: Result<String, DeribitWsError>,
+        rate_limit_keys: Option<&[Ustr]>,
+    ) -> Result<(), DeribitWsError> {
+        let payload = match payload {
+            Ok(payload) => payload,
+            Err(e) => {
+                self.pending_requests.remove(&request_id);
+                return Err(e);
+            }
+        };
+
+        self.send_with_retry(payload, rate_limit_keys).await
+    }
+
+    /// Sends a message over the WebSocket with retry logic.
+    fn send_with_retry(
+        &self,
+        payload: String,
+        rate_limit_keys: Option<&[Ustr]>,
+    ) -> BoxFuture<'static, Result<(), DeribitWsError>> {
+        self.send_secret_with_retry(payload.into(), rate_limit_keys)
+    }
+
+    fn send_secret_with_retry(
+        &self,
+        payload: SecretString,
+        rate_limit_keys: Option<&[Ustr]>,
+    ) -> BoxFuture<'static, Result<(), DeribitWsError>> {
+        let client = self.inner.clone();
+        let retry_manager = self.retry_manager.clone();
+        let keys_owned: Option<Vec<Ustr>> = rate_limit_keys.map(<[Ustr]>::to_vec);
+        Box::pin(async move {
+            let Some(client) = client else {
+                return Err(DeribitWsError::NotConnected);
+            };
+
+            retry_manager
+                .invocation(
+                    "websocket_send",
+                    || {
+                        let payload = payload.clone();
+                        let keys = keys_owned.clone();
+                        let client = client.clone();
+                        async move {
+                            client
+                                .send_text(payload.expose_secret().to_owned(), keys.as_deref())
+                                .await
+                                .map_err(|e| DeribitWsError::Send(e.to_string()))
+                        }
+                    },
+                    |e| matches!(e, DeribitWsError::Send(_)),
+                    |e| DeribitWsError::Timeout(e.to_string()),
+                )
+                .execute()
+                .await
+        })
+    }
+
+    /// Sends one order command on the current connection.
+    ///
+    /// The returned future does not borrow the handler. A failure before the write starts is a
+    /// typed not-sent error. A write that may have started stays a transport error whose delivery
+    /// is unknown.
+    fn send_order_once(&self, payload: String) -> BoxFuture<'static, Result<(), DeribitWsError>> {
+        if self.signal.load(Ordering::Acquire) {
+            return Box::pin(async { Err(DeribitWsError::CanceledBeforeSend) });
+        }
+
+        let Some(client) = self.inner.clone() else {
+            return Box::pin(async { Err(DeribitWsError::NotConnected) });
+        };
+
+        if client.is_reconnecting() {
+            return Box::pin(async {
+                Err(DeribitWsError::TransportSend(SendError::ConnectionChanged))
+            });
+        }
+
+        let connection_epoch = client.connection_epoch();
+        let keys = *DERIBIT_RATE_LIMIT_KEY_ORDER;
+        Box::pin(async move {
+            client
+                .send_text_on_connection(payload, Some(keys.as_slice()), connection_epoch)
+                .await
+                .map_err(DeribitWsError::TransportSend)
+        })
+    }
+
+    fn terminal_command_reason(&self, error: &DeribitWsError) -> Option<String> {
+        let failure = classify_deribit_command_failure(error);
+
+        let Some(reason) = terminal_reason(&failure) else {
+            log::warn!("Ambiguous order command outcome, awaiting reconciliation: {error}");
+            return None;
+        };
+
+        log::warn!("Order command was not sent: {error}");
+        Some(reason.to_string())
+    }
+
+    fn venue_command_reason(
+        code: i64,
+        message: &str,
+        data: Option<&serde_json::Value>,
+    ) -> Option<(String, bool)> {
+        log::warn!("Venue order command result: code={code}, message={message}, data={data:?}");
+        let (failure, due_post_only) = classify_deribit_venue_error(code, message);
+
+        let Some(reason) = terminal_reason(&failure) else {
+            log::warn!(
+                "Ambiguous venue order command outcome, awaiting reconciliation: code={code}, message={message}, data={data:?}"
+            );
+            return None;
+        };
+
+        Some((reason.to_string(), due_post_only))
+    }
+
+    fn should_track_command(&self, sent: &Result<(), DeribitWsError>) -> bool {
+        match sent {
+            Ok(()) => true,
+            Err(e) => terminal_reason(&classify_deribit_command_failure(e)).is_none(),
+        }
+    }
+
+    fn track_submit(&mut self, request_id: u64, context: OrderContext) {
+        let pending = match context.order_side {
+            OrderSide::Buy => PendingRequestType::Buy {
+                client_order_id: context.client_order_id,
+                trader_id: context.trader_id,
+                strategy_id: context.strategy_id,
+                instrument_id: context.instrument_id,
+                order_side: context.order_side,
+                order_type: context.order_type,
+            },
+            OrderSide::Sell => PendingRequestType::Sell {
+                client_order_id: context.client_order_id,
+                trader_id: context.trader_id,
+                strategy_id: context.strategy_id,
+                instrument_id: context.instrument_id,
+                order_side: context.order_side,
+                order_type: context.order_type,
+            },
+        };
+
+        self.submitted_order_contexts
+            .insert(context.client_order_id, context);
+        self.pending_requests.insert(request_id, pending);
+    }
+
+    fn order_rejected(
+        &self,
+        trader_id: TraderId,
+        strategy_id: StrategyId,
+        instrument_id: InstrumentId,
+        client_order_id: ClientOrderId,
+        reason: &str,
+        due_post_only: bool,
+    ) -> OrderRejected {
+        let ts_init = self.ts_init();
+
+        OrderRejected::new(
+            trader_id,
+            strategy_id,
+            instrument_id,
+            client_order_id,
+            self.account_id.unwrap_or(AccountId::new("DERIBIT-UNKNOWN")),
+            ustr::ustr(reason),
+            UUID4::new(),
+            ts_init,
+            ts_init,
+            false,
+            due_post_only,
+        )
+    }
+
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "event construction preserves order identity and command correlation"
+    )]
+    fn order_modify_denied(
+        &self,
+        trader_id: TraderId,
+        strategy_id: StrategyId,
+        instrument_id: InstrumentId,
+        client_order_id: ClientOrderId,
+        venue_order_id: Option<VenueOrderId>,
+        causation_id: Option<UUID4>,
+        reason: &str,
+    ) -> OrderModifyDenied {
+        let ts_init = self.ts_init();
+
+        let mut event = OrderModifyDenied::new(
+            trader_id,
+            strategy_id,
+            instrument_id,
+            client_order_id,
+            reason.into(),
+            UUID4::new(),
+            ts_init,
+            ts_init,
+            venue_order_id,
+            self.account_id,
+        );
+        event.causation_id = causation_id;
+        event
+    }
+
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "event construction preserves order identity and command correlation"
+    )]
+    fn order_cancel_denied(
+        &self,
+        trader_id: TraderId,
+        strategy_id: StrategyId,
+        instrument_id: InstrumentId,
+        client_order_id: ClientOrderId,
+        venue_order_id: Option<VenueOrderId>,
+        causation_id: Option<UUID4>,
+        reason: &str,
+    ) -> OrderCancelDenied {
+        let ts_init = self.ts_init();
+
+        let mut event = OrderCancelDenied::new(
+            trader_id,
+            strategy_id,
+            instrument_id,
+            client_order_id,
+            reason.into(),
+            UUID4::new(),
+            ts_init,
+            ts_init,
+            venue_order_id,
+            self.account_id,
+        );
+        event.causation_id = causation_id;
+        event
+    }
+
+    fn order_modify_rejected(
+        &self,
+        trader_id: TraderId,
+        strategy_id: StrategyId,
+        instrument_id: InstrumentId,
+        client_order_id: ClientOrderId,
+        venue_order_id: Option<VenueOrderId>,
+        reason: &str,
+    ) -> OrderModifyRejected {
+        let ts_init = self.ts_init();
+
+        OrderModifyRejected::new(
+            trader_id,
+            strategy_id,
+            instrument_id,
+            client_order_id,
+            ustr::ustr(reason),
+            UUID4::new(),
+            ts_init,
+            ts_init,
+            false,
+            venue_order_id,
+            self.account_id,
+        )
+    }
+
+    fn fail_unsent_order_commands(&mut self) {
+        self.cmd_rx.close();
+        let mut commands = Vec::new();
+        if let Some(command) = self.pending_command.take() {
+            commands.push(command);
+        }
+
+        while let Ok(command) = self.cmd_rx.try_recv() {
+            commands.push(command);
+        }
+
+        for command in commands {
+            match command {
+                HandlerCommand::Buy {
+                    client_order_id,
+                    trader_id,
+                    strategy_id,
+                    instrument_id,
+                    ..
+                }
+                | HandlerCommand::Sell {
+                    client_order_id,
+                    trader_id,
+                    strategy_id,
+                    instrument_id,
+                    ..
+                } => {
+                    let _ =
+                        self.out_tx
+                            .send(NautilusWsMessage::OrderRejected(self.order_rejected(
+                                trader_id,
+                                strategy_id,
+                                instrument_id,
+                                client_order_id,
+                                REASON_CANCELED,
+                                false,
+                            )));
+                }
+                HandlerCommand::Edit {
+                    causation_id,
+                    params,
+                    client_order_id,
+                    trader_id,
+                    strategy_id,
+                    instrument_id,
+                } => {
+                    let _ = self.out_tx.send(NautilusWsMessage::OrderModifyDenied(
+                        self.order_modify_denied(
+                            trader_id,
+                            strategy_id,
+                            instrument_id,
+                            client_order_id,
+                            VenueOrderId::new_checked(params.order_id).ok(),
+                            causation_id,
+                            REASON_CANCELED,
+                        ),
+                    ));
+                }
+                HandlerCommand::Cancel {
+                    causation_id,
+                    params,
+                    client_order_id,
+                    trader_id,
+                    strategy_id,
+                    instrument_id,
+                } => {
+                    let _ = self.out_tx.send(NautilusWsMessage::OrderCancelDenied(
+                        self.order_cancel_denied(
+                            trader_id,
+                            strategy_id,
+                            instrument_id,
+                            client_order_id,
+                            VenueOrderId::new_checked(params.order_id).ok(),
+                            causation_id,
+                            REASON_CANCELED,
+                        ),
+                    ));
+                }
+                HandlerCommand::CancelAllByInstrument { instrument_id, .. } => {
+                    log::warn!(
+                        "Cancel all by instrument canceled before transmission for {instrument_id}"
+                    );
+                }
+                _ => {}
+            }
+        }
+    }
+
+    fn order_cancel_rejected(
+        &self,
+        trader_id: TraderId,
+        strategy_id: StrategyId,
+        instrument_id: InstrumentId,
+        client_order_id: ClientOrderId,
+        venue_order_id: Option<VenueOrderId>,
+        reason: &str,
+    ) -> OrderCancelRejected {
+        let ts_init = self.ts_init();
+
+        OrderCancelRejected::new(
+            trader_id,
+            strategy_id,
+            instrument_id,
+            client_order_id,
+            ustr::ustr(reason),
+            UUID4::new(),
+            ts_init,
+            ts_init,
+            false,
+            venue_order_id,
+            self.account_id,
+        )
+    }
+
+    async fn handle_authenticate(&mut self, auth_params: SecretString) {
+        let request_id = self.next_request_id();
+        log::debug!("Authenticating: request_id={request_id}");
+
+        let auth_params: serde_json::Value = match serde_json::from_str(auth_params.expose_secret())
+        {
+            Ok(auth_params) => auth_params,
+            Err(e) => {
+                log::error!("Failed to deserialize auth params: {e}");
+                self.auth_tracker.fail(format!("Serialization failed: {e}"));
+                return;
+            }
+        };
+        self.pending_requests
+            .insert(request_id, PendingRequestType::Authenticate);
+
+        let mut request = DeribitJsonRpcRequest::new(
+            request_id,
+            DeribitWsMethod::PublicAuth.as_method_str(),
+            auth_params,
+        );
+        let serialized = serde_json::to_string(&request).map(SecretString::from);
+        zeroize_json_value(&mut request.params);
+        drop(request);
+
+        match serialized {
+            Ok(payload) => {
+                if let Err(e) = self.send_secret_with_retry(payload, None).await {
+                    self.pending_requests.remove(&request_id);
+                    log::error!("Authentication send failed: {e}");
+                    self.auth_tracker.fail(format!("Send failed: {e}"));
+                }
+            }
+            Err(e) => {
+                self.pending_requests.remove(&request_id);
+                log::error!("Failed to serialize auth request: {e}");
+                self.auth_tracker.fail(format!("Serialization failed: {e}"));
+            }
+        }
+    }
+
+    /// Handles a subscribe command.
+    ///
+    /// Note: The client has already called `mark_subscribe` before sending this command.
+    fn handle_subscribe(&mut self, channels: &[String]) -> Result<Vec<u64>, DeribitWsError> {
+        let result = self.queue_subscription_requests(channels.to_vec(), true);
+        if result.is_ok() {
+            for channel in channels {
+                if let Some(key) = BookKey::for_channel(channel)
+                    && let Some(instrument_id) = book_instrument_id(channel)
+                {
+                    self.book_sync.record_subscription(key, instrument_id);
+                }
+            }
+        }
+
+        if let Err(e) = &result {
+            self.subscribe_errors.lock().push(e.to_string());
+        }
+
+        result
+    }
+
+    /// Handles an unsubscribe command.
+    fn handle_unsubscribe(&mut self, channels: Vec<String>) -> Result<Vec<u64>, DeribitWsError> {
+        self.queue_subscription_requests(channels, false)
+    }
+
+    fn queue_subscription_requests(
+        &mut self,
+        channels: Vec<String>,
+        subscribe: bool,
+    ) -> Result<Vec<u64>, DeribitWsError> {
+        let private = channels
+            .iter()
+            .any(|ch| DeribitWsChannel::requires_auth(ch));
+
+        let method = match (subscribe, private) {
+            (true, true) => DeribitWsMethod::PrivateSubscribe,
+            (true, false) => DeribitWsMethod::PublicSubscribe,
+            (false, true) => DeribitWsMethod::PrivateUnsubscribe,
+            (false, false) => DeribitWsMethod::PublicUnsubscribe,
+        };
+
+        let batches = subscription_batches(channels, &method)?;
+        let mut request_ids = Vec::with_capacity(batches.len());
+        for channels in batches {
+            let request_id = self.next_request_id();
+            request_ids.push(request_id);
+
+            let request = DeribitJsonRpcRequest::new(
+                request_id,
+                method.as_method_str(),
+                DeribitSubscribeParams { channels },
+            );
+            let payload =
+                serde_json::to_string(&request).map_err(|e| DeribitWsError::Json(e.to_string()))?;
+            let channels = request.params.channels;
+            let pending = if subscribe {
+                PendingRequestType::Subscribe { channels }
+            } else {
+                PendingRequestType::Unsubscribe { channels }
+            };
+
+            self.pending_requests.insert(request_id, pending);
+            self.subscription_requests.push_back((request_id, payload));
+        }
+
+        Ok(request_ids)
+    }
+
+    fn coalesce_subscriptions(&mut self, mut channels: Vec<String>) -> Vec<String> {
+        let private = channels
+            .iter()
+            .any(|ch| DeribitWsChannel::requires_auth(ch));
+        let mut bytes = channels.iter().map(|ch| ch.len() + 3).sum::<usize>();
+        while bytes < SUBSCRIPTION_REQUEST_MAX_BYTES {
+            let Ok(cmd) = self.cmd_rx.try_recv() else {
+                break;
+            };
+
+            match cmd {
+                HandlerCommand::Subscribe { channels: adjacent }
+                    if adjacent
+                        .iter()
+                        .any(|ch| DeribitWsChannel::requires_auth(ch))
+                        == private =>
+                {
+                    bytes += adjacent.iter().map(|ch| ch.len() + 3).sum::<usize>() + 1;
+                    channels.extend(adjacent);
+                }
+                cmd => {
+                    self.pending_command = Some(cmd);
+                    break;
+                }
+            }
+        }
+
+        channels
+    }
+
+    /// Handles enabling heartbeat.
+    async fn handle_set_heartbeat(&mut self, interval: u64) -> Result<(), DeribitWsError> {
+        let request_id = self.next_request_id();
+
+        // Track this request for response correlation
+        self.pending_requests
+            .insert(request_id, PendingRequestType::SetHeartbeat);
+
+        let request = DeribitJsonRpcRequest::new(
+            request_id,
+            DeribitWsMethod::SetHeartbeat.as_method_str(),
+            DeribitHeartbeatParams { interval },
+        );
+
+        let payload =
+            serde_json::to_string(&request).map_err(|e| DeribitWsError::Json(e.to_string()));
+
+        log::debug!(
+            "Enabling heartbeat with interval: request_id={request_id}, interval={interval} seconds"
+        );
+        self.send_tracked_request(request_id, payload, None).await
+    }
+
+    /// Responds to a heartbeat test_request.
+    async fn handle_heartbeat_test_request(&mut self) -> Result<(), DeribitWsError> {
+        let request_id = self.next_request_id();
+
+        // Track this request for response correlation
+        self.pending_requests
+            .insert(request_id, PendingRequestType::Test);
+
+        let request = DeribitJsonRpcRequest::new(
+            request_id,
+            DeribitWsMethod::Test.as_method_str(),
+            serde_json::json!({}),
+        );
+
+        let payload =
+            serde_json::to_string(&request).map_err(|e| DeribitWsError::Json(e.to_string()));
+
+        log::trace!("Responding to heartbeat test_request: request_id={request_id}");
+        self.send_tracked_request(request_id, payload, None).await
+    }
+
+    /// Handles an order submission command.
+    async fn handle_submit(
+        &mut self,
+        order_side: OrderSide,
+        params: DeribitOrderParams,
+        client_order_id: ClientOrderId,
+        trader_id: TraderId,
+        strategy_id: StrategyId,
+        instrument_id: InstrumentId,
+    ) -> Result<(), DeribitWsError> {
+        let request_id = self.next_request_id();
+        let order_type = parse_deribit_order_type(&params.order_type);
+        let order_signature = (params.amount, params.price, params.trigger_price);
+
+        let (method, side) = match order_side {
+            OrderSide::Buy => (DeribitWsMethod::Buy, "buy"),
+            OrderSide::Sell => (DeribitWsMethod::Sell, "sell"),
+        };
+
+        let request = DeribitJsonRpcRequest::new(request_id, method.as_method_str(), params);
+        let payload =
+            serde_json::to_string(&request).map_err(|e| DeribitWsError::Encode(e.to_string()))?;
+
+        log::debug!("Sending {side} order: request_id={request_id}");
+        let sent = self.send_order_once(payload).await;
+        if self.should_track_command(&sent) {
+            self.track_submit(
+                request_id,
+                OrderContext {
+                    client_order_id,
+                    trader_id,
+                    strategy_id,
+                    instrument_id,
+                    order_side,
+                    order_type,
+                    accepted: false,
+                    last_order_signature: Some(order_signature),
+                },
+            );
+        }
+
+        sent
+    }
+
+    /// Handles an edit order command.
+    async fn handle_edit(
+        &mut self,
+        params: DeribitEditParams,
+        client_order_id: ClientOrderId,
+        trader_id: TraderId,
+        strategy_id: StrategyId,
+        instrument_id: InstrumentId,
+        causation_id: Option<UUID4>,
+    ) -> Result<(), DeribitWsError> {
+        let request_id = self.next_request_id();
+        let order_id = params.order_id.clone();
+        let venue_order_id = VenueOrderId::new_checked(order_id.clone()).ok();
+        let request =
+            DeribitJsonRpcRequest::new(request_id, DeribitWsMethod::Edit.as_method_str(), params);
+        let payload =
+            serde_json::to_string(&request).map_err(|e| DeribitWsError::Encode(e.to_string()))?;
+
+        log::debug!("Sending edit order: request_id={request_id}, order_id={order_id}");
+        let sent = self.send_order_once(payload).await;
+        if self.should_track_command(&sent) {
+            self.pending_requests.insert(
+                request_id,
+                PendingRequestType::Edit {
+                    causation_id,
+                    venue_order_id,
+                    client_order_id,
+                    trader_id,
+                    strategy_id,
+                    instrument_id,
+                },
+            );
+        }
+
+        sent
+    }
+
+    /// Handles a cancel order command.
+    async fn handle_cancel(
+        &mut self,
+        params: DeribitCancelParams,
+        client_order_id: ClientOrderId,
+        trader_id: TraderId,
+        strategy_id: StrategyId,
+        instrument_id: InstrumentId,
+        causation_id: Option<UUID4>,
+    ) -> Result<(), DeribitWsError> {
+        let request_id = self.next_request_id();
+        let order_id = params.order_id.clone();
+        let venue_order_id = VenueOrderId::new_checked(order_id.clone()).ok();
+        let request =
+            DeribitJsonRpcRequest::new(request_id, DeribitWsMethod::Cancel.as_method_str(), params);
+        let payload =
+            serde_json::to_string(&request).map_err(|e| DeribitWsError::Encode(e.to_string()))?;
+
+        log::debug!("Sending cancel order: request_id={request_id}, order_id={order_id}");
+        let sent = self.send_order_once(payload).await;
+        if self.should_track_command(&sent) {
+            self.pending_requests.insert(
+                request_id,
+                PendingRequestType::Cancel {
+                    causation_id,
+                    venue_order_id,
+                    client_order_id,
+                    trader_id,
+                    strategy_id,
+                    instrument_id,
+                },
+            );
+        }
+
+        sent
+    }
+
+    /// Handles cancel all orders by instrument command.
+    async fn handle_cancel_all_by_instrument(
+        &mut self,
+        params: DeribitCancelAllByInstrumentParams,
+        instrument_id: InstrumentId,
+    ) -> Result<(), DeribitWsError> {
+        let request_id = self.next_request_id();
+        let instrument_name = params.instrument_name.clone();
+
+        let request = DeribitJsonRpcRequest::new(
+            request_id,
+            DeribitWsMethod::CancelAllByInstrument.as_method_str(),
+            params,
+        );
+        let payload =
+            serde_json::to_string(&request).map_err(|e| DeribitWsError::Encode(e.to_string()))?;
+
+        log::debug!(
+            "Sending cancel_all_by_instrument: request_id={request_id}, instrument={instrument_name}"
+        );
+        let sent = self.send_order_once(payload).await;
+        if self.should_track_command(&sent) {
+            self.pending_requests.insert(
+                request_id,
+                PendingRequestType::CancelAllByInstrument { instrument_id },
+            );
+        }
+
+        sent
+    }
+
+    /// Handles get order state command.
+    async fn handle_get_order_state(
+        &mut self,
+        order_id: String,
+        client_order_id: ClientOrderId,
+        trader_id: TraderId,
+        strategy_id: StrategyId,
+        instrument_id: InstrumentId,
+    ) -> Result<(), DeribitWsError> {
+        let request_id = self.next_request_id();
+
+        // Track this request for response correlation
+        self.pending_requests.insert(
+            request_id,
+            PendingRequestType::GetOrderState {
+                client_order_id,
+                trader_id,
+                strategy_id,
+                instrument_id,
+            },
+        );
+
+        let params = serde_json::json!({
+            "order_id": order_id
+        });
+
+        let request = DeribitJsonRpcRequest::new(
+            request_id,
+            DeribitWsMethod::GetOrderState.as_method_str(),
+            params,
+        );
+
+        let payload =
+            serde_json::to_string(&request).map_err(|e| DeribitWsError::Json(e.to_string()));
+
+        log::debug!("Sending get_order_state: request_id={request_id}, order_id={order_id}");
+        self.send_tracked_request(
+            request_id,
+            payload,
+            Some(DERIBIT_RATE_LIMIT_KEY_ORDER.as_slice()),
+        )
+        .await
+    }
+
+    /// Processes a command from the client.
+    async fn process_command(&mut self, cmd: HandlerCommand) {
+        match cmd {
+            HandlerCommand::SetClient(client) => {
+                log::debug!("Setting WebSocket client");
+                self.inner = Some(Arc::new(client));
+            }
+            HandlerCommand::Disconnect => {
+                log::debug!("Disconnecting WebSocket");
+
+                if let Some(client) = self.inner.take() {
+                    client.disconnect().await;
+                }
+            }
+            HandlerCommand::Authenticate { auth_params } => {
+                self.handle_authenticate(auth_params).await;
+            }
+            HandlerCommand::SetHeartbeat { interval } => {
+                if let Err(e) = self.handle_set_heartbeat(interval).await {
+                    log::error!("Set heartbeat failed: {e}");
+                }
+            }
+            HandlerCommand::InitializeInstruments(instruments) => {
+                log::debug!("Handler received {} instruments", instruments.len());
+                self.instruments_cache.clear();
+                for inst in instruments {
+                    self.instruments_cache
+                        .insert(inst.raw_symbol().inner(), inst);
+                }
+            }
+            HandlerCommand::UpdateInstrument(instrument) => {
+                log::trace!("Updating instrument: {}", instrument.raw_symbol());
+                self.instruments_cache
+                    .insert(instrument.raw_symbol().inner(), *instrument);
+            }
+            HandlerCommand::Subscribe { channels } => {
+                if let Err(e) = self.handle_subscribe(&channels) {
+                    log::error!("Subscribe failed: {e}");
+                }
+            }
+            HandlerCommand::Unsubscribe { channels } => {
+                self.drop_released_book_tracking(&channels);
+
+                if let Err(e) = self.handle_unsubscribe(channels) {
+                    log::error!("Unsubscribe failed: {e}");
+                }
+            }
+            HandlerCommand::RecoverBook {
+                instrument,
+                channel,
+                cancel,
+                gate,
+                completion,
+                recovery,
+            } => {
+                self.replace_book_subscription(
+                    instrument, channel, &cancel, gate, completion, &recovery,
+                );
+            }
+            HandlerCommand::Buy {
+                params,
+                client_order_id,
+                trader_id,
+                strategy_id,
+                instrument_id,
+            } => {
+                if let Err(e) = self
+                    .handle_submit(
+                        OrderSide::Buy,
+                        params,
+                        client_order_id,
+                        trader_id,
+                        strategy_id,
+                        instrument_id,
+                    )
+                    .await
+                    && let Some(reason) = self.terminal_command_reason(&e)
+                {
+                    let _ =
+                        self.out_tx
+                            .send(NautilusWsMessage::OrderRejected(self.order_rejected(
+                                trader_id,
+                                strategy_id,
+                                instrument_id,
+                                client_order_id,
+                                &reason,
+                                false,
+                            )));
+                }
+            }
+            HandlerCommand::Sell {
+                params,
+                client_order_id,
+                trader_id,
+                strategy_id,
+                instrument_id,
+            } => {
+                if let Err(e) = self
+                    .handle_submit(
+                        OrderSide::Sell,
+                        params,
+                        client_order_id,
+                        trader_id,
+                        strategy_id,
+                        instrument_id,
+                    )
+                    .await
+                    && let Some(reason) = self.terminal_command_reason(&e)
+                {
+                    let _ =
+                        self.out_tx
+                            .send(NautilusWsMessage::OrderRejected(self.order_rejected(
+                                trader_id,
+                                strategy_id,
+                                instrument_id,
+                                client_order_id,
+                                &reason,
+                                false,
+                            )));
+                }
+            }
+            HandlerCommand::Edit {
+                causation_id,
+                params,
+                client_order_id,
+                trader_id,
+                strategy_id,
+                instrument_id,
+            } => {
+                let venue_order_id = VenueOrderId::new_checked(params.order_id.clone()).ok();
+
+                if let Err(e) = self
+                    .handle_edit(
+                        params,
+                        client_order_id,
+                        trader_id,
+                        strategy_id,
+                        instrument_id,
+                        causation_id,
+                    )
+                    .await
+                    && let Some(reason) = self.terminal_command_reason(&e)
+                {
+                    self.pending_outgoing
+                        .push_back(NautilusWsMessage::OrderModifyDenied(
+                            self.order_modify_denied(
+                                trader_id,
+                                strategy_id,
+                                instrument_id,
+                                client_order_id,
+                                venue_order_id,
+                                causation_id,
+                                &reason,
+                            ),
+                        ));
+                }
+            }
+            HandlerCommand::Cancel {
+                causation_id,
+                params,
+                client_order_id,
+                trader_id,
+                strategy_id,
+                instrument_id,
+            } => {
+                let venue_order_id = VenueOrderId::new_checked(params.order_id.clone()).ok();
+
+                if let Err(e) = self
+                    .handle_cancel(
+                        params,
+                        client_order_id,
+                        trader_id,
+                        strategy_id,
+                        instrument_id,
+                        causation_id,
+                    )
+                    .await
+                    && let Some(reason) = self.terminal_command_reason(&e)
+                {
+                    self.pending_outgoing
+                        .push_back(NautilusWsMessage::OrderCancelDenied(
+                            self.order_cancel_denied(
+                                trader_id,
+                                strategy_id,
+                                instrument_id,
+                                client_order_id,
+                                venue_order_id,
+                                causation_id,
+                                &reason,
+                            ),
+                        ));
+                }
+            }
+            HandlerCommand::CancelAllByInstrument {
+                params,
+                instrument_id,
+            } => {
+                if let Err(e) = self
+                    .handle_cancel_all_by_instrument(params, instrument_id)
+                    .await
+                {
+                    log::warn!(
+                        "Cancel all by instrument failed for {instrument_id}, awaiting reconciliation: {e}"
+                    );
+                }
+            }
+            HandlerCommand::GetOrderState {
+                order_id,
+                client_order_id,
+                trader_id,
+                strategy_id,
+                instrument_id,
+            } => {
+                if let Err(e) = self
+                    .handle_get_order_state(
+                        order_id,
+                        client_order_id,
+                        trader_id,
+                        strategy_id,
+                        instrument_id,
+                    )
+                    .await
+                {
+                    log::error!("Get order state failed: {e}");
+                }
+            }
+        }
+    }
+
+    /// Processes a raw WebSocket message.
+    async fn process_raw_message(&mut self, text: &str) -> Option<NautilusWsMessage> {
+        if text == RECONNECTED {
+            log::info!("Received reconnection signal");
+
+            self.auth_tracker.invalidate();
+            self.clear_state();
+
+            return Some(NautilusWsMessage::Reconnected);
+        }
+
+        // Parse the JSON-RPC message
+        let ws_msg = match parse_raw_message(text) {
+            Ok(msg) => msg,
+            Err(e) => {
+                log::warn!("Failed to parse message: {e}");
+                return None;
+            }
+        };
+
+        let ts_init = self.ts_init();
+
+        match ws_msg {
+            DeribitWsMessage::Response(response) => {
+                // Look up the request type by ID for explicit correlation
+                if let Some(request_id) = response.id
+                    && let Some(request_type) = self.pending_requests.remove(&request_id)
+                {
+                    for ids in self.book_recovery_requests.values_mut() {
+                        ids.remove(&request_id);
+                    }
+
+                    match request_type {
+                        PendingRequestType::Authenticate => {
+                            if let Some(error) = &response.error {
+                                let reason = format!(
+                                    "Authentication error code={}: {}",
+                                    error.code, error.message
+                                );
+                                log::error!(
+                                    "Authentication failed: code={}, message={}, request_id={}",
+                                    error.code,
+                                    error.message,
+                                    request_id
+                                );
+                                self.auth_tracker.fail(reason.clone());
+                                return Some(NautilusWsMessage::AuthenticationFailed(reason));
+                            } else if let Some(result) = &response.result {
+                                match serde_json::from_str::<DeribitAuthResult>(result.get()) {
+                                    Ok(auth_result) => {
+                                        self.auth_tracker.succeed();
+                                        log::debug!(
+                                            "WebSocket authenticated successfully (request_id={}, scope={}, expires_in={}s)",
+                                            request_id,
+                                            auth_result.scope,
+                                            auth_result.expires_in
+                                        );
+                                        return Some(NautilusWsMessage::Authenticated(Box::new(
+                                            auth_result,
+                                        )));
+                                    }
+                                    Err(e) => {
+                                        let reason = format!("Failed to parse auth result: {e}");
+                                        log::error!("{reason}: request_id={request_id}");
+                                        self.auth_tracker.fail(reason.clone());
+                                        return Some(NautilusWsMessage::AuthenticationFailed(
+                                            reason,
+                                        ));
+                                    }
+                                }
+                            }
+                        }
+                        PendingRequestType::Subscribe { channels } => {
+                            if let Some(error) = &response.error {
+                                log::error!(
+                                    "Subscribe failed: code={}, message={}, channels={:?}, request_id={}",
+                                    error.code,
+                                    error.message,
+                                    channels,
+                                    request_id
+                                );
+
+                                self.subscribe_errors.lock().push(format!(
+                                    "Subscribe rejected: code={}, message={}",
+                                    error.code, error.message,
+                                ));
+
+                                self.abort_book_replacements(&channels, error.code, &error.message);
+                                self.recover_rejected_book_subscriptions(&channels);
+                            } else {
+                                let acknowledged = self.subscription_acknowledgements(
+                                    request_id,
+                                    &channels,
+                                    response.result.as_deref(),
+                                    true,
+                                );
+
+                                for ch in acknowledged {
+                                    self.subscriptions_state.confirm_subscribe(&ch);
+                                    log::debug!("Subscription confirmed: {ch}");
+                                    self.confirm_book_subscription(&ch);
+                                }
+                            }
+                        }
+                        PendingRequestType::Unsubscribe { channels } => {
+                            self.handle_unsubscribe_acknowledgement(
+                                request_id, &channels, &response,
+                            );
+                        }
+                        PendingRequestType::SetHeartbeat => {
+                            if let Some(error) = &response.error {
+                                log::error!(
+                                    "Set heartbeat failed: code={}, message={}, request_id={}",
+                                    error.code,
+                                    error.message,
+                                    request_id
+                                );
+                            } else {
+                                log::debug!("Heartbeat enabled (request_id={request_id})");
+                            }
+                        }
+                        PendingRequestType::Test => {
+                            if let Some(error) = &response.error {
+                                log::warn!(
+                                    "Heartbeat test failed: code={}, message={}, request_id={}",
+                                    error.code,
+                                    error.message,
+                                    request_id
+                                );
+                            } else {
+                                log::trace!(
+                                    "Heartbeat test acknowledged (request_id={request_id})"
+                                );
+                            }
+                        }
+                        PendingRequestType::Cancel {
+                            venue_order_id,
+                            causation_id,
+                            client_order_id,
+                            trader_id,
+                            strategy_id,
+                            instrument_id,
+                        } => {
+                            if let Some(result) = &response.result {
+                                match serde_json::from_str::<DeribitOrderMsg>(result.get()) {
+                                    Ok(order_msg) => {
+                                        let venue_order_id =
+                                            VenueOrderId::new(order_msg.order_id.as_str());
+                                        log::debug!(
+                                            "Cancel confirmed: venue_order_id={venue_order_id}, \
+                                            client_order_id={client_order_id}, state={}",
+                                            order_msg.order_state
+                                        );
+
+                                        // Emit OrderCanceled from the response path so we
+                                        // do not lose the event during a reconnection gap.
+                                        // Both paths check terminal context to suppress
+                                        // duplicates regardless of which arrives first.
+                                        if order_msg.order_state == "cancelled"
+                                            && !self
+                                                .terminal_order_contexts
+                                                .contains_key(&venue_order_id)
+                                        {
+                                            let instrument_name_ustr = order_msg.instrument_name;
+
+                                            if let Some(instrument) =
+                                                self.instruments_cache.get(&instrument_name_ustr)
+                                                && let Some(account_id) = self.account_id
+                                            {
+                                                let event =
+                                                    parse_order_canceled_with_client_order_id(
+                                                        &order_msg,
+                                                        instrument,
+                                                        account_id,
+                                                        trader_id,
+                                                        strategy_id,
+                                                        client_order_id,
+                                                        ts_init,
+                                                    );
+                                                let context = self
+                                                    .find_order_context(
+                                                        venue_order_id,
+                                                        Some(client_order_id),
+                                                    )
+                                                    .or_else(|| {
+                                                        let order_side =
+                                                            match order_msg.direction.as_str() {
+                                                                "buy" => OrderSide::Buy,
+                                                                "sell" => OrderSide::Sell,
+                                                                _ => return None,
+                                                            };
+                                                        Some(OrderContext {
+                                                            client_order_id,
+                                                            trader_id,
+                                                            strategy_id,
+                                                            instrument_id,
+                                                            order_side,
+                                                            order_type: parse_deribit_order_type(
+                                                                &order_msg.order_type,
+                                                            ),
+                                                            accepted: true,
+                                                            last_order_signature: Some(
+                                                                Self::order_signature(&order_msg),
+                                                            ),
+                                                        })
+                                                    });
+
+                                                if let Some(context) = context {
+                                                    self.finish_order_context(
+                                                        venue_order_id,
+                                                        &context,
+                                                        true,
+                                                    );
+                                                }
+                                                return Some(NautilusWsMessage::OrderCanceled(
+                                                    event,
+                                                ));
+                                            }
+                                        }
+                                    }
+                                    Err(e) => {
+                                        log::error!(
+                                            "Failed to parse cancel response: request_id={request_id}, error={e}"
+                                        );
+                                    }
+                                }
+                            } else if let Some(error) = &response.error {
+                                let (reason, _) = Self::venue_command_reason(
+                                    error.code,
+                                    &error.message,
+                                    error.data.as_ref(),
+                                )?;
+                                let mut event = self.order_cancel_rejected(
+                                    trader_id,
+                                    strategy_id,
+                                    instrument_id,
+                                    client_order_id,
+                                    venue_order_id,
+                                    &reason,
+                                );
+                                event.causation_id = causation_id;
+                                return Some(NautilusWsMessage::OrderCancelRejected(event));
+                            }
+                        }
+                        PendingRequestType::CancelAllByInstrument { instrument_id } => {
+                            if let Some(result) = &response.result {
+                                match serde_json::from_str::<u64>(result.get()) {
+                                    Ok(count) => {
+                                        log::debug!(
+                                            "Cancelled {count} orders for instrument {instrument_id}"
+                                        );
+                                        // Individual order status updates come via user.orders subscription
+                                    }
+                                    Err(e) => {
+                                        log::warn!("Failed to parse cancel_all response: {e}");
+                                    }
+                                }
+                            } else if let Some(error) = &response.error {
+                                log::warn!(
+                                    "Cancel all by instrument left in flight for {instrument_id}: code={}, message={}, data={:?}, class={:?}",
+                                    error.code,
+                                    error.message,
+                                    error.data,
+                                    classify_deribit_venue_error(error.code, &error.message).0
+                                );
+                            }
+                        }
+                        PendingRequestType::Buy {
+                            client_order_id,
+                            trader_id,
+                            strategy_id,
+                            instrument_id,
+                            order_side,
+                            order_type,
+                        }
+                        | PendingRequestType::Sell {
+                            client_order_id,
+                            trader_id,
+                            strategy_id,
+                            instrument_id,
+                            order_side,
+                            order_type,
+                        } => {
+                            let submit_context = OrderContext {
+                                client_order_id,
+                                trader_id,
+                                strategy_id,
+                                instrument_id,
+                                order_side,
+                                order_type,
+                                accepted: false,
+                                last_order_signature: None,
+                            };
+
+                            return self.handle_order_submit_response(
+                                &submit_context,
+                                request_id,
+                                &response,
+                                ts_init,
+                            );
+                        }
+                        PendingRequestType::Edit {
+                            venue_order_id,
+                            causation_id,
+                            client_order_id,
+                            trader_id,
+                            strategy_id,
+                            instrument_id,
+                        } => {
+                            if let Some(result) = &response.result {
+                                match serde_json::from_str::<DeribitOrderResponse>(result.get()) {
+                                    Ok(order_response) => {
+                                        let venue_order_id =
+                                            VenueOrderId::new(&order_response.order.order_id);
+                                        log::debug!(
+                                            "Order updated: venue_order_id={}, client_order_id={}, state={}",
+                                            venue_order_id,
+                                            client_order_id,
+                                            order_response.order.order_state
+                                        );
+
+                                        let instrument_name_ustr = Ustr::from(
+                                            order_response.order.instrument_name.as_str(),
+                                        );
+
+                                        if let Some(instrument) =
+                                            self.instruments_cache.get(&instrument_name_ustr)
+                                        {
+                                            if let Some(account_id) = self.account_id {
+                                                let Some(mut context) = self.find_order_context(
+                                                    venue_order_id,
+                                                    Some(client_order_id),
+                                                ) else {
+                                                    let report = parse_user_order_msg(
+                                                        &order_response.order,
+                                                        instrument,
+                                                        account_id,
+                                                        ts_init,
+                                                    );
+                                                    let outgoing = self.route_user_trades(
+                                                        &order_response.trades,
+                                                        ts_init,
+                                                    );
+                                                    self.pending_outgoing.extend(outgoing);
+                                                    return report
+                                                    .map(|report| {
+                                                        NautilusWsMessage::OrderStatusReports(vec![
+                                                            report,
+                                                        ])
+                                                    })
+                                                    .map_err(|e| {
+                                                        log::warn!(
+                                                            "Failed to parse external edit response: {e}"
+                                                        );
+                                                    })
+                                                    .ok();
+                                                };
+                                                let was_terminal = self
+                                                    .terminal_order_contexts
+                                                    .contains_key(&venue_order_id);
+                                                let signature =
+                                                    Self::order_signature(&order_response.order);
+                                                let duplicate_update = was_terminal
+                                                    || context.last_order_signature
+                                                        == Some(signature);
+                                                let event = (!duplicate_update).then(|| {
+                                                    parse_order_updated_with_client_order_id(
+                                                        &order_response.order,
+                                                        instrument,
+                                                        account_id,
+                                                        context.trader_id,
+                                                        context.strategy_id,
+                                                        context.client_order_id,
+                                                        ts_init,
+                                                    )
+                                                });
+                                                context.accepted = true;
+                                                context.last_order_signature = Some(signature);
+
+                                                if was_terminal {
+                                                    self.finish_order_context(
+                                                        venue_order_id,
+                                                        &context,
+                                                        false,
+                                                    );
+                                                } else {
+                                                    self.bind_order_context(
+                                                        venue_order_id,
+                                                        context,
+                                                    );
+                                                }
+                                                let outgoing = self.route_user_trades(
+                                                    &order_response.trades,
+                                                    ts_init,
+                                                );
+                                                self.pending_outgoing.extend(outgoing);
+                                                return event.map(|mut event| {
+                                                    event.causation_id = causation_id;
+                                                    NautilusWsMessage::OrderUpdated(event)
+                                                });
+                                            } else {
+                                                log::warn!(
+                                                    "Cannot create OrderUpdated: account_id not set"
+                                                );
+                                            }
+                                        } else {
+                                            log::warn!(
+                                                "Instrument {instrument_name_ustr} not found in cache for edit response"
+                                            );
+                                        }
+                                    }
+                                    Err(e) => {
+                                        log::error!(
+                                            "Failed to parse edit response: request_id={request_id}, error={e}"
+                                        );
+                                    }
+                                }
+                            } else if let Some(error) = &response.error {
+                                let (reason, _) = Self::venue_command_reason(
+                                    error.code,
+                                    &error.message,
+                                    error.data.as_ref(),
+                                )?;
+                                let mut event = self.order_modify_rejected(
+                                    trader_id,
+                                    strategy_id,
+                                    instrument_id,
+                                    client_order_id,
+                                    venue_order_id,
+                                    &reason,
+                                );
+                                event.causation_id = causation_id;
+                                return Some(NautilusWsMessage::OrderModifyRejected(event));
+                            }
+                        }
+                        PendingRequestType::GetOrderState {
+                            client_order_id,
+                            trader_id: _,
+                            strategy_id: _,
+                            instrument_id: _,
+                        } => {
+                            if let Some(result) = &response.result {
+                                match serde_json::from_str::<DeribitOrderMsg>(result.get()) {
+                                    Ok(order_msg) => {
+                                        log::debug!(
+                                            "Order state received: venue_order_id={}, client_order_id={}, state={}",
+                                            order_msg.order_id,
+                                            client_order_id,
+                                            order_msg.order_state
+                                        );
+
+                                        // Convert to OrderStatusReport
+                                        let instrument_name_ustr = order_msg.instrument_name;
+
+                                        if let Some(instrument) =
+                                            self.instruments_cache.get(&instrument_name_ustr)
+                                        {
+                                            if let Some(account_id) = self.account_id {
+                                                match parse_user_order_msg(
+                                                    &order_msg, instrument, account_id, ts_init,
+                                                ) {
+                                                    Ok(report) => {
+                                                        return Some(
+                                                            NautilusWsMessage::OrderStatusReports(
+                                                                vec![report],
+                                                            ),
+                                                        );
+                                                    }
+                                                    Err(e) => {
+                                                        log::warn!(
+                                                            "Failed to parse get_order_state response to report: {e}"
+                                                        );
+                                                    }
+                                                }
+                                            } else {
+                                                log::warn!(
+                                                    "Cannot create OrderStatusReport: account_id not set"
+                                                );
+                                            }
+                                        } else {
+                                            log::warn!(
+                                                "Instrument {instrument_name_ustr} not found in cache for get_order_state response"
+                                            );
+                                        }
+                                    }
+                                    Err(e) => {
+                                        log::error!(
+                                            "Failed to parse get_order_state response: request_id={request_id}, error={e}"
+                                        );
+                                    }
+                                }
+                            } else if let Some(error) = &response.error {
+                                log::error!(
+                                    "Get order state failed: code={}, message={}, client_order_id={}",
+                                    error.code,
+                                    error.message,
+                                    client_order_id
+                                );
+                            }
+                        }
+                    }
+                } else if let Some(request_id) = response.id {
+                    // Response with ID but no matching pending request
+                    if let Some(error) = &response.error {
+                        // Log orphaned error response with all available context
+                        log::error!(
+                            "Deribit error for unknown request: code={}, message={}, request_id={}, data={:?}",
+                            error.code,
+                            error.message,
+                            request_id,
+                            error.data
+                        );
+                        return Some(NautilusWsMessage::Error(DeribitWsError::DeribitError {
+                            code: error.code,
+                            message: error.message.clone(),
+                        }));
+                    } else {
+                        // Success response but no pending request - likely already processed
+                        log::debug!(
+                            "Received response for unknown request_id={}, result present: {}",
+                            request_id,
+                            response.result.is_some()
+                        );
+                    }
+                } else if let Some(error) = &response.error {
+                    // Error response with no ID (shouldn't happen in JSON-RPC 2.0, but handle it)
+                    log::error!(
+                        "Deribit error with no request_id: code={}, message={}, data={:?}",
+                        error.code,
+                        error.message,
+                        error.data
+                    );
+                    return Some(NautilusWsMessage::Error(DeribitWsError::DeribitError {
+                        code: error.code,
+                        message: error.message.clone(),
+                    }));
+                }
+                None
+            }
+            DeribitWsMessage::Notification(notification) => {
+                let channel = &notification.params.channel;
+                let data = &notification.params.data;
+
+                // Determine channel type and parse accordingly
+                if let Some(channel_type) = DeribitWsChannel::from_channel_string(channel) {
+                    match channel_type {
+                        DeribitWsChannel::Trades => {
+                            // Parse trade messages
+                            match serde_json::from_str::<Vec<DeribitTradeMsg>>(data.get()) {
+                                Ok(trades) => {
+                                    log::debug!("Received {} trades", trades.len());
+                                    let data_vec = parse_trades_data(
+                                        &trades,
+                                        &self.instruments_cache,
+                                        ts_init,
+                                    );
+
+                                    if data_vec.is_empty() && !trades.is_empty() {
+                                        let missing: Vec<&Ustr> = trades
+                                            .iter()
+                                            .map(|t| &t.instrument_name)
+                                            .filter(|name| {
+                                                !self.instruments_cache.contains_key(name)
+                                            })
+                                            .collect();
+
+                                        if missing.is_empty() {
+                                            log::warn!(
+                                                "Received {} trades but parsed 0 (parse failures); cache size: {}",
+                                                trades.len(),
+                                                self.instruments_cache.len()
+                                            );
+                                        } else {
+                                            log::warn!(
+                                                "Trade message received but instrument(s) not found in cache: {:?} (cache size: {})",
+                                                missing,
+                                                self.instruments_cache.len()
+                                            );
+                                        }
+                                    } else if !data_vec.is_empty() {
+                                        log::debug!("Parsed {} trade ticks", data_vec.len());
+                                        return Some(NautilusWsMessage::Data(data_vec));
+                                    }
+                                }
+                                Err(e) => {
+                                    log::warn!("Failed to deserialize trades: {e}");
+                                }
+                            }
+                        }
+                        DeribitWsChannel::Book => {
+                            return self.handle_book_message(channel, data.get(), ts_init).await;
+                        }
+                        DeribitWsChannel::Ticker => {
+                            match serde_json::from_str::<DeribitTickerMsg>(data.get()) {
+                                Ok(ticker_msg) => {
+                                    if let Some(instrument) =
+                                        self.instruments_cache.get(&ticker_msg.instrument_name)
+                                    {
+                                        // Emit OptionGreeks only if subscribed
+                                        if self.option_greeks_subs.contains(&instrument.id())
+                                            && let Some(option_greeks) =
+                                                parse_ticker_to_option_greeks(
+                                                    &ticker_msg,
+                                                    instrument,
+                                                    ts_init,
+                                                )
+                                        {
+                                            let _ = self.out_tx.send(
+                                                NautilusWsMessage::OptionGreeks(option_greeks),
+                                            );
+                                        }
+
+                                        let instrument_id = instrument.id();
+                                        let mut data_vec = Vec::new();
+
+                                        // Emit MarkPriceUpdate only if subscribed
+                                        if self.mark_price_subs.contains(&instrument_id) {
+                                            match parse_ticker_to_mark_price(
+                                                &ticker_msg,
+                                                instrument,
+                                                ts_init,
+                                            ) {
+                                                Ok(mark_price) => {
+                                                    data_vec.push(Data::MarkPrice(mark_price));
+                                                }
+                                                Err(e) => {
+                                                    log::warn!("Failed to parse mark price: {e}");
+                                                }
+                                            }
+                                        }
+
+                                        // Emit IndexPriceUpdate only if subscribed
+                                        if self.index_price_subs.contains(&instrument_id) {
+                                            match parse_ticker_to_index_price(
+                                                &ticker_msg,
+                                                instrument,
+                                                ts_init,
+                                            ) {
+                                                Ok(index_price) => {
+                                                    data_vec.push(Data::IndexPrice(index_price));
+                                                }
+                                                Err(e) => {
+                                                    log::warn!("Failed to parse index price: {e}");
+                                                }
+                                            }
+                                        }
+
+                                        if !data_vec.is_empty() {
+                                            return Some(NautilusWsMessage::Data(data_vec));
+                                        }
+                                    } else {
+                                        log::warn!(
+                                            "Ticker message received but instrument '{}' not found in cache (cache size: {})",
+                                            ticker_msg.instrument_name,
+                                            self.instruments_cache.len()
+                                        );
+                                    }
+                                }
+                                Err(e) => {
+                                    log::warn!(
+                                        "Failed to deserialize ticker message: {e}, channel: {channel}"
+                                    );
+                                }
+                            }
+                        }
+                        DeribitWsChannel::Perpetual => {
+                            // Parse perpetual channel for funding rate updates
+                            // This channel is dedicated to perpetual instruments and provides
+                            // the interest (funding) rate
+                            match serde_json::from_str::<DeribitPerpetualMsg>(data.get()) {
+                                Ok(perpetual_msg) => {
+                                    // Extract instrument name from channel: perpetual.{instrument}.{interval}
+                                    let parts: Vec<&str> = channel.split('.').collect();
+                                    if parts.len() >= 2 {
+                                        let instrument_name = Ustr::from(parts[1]);
+
+                                        if let Some(instrument) =
+                                            self.instruments_cache.get(&instrument_name)
+                                        {
+                                            let funding_rate = parse_perpetual_to_funding_rate(
+                                                &perpetual_msg,
+                                                instrument,
+                                                ts_init,
+                                            );
+                                            return Some(NautilusWsMessage::FundingRates(vec![
+                                                funding_rate,
+                                            ]));
+                                        } else {
+                                            log::warn!(
+                                                "Instrument {} not found in cache (cache size: {})",
+                                                instrument_name,
+                                                self.instruments_cache.len()
+                                            );
+                                        }
+                                    }
+                                }
+                                Err(e) => {
+                                    log::warn!(
+                                        "Failed to deserialize perpetual message: {e}, data: {data}"
+                                    );
+                                }
+                            }
+                        }
+                        DeribitWsChannel::Quote => {
+                            // Parse quote messages
+                            match serde_json::from_str::<DeribitQuoteMsg>(data.get()) {
+                                Ok(quote_msg) => {
+                                    if let Some(instrument) =
+                                        self.instruments_cache.get(&quote_msg.instrument_name)
+                                    {
+                                        match parse_quote_msg(&quote_msg, instrument, ts_init) {
+                                            Ok(quote) => {
+                                                return Some(NautilusWsMessage::Data(vec![
+                                                    Data::Quote(quote),
+                                                ]));
+                                            }
+                                            Err(e) => {
+                                                log::warn!("Failed to parse quote message: {e}");
+                                            }
+                                        }
+                                    } else {
+                                        log::warn!(
+                                            "Quote message received but instrument '{}' not found in cache (cache size: {})",
+                                            quote_msg.instrument_name,
+                                            self.instruments_cache.len()
+                                        );
+                                    }
+                                }
+                                Err(e) => {
+                                    log::warn!(
+                                        "Failed to deserialize quote message: {e}, channel: {channel}"
+                                    );
+                                }
+                            }
+                        }
+                        DeribitWsChannel::VolatilityIndex => {
+                            match serde_json::from_str::<DeribitVolatilityIndexMsg>(data.get()) {
+                                Ok(msg) => {
+                                    let ts_event = UnixNanos::from(msg.timestamp * 1_000_000);
+
+                                    let metadata = nautilus_core::Params::new(
+                                        [(
+                                            "index_name".to_string(),
+                                            serde_json::Value::String(msg.index_name.clone()),
+                                        )]
+                                        .into(),
+                                    );
+                                    let data_type = DataType::new(
+                                        "DeribitVolatilityIndex",
+                                        Some(metadata),
+                                        None,
+                                    );
+
+                                    let dvol = DeribitVolatilityIndex::new(
+                                        msg.index_name,
+                                        msg.volatility,
+                                        ts_event,
+                                        ts_init,
+                                    );
+
+                                    return Some(NautilusWsMessage::Data(vec![Data::Custom(
+                                        CustomData::new(Arc::new(dvol), data_type),
+                                    )]));
+                                }
+                                Err(e) => {
+                                    log::warn!("Failed to deserialize volatility index: {e}");
+                                }
+                            }
+                        }
+                        DeribitWsChannel::InstrumentState => {
+                            match serde_json::from_str::<DeribitInstrumentStateMsg>(data.get()) {
+                                Ok(state_msg) => {
+                                    log::debug!(
+                                        "Instrument state change: {} -> {} (timestamp: {})",
+                                        state_msg.instrument_name,
+                                        state_msg.state,
+                                        state_msg.timestamp
+                                    );
+
+                                    let instrument_id = if let Some(instrument) =
+                                        self.instruments_cache.get(&state_msg.instrument_name)
+                                    {
+                                        instrument.id()
+                                    } else {
+                                        log::debug!(
+                                            "Instrument '{}' not in cache, constructing ID",
+                                            state_msg.instrument_name
+                                        );
+                                        InstrumentId::new(
+                                            Symbol::new(state_msg.instrument_name),
+                                            *DERIBIT_VENUE,
+                                        )
+                                    };
+
+                                    let action = MarketStatusAction::from(state_msg.state);
+                                    let is_trading =
+                                        Some(state_msg.state == DeribitInstrumentState::Started);
+                                    let ts_event = UnixNanos::from(state_msg.timestamp * 1_000_000);
+                                    let status = InstrumentStatus::new(
+                                        instrument_id,
+                                        action,
+                                        ts_event,
+                                        ts_init,
+                                        None,
+                                        None,
+                                        is_trading,
+                                        None,
+                                        None,
+                                    );
+                                    return Some(NautilusWsMessage::InstrumentStatus(status));
+                                }
+                                Err(e) => {
+                                    log::warn!("Failed to parse instrument status message: {e}");
+                                }
+                            }
+                        }
+                        DeribitWsChannel::ChartTrades => {
+                            // Parse chart.trades messages into Bar objects using emit-on-next pattern.
+                            // Deribit sends updates for the current bar as it builds. We only emit
+                            // a bar when we receive a bar with a different timestamp, confirming
+                            // the previous bar is closed.
+                            if let Ok(chart_msg) =
+                                serde_json::from_str::<DeribitChartMsg>(data.get())
+                            {
+                                // Extract instrument and resolution from channel
+                                // Channel format: chart.trades.{instrument}.{resolution}
+                                let parts: Vec<&str> = channel.split('.').collect();
+                                if parts.len() >= 4 {
+                                    let instrument_name = Ustr::from(parts[2]);
+                                    let resolution = parts[3];
+
+                                    if let Some(instrument) =
+                                        self.instruments_cache.get(&instrument_name)
+                                    {
+                                        let instrument_id = instrument.id();
+
+                                        match resolution_to_bar_type(instrument_id, resolution) {
+                                            Ok(bar_type) => {
+                                                let price_precision = instrument.price_precision();
+                                                let size_precision = instrument.size_precision();
+                                                let use_cost_for_volume =
+                                                    use_cost_for_bar_volume(instrument);
+
+                                                match parse_chart_msg(
+                                                    &chart_msg,
+                                                    bar_type,
+                                                    price_precision,
+                                                    size_precision,
+                                                    use_cost_for_volume,
+                                                    self.bars_timestamp_on_close,
+                                                    ts_init,
+                                                ) {
+                                                    Ok(new_bar) => {
+                                                        // Check if we have a pending bar for this channel
+                                                        let channel_key = channel.clone();
+
+                                                        if let Some(pending_bar) =
+                                                            self.pending_bars.get(&channel_key)
+                                                        {
+                                                            // If new bar has different timestamp, the pending bar is closed
+                                                            if new_bar.ts_event
+                                                                != pending_bar.ts_event
+                                                            {
+                                                                let closed_bar = *pending_bar;
+                                                                self.pending_bars
+                                                                    .insert(channel_key, new_bar);
+                                                                log::debug!(
+                                                                    "Emitting closed bar: {closed_bar:?}"
+                                                                );
+                                                                return Some(
+                                                                    NautilusWsMessage::Data(vec![
+                                                                        Data::Bar(closed_bar),
+                                                                    ]),
+                                                                );
+                                                            }
+                                                            // Same timestamp - update pending bar with latest values
+                                                            self.pending_bars
+                                                                .insert(channel_key, new_bar);
+                                                        } else {
+                                                            // First bar for this channel - store as pending
+                                                            self.pending_bars
+                                                                .insert(channel_key, new_bar);
+                                                        }
+                                                    }
+                                                    Err(e) => {
+                                                        log::warn!(
+                                                            "Failed to parse chart message to bar: {e}"
+                                                        );
+                                                    }
+                                                }
+                                            }
+                                            Err(e) => {
+                                                log::warn!(
+                                                    "Failed to create BarType from resolution {resolution}: {e}"
+                                                );
+                                            }
+                                        }
+                                    } else {
+                                        log::warn!(
+                                            "Instrument {instrument_name} not found in cache for chart data"
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                        DeribitWsChannel::UserOrders => {
+                            // Handle both array and single object responses
+                            let orders_result = serde_json::from_str::<Vec<DeribitOrderMsg>>(
+                                data.get(),
+                            )
+                            .or_else(|_| {
+                                serde_json::from_str::<DeribitOrderMsg>(data.get())
+                                    .map(|order| vec![order])
+                            });
+
+                            match orders_result {
+                                Ok(orders) => {
+                                    log::debug!("Received {} user order updates", orders.len());
+
+                                    // Require account_id for parsing
+                                    let Some(account_id) = self.account_id else {
+                                        log::warn!("Cannot parse user orders: account_id not set");
+                                        return Some(NautilusWsMessage::Raw(data.clone()));
+                                    };
+
+                                    let mut outgoing = Vec::new();
+
+                                    // Process each order and emit appropriate events
+                                    for order in &orders {
+                                        let venue_order_id_str = &order.order_id;
+                                        let venue_order_id =
+                                            VenueOrderId::new(venue_order_id_str.as_str());
+                                        let instrument_name = order.instrument_name;
+
+                                        let Some(instrument) =
+                                            self.instruments_cache.get(&instrument_name)
+                                        else {
+                                            log::warn!(
+                                                "Instrument {instrument_name} not found in cache"
+                                            );
+                                            continue;
+                                        };
+
+                                        let label_client_order_id = order
+                                            .label
+                                            .as_ref()
+                                            .filter(|l| !l.is_empty())
+                                            .map(ClientOrderId::new);
+                                        let was_terminal = self
+                                            .terminal_order_contexts
+                                            .contains_key(&venue_order_id);
+                                        let Some(mut context) = self.find_order_context(
+                                            venue_order_id,
+                                            label_client_order_id,
+                                        ) else {
+                                            match parse_user_order_msg(
+                                                order, instrument, account_id, ts_init,
+                                            ) {
+                                                Ok(report) => outgoing.push(
+                                                    NautilusWsMessage::OrderStatusReports(vec![
+                                                        report,
+                                                    ]),
+                                                ),
+                                                Err(e) => log::warn!(
+                                                    "Failed to parse external order update: {e}"
+                                                ),
+                                            }
+                                            continue;
+                                        };
+
+                                        let signature = Self::order_signature(order);
+
+                                        // Determine event type based on order state
+                                        let event_type = determine_order_event_type(
+                                            &order.order_state,
+                                            !context.accepted,
+                                            order.replaced
+                                                && context.last_order_signature != Some(signature),
+                                        );
+                                        context.last_order_signature = Some(signature);
+
+                                        let trader_id = context.trader_id;
+                                        let strategy_id = context.strategy_id;
+                                        let client_order_id = context.client_order_id;
+
+                                        let push_accepted = |
+                                            context: &mut OrderContext,
+                                            outgoing: &mut Vec<NautilusWsMessage>,
+                                        | {
+                                            if context.accepted {
+                                                return;
+                                            }
+
+                                            outgoing.push(NautilusWsMessage::OrderAccepted(
+                                                parse_order_accepted_with_client_order_id(
+                                                    order,
+                                                    instrument,
+                                                    account_id,
+                                                    trader_id,
+                                                    strategy_id,
+                                                    client_order_id,
+                                                    ts_init,
+                                                ),
+                                            ));
+                                            context.accepted = true;
+                                        };
+
+                                        match event_type {
+                                            OrderEventType::Accepted => {
+                                                // Skip if order already reached terminal state (race condition)
+                                                if self
+                                                    .terminal_order_contexts
+                                                    .contains_key(&venue_order_id)
+                                                {
+                                                    log::debug!(
+                                                        "Skipping OrderAccepted for terminal order: client_order_id={client_order_id}"
+                                                    );
+                                                    continue;
+                                                }
+
+                                                let event =
+                                                    parse_order_accepted_with_client_order_id(
+                                                        order,
+                                                        instrument,
+                                                        account_id,
+                                                        trader_id,
+                                                        strategy_id,
+                                                        client_order_id,
+                                                        ts_init,
+                                                    );
+                                                context.accepted = true;
+                                                self.bind_order_context(venue_order_id, context);
+
+                                                log::debug!(
+                                                    "Emitting OrderAccepted: venue_order_id={venue_order_id}"
+                                                );
+                                                outgoing
+                                                    .push(NautilusWsMessage::OrderAccepted(event));
+                                            }
+                                            OrderEventType::Canceled => {
+                                                // Skip if already emitted from the cancel
+                                                // response path
+                                                if self
+                                                    .terminal_order_contexts
+                                                    .contains_key(&venue_order_id)
+                                                {
+                                                    log::trace!(
+                                                        "Skipping duplicate OrderCanceled: client_order_id={client_order_id}"
+                                                    );
+                                                    continue;
+                                                }
+
+                                                push_accepted(&mut context, &mut outgoing);
+
+                                                let event =
+                                                    parse_order_canceled_with_client_order_id(
+                                                        order,
+                                                        instrument,
+                                                        account_id,
+                                                        trader_id,
+                                                        strategy_id,
+                                                        client_order_id,
+                                                        ts_init,
+                                                    );
+                                                log::debug!(
+                                                    "Emitting OrderCanceled: venue_order_id={venue_order_id}"
+                                                );
+                                                self.finish_order_context(
+                                                    venue_order_id,
+                                                    &context,
+                                                    true,
+                                                );
+                                                outgoing
+                                                    .push(NautilusWsMessage::OrderCanceled(event));
+                                            }
+                                            OrderEventType::Expired => {
+                                                if self
+                                                    .terminal_order_contexts
+                                                    .contains_key(&venue_order_id)
+                                                {
+                                                    log::trace!(
+                                                        "Skipping duplicate OrderExpired: client_order_id={client_order_id}"
+                                                    );
+                                                    continue;
+                                                }
+
+                                                push_accepted(&mut context, &mut outgoing);
+
+                                                let event =
+                                                    parse_order_expired_with_client_order_id(
+                                                        order,
+                                                        instrument,
+                                                        account_id,
+                                                        trader_id,
+                                                        strategy_id,
+                                                        client_order_id,
+                                                        ts_init,
+                                                    );
+                                                log::debug!(
+                                                    "Emitting OrderExpired: venue_order_id={venue_order_id}"
+                                                );
+                                                self.finish_order_context(
+                                                    venue_order_id,
+                                                    &context,
+                                                    true,
+                                                );
+                                                outgoing
+                                                    .push(NautilusWsMessage::OrderExpired(event));
+                                            }
+                                            OrderEventType::Updated => {
+                                                if was_terminal {
+                                                    log::trace!(
+                                                        "Skipping amendment for terminal order: venue_order_id={venue_order_id}"
+                                                    );
+                                                    continue;
+                                                }
+
+                                                push_accepted(&mut context, &mut outgoing);
+
+                                                let event =
+                                                    parse_order_updated_with_client_order_id(
+                                                        order,
+                                                        instrument,
+                                                        account_id,
+                                                        trader_id,
+                                                        strategy_id,
+                                                        client_order_id,
+                                                        ts_init,
+                                                    );
+                                                self.bind_order_context(venue_order_id, context);
+                                                log::debug!(
+                                                    "Emitting OrderUpdated: venue_order_id={venue_order_id}"
+                                                );
+                                                outgoing
+                                                    .push(NautilusWsMessage::OrderUpdated(event));
+                                            }
+                                            OrderEventType::None => {
+                                                // Fills handled via user.trades, track terminal state
+                                                // for race condition prevention
+                                                if order.order_state == "filled" {
+                                                    log::debug!(
+                                                        "Recording terminal order: venue_order_id={venue_order_id}, state={}",
+                                                        order.order_state
+                                                    );
+                                                    self.finish_order_context(
+                                                        venue_order_id,
+                                                        &context,
+                                                        false,
+                                                    );
+                                                } else if order.order_state == "rejected" {
+                                                    log::debug!(
+                                                        "Recording rejected order: venue_order_id={venue_order_id}"
+                                                    );
+                                                    self.finish_order_context(
+                                                        venue_order_id,
+                                                        &context,
+                                                        true,
+                                                    );
+                                                } else if was_terminal {
+                                                    self.finish_order_context(
+                                                        venue_order_id,
+                                                        &context,
+                                                        false,
+                                                    );
+                                                } else {
+                                                    log::trace!(
+                                                        "No event to emit for order {}, state={}",
+                                                        venue_order_id,
+                                                        order.order_state
+                                                    );
+                                                    self.bind_order_context(
+                                                        venue_order_id,
+                                                        context,
+                                                    );
+                                                }
+                                            }
+                                        }
+                                    }
+
+                                    if !outgoing.is_empty() {
+                                        self.pending_outgoing.extend(outgoing);
+                                    }
+                                }
+                                Err(e) => {
+                                    log::warn!("Failed to deserialize user orders: {e}");
+                                }
+                            }
+                        }
+                        DeribitWsChannel::UserTrades => {
+                            // Handle both array and single object responses
+                            let trades_result =
+                                serde_json::from_str::<Vec<DeribitUserTradeMsg>>(data.get())
+                                    .or_else(|_| {
+                                        serde_json::from_str::<DeribitUserTradeMsg>(data.get())
+                                            .map(|trade| vec![trade])
+                                    });
+
+                            match trades_result {
+                                Ok(trades) => {
+                                    log::debug!("Received {} user trade updates", trades.len());
+                                    if self.account_id.is_none() {
+                                        log::warn!("Cannot parse user trades: account_id not set");
+                                        return Some(NautilusWsMessage::Raw(data.clone()));
+                                    }
+                                    let outgoing = self.route_user_trades(&trades, ts_init);
+                                    if !outgoing.is_empty() {
+                                        self.pending_outgoing.extend(outgoing);
+                                    }
+                                }
+                                Err(e) => {
+                                    log::warn!("Failed to deserialize user trades: {e}");
+                                }
+                            }
+                        }
+                        DeribitWsChannel::UserPortfolio => {
+                            match serde_json::from_str::<DeribitPortfolioMsg>(data.get()) {
+                                Ok(portfolio) => {
+                                    // Skip zero-balance currencies (common with cross-collateral)
+                                    // Only check equity and balance - initial_margin can be non-zero
+                                    // for all currencies when cross-collateral is enabled
+                                    if portfolio.equity.is_zero() && portfolio.balance.is_zero() {
+                                        log::trace!(
+                                            "Skipping zero-balance portfolio for {}",
+                                            portfolio.currency
+                                        );
+                                        return None;
+                                    }
+
+                                    // Require account_id for parsing
+                                    let Some(account_id) = self.account_id else {
+                                        log::warn!("Cannot parse portfolio: account_id not set");
+                                        return None;
+                                    };
+
+                                    match parse_portfolio_to_account_state(
+                                        &portfolio, account_id, ts_init,
+                                    ) {
+                                        Ok(account_state) => {
+                                            // Check for duplicate per currency
+                                            let currency_key = portfolio.currency.clone();
+
+                                            if let Some(last) =
+                                                self.last_account_states.get(&currency_key)
+                                                && account_state.has_same_balances_and_margins(last)
+                                            {
+                                                log::trace!(
+                                                    "Skipping duplicate portfolio update for {}",
+                                                    portfolio.currency
+                                                );
+                                                return None;
+                                            }
+
+                                            self.last_account_states
+                                                .insert(currency_key, account_state.clone());
+                                            return Some(NautilusWsMessage::AccountState(
+                                                account_state,
+                                            ));
+                                        }
+                                        Err(e) => {
+                                            log::warn!(
+                                                "Failed to parse portfolio to AccountState: {e}"
+                                            );
+                                        }
+                                    }
+                                }
+                                Err(e) => {
+                                    log::warn!("Failed to deserialize portfolio: {e}");
+                                }
+                            }
+                        }
+                        _ => {
+                            // Unhandled channel - return raw
+                            log::trace!("Unhandled channel: {channel}");
+                            return Some(NautilusWsMessage::Raw(data.clone()));
+                        }
+                    }
+                } else {
+                    log::trace!("Unknown channel: {channel}");
+                    return Some(NautilusWsMessage::Raw(data.clone()));
+                }
+                None
+            }
+            DeribitWsMessage::Heartbeat(heartbeat) => {
+                match heartbeat.heartbeat_type {
+                    DeribitHeartbeatType::TestRequest => {
+                        log::trace!(
+                            "Received heartbeat test_request - responding with public/test"
+                        );
+
+                        if let Err(e) = self.handle_heartbeat_test_request().await {
+                            log::error!("Failed to respond to heartbeat test_request: {e}");
+
+                            // Return error to signal connection may be unhealthy
+                            return Some(NautilusWsMessage::Error(DeribitWsError::Send(format!(
+                                "Heartbeat response failed: {e}"
+                            ))));
+                        }
+                    }
+                    DeribitHeartbeatType::Heartbeat => {
+                        log::trace!("Received heartbeat acknowledgment");
+                    }
+                }
+                None
+            }
+            DeribitWsMessage::Error(err) => {
+                log::error!("Deribit error {}: {}", err.code, err.message);
+                Some(NautilusWsMessage::Error(DeribitWsError::DeribitError {
+                    code: err.code,
+                    message: err.message,
+                }))
+            }
+            DeribitWsMessage::Reconnected => Some(NautilusWsMessage::Reconnected),
+        }
+    }
+
+    fn handle_unsubscribe_acknowledgement(
+        &mut self,
+        request_id: u64,
+        channels: &[String],
+        response: &DeribitJsonRpcResponse<Box<RawValue>>,
+    ) {
+        if let Some(error) = &response.error {
+            log::error!(
+                "Unsubscribe failed: code={}, message={}, channels={:?}, request_id={}",
+                error.code,
+                error.message,
+                channels,
+                request_id
+            );
+
+            self.abort_book_replacements(channels, error.code, &error.message);
+
+            return;
+        }
+
+        let acknowledged = self.subscription_acknowledgements(
+            request_id,
+            channels,
+            response.result.as_deref(),
+            false,
+        );
+
+        for ch in &acknowledged {
+            self.subscriptions_state.confirm_unsubscribe(ch);
+            log::debug!("Unsubscription confirmed: {ch}");
+            self.handle_book_unsubscribe_ack(ch);
+        }
+    }
+
+    fn subscription_acknowledgements(
+        &self,
+        request_id: u64,
+        requested: &[String],
+        result: Option<&RawValue>,
+        subscribe: bool,
+    ) -> Vec<String> {
+        let operation = if subscribe {
+            "Subscribe"
+        } else {
+            "Unsubscribe"
+        };
+
+        let parsed = result
+            .ok_or_else(|| "missing result".to_string())
+            .and_then(|result| {
+                serde_json::from_str::<Vec<String>>(result.get()).map_err(|e| e.to_string())
+            });
+
+        let returned = match parsed {
+            Ok(channels) => channels,
+            Err(e) => {
+                let reason =
+                    format!("{operation} acknowledgement invalid: {e}, request_id={request_id}");
+                log::error!("{reason}");
+
+                if subscribe {
+                    self.subscribe_errors.lock().push(reason);
+                }
+
+                return Vec::new();
+            }
+        };
+
+        let mut returned: HashSet<String> = returned.into_iter().collect();
+        let mut requested_unique = HashSet::new();
+        let acknowledged: Vec<String> = requested
+            .iter()
+            .filter(|ch| requested_unique.insert(ch.as_str()) && returned.remove(ch.as_str()))
+            .cloned()
+            .collect();
+
+        if acknowledged.len() != requested_unique.len() || !returned.is_empty() {
+            let reason = format!(
+                "{operation} acknowledgement incomplete or unrelated: confirmed={} requested={} unrelated={}, request_id={request_id}",
+                acknowledged.len(),
+                requested_unique.len(),
+                returned.len(),
+            );
+            log::error!("{reason}");
+
+            if subscribe {
+                self.subscribe_errors.lock().push(reason);
+            }
+        }
+
+        acknowledged
+    }
+
+    async fn handle_book_message(
+        &mut self,
+        channel: &str,
+        data: &str,
+        ts_init: UnixNanos,
+    ) -> Option<NautilusWsMessage> {
+        let book_msg = match serde_json::from_str::<DeribitBookMsg>(data) {
+            Ok(msg) => msg,
+            Err(e) => {
+                log::warn!("Failed to deserialize book message: {e}, channel: {channel}");
+                return None;
+            }
+        };
+
+        if is_grouped_book_channel(channel) {
+            return self.handle_grouped_book(channel, &book_msg, ts_init).await;
+        }
+
+        let key = BookKey::for_channel(channel)?;
+
+        if !self.book_sync.is_tracked(&key) {
+            return None;
+        }
+
+        let Some(instrument) = self.instruments_cache.get(&book_msg.instrument_name) else {
+            log::warn!(
+                "Book message received but instrument '{}' not found in cache (cache size: {})",
+                book_msg.instrument_name,
+                self.instruments_cache.len()
+            );
+            return None;
+        };
+
+        // Parse snapshots before accepting so a corrupt frame never completes an episode
+        if book_msg.msg_type == DeribitBookMsgType::Snapshot {
+            let deltas = match parse_book_msg(&book_msg, instrument, ts_init) {
+                Ok(deltas) => deltas,
+                Err(e) => {
+                    log::error!(
+                        "Failed to parse book snapshot for {}: {e}, requesting recovery",
+                        book_msg.instrument_name
+                    );
+                    self.reject_book_frame(&key, DeribitWsError::ParsingError(e.to_string()));
+                    return None;
+                }
+            };
+
+            return match self.book_sync.validate(
+                &key,
+                book_msg.msg_type,
+                book_msg.change_id,
+                book_msg.prev_change_id,
+                Instant::now(),
+            ) {
+                BookSequenceOutcome::Accept => Some(NautilusWsMessage::Deltas(deltas)),
+                BookSequenceOutcome::Suppress | BookSequenceOutcome::Recover => None,
+            };
+        }
+
+        match self.book_sync.validate(
+            &key,
+            book_msg.msg_type,
+            book_msg.change_id,
+            book_msg.prev_change_id,
+            Instant::now(),
+        ) {
+            BookSequenceOutcome::Accept => {}
+            BookSequenceOutcome::Suppress => return None,
+            BookSequenceOutcome::Recover => {
+                self.start_book_recovery(&key);
+                return None;
+            }
+        }
+
+        match parse_book_msg(&book_msg, instrument, ts_init) {
+            Ok(deltas) => Some(NautilusWsMessage::Deltas(deltas)),
+            Err(e) => {
+                log::error!(
+                    "Failed to parse book message for {}: {e}, requesting recovery",
+                    book_msg.instrument_name
+                );
+                self.reject_book_delta(&key, DeribitWsError::ParsingError(e.to_string()));
+                None
+            }
+        }
+    }
+
+    async fn handle_grouped_book(
+        &mut self,
+        channel: &str,
+        book_msg: &DeribitBookMsg<'_>,
+        ts_init: UnixNanos,
+    ) -> Option<NautilusWsMessage> {
+        let (depth_refs, deltas_subscribed) = {
+            let depth_subs = self.book_depth_subs.lock().await;
+            let depth_refs = depth_subs.get_reference_count(channel);
+            let deltas_subscribed =
+                self.subscriptions_state.get_reference_count(channel) > depth_refs;
+            (depth_refs, deltas_subscribed)
+        };
+
+        if depth_refs == 0 && !deltas_subscribed {
+            return None;
+        }
+
+        let key = BookKey::for_channel(channel)?;
+
+        if !self.book_sync.is_tracked(&key) {
+            return None;
+        }
+
+        // Grouped legs stream snapshots, but a contiguous change still advances them
+        if book_msg.msg_type == DeribitBookMsgType::Change
+            && !self.validate_book_frame(
+                &key,
+                book_msg.msg_type,
+                book_msg.change_id,
+                book_msg.prev_change_id,
+            )
+        {
+            return None;
+        }
+
+        let Some(instrument) = self.instruments_cache.get(&book_msg.instrument_name) else {
+            log::warn!(
+                "Book snapshot instrument '{}' not found in cache",
+                book_msg.instrument_name
+            );
+            return None;
+        };
+
+        // Parse snapshots before accepting so a corrupt frame never completes an episode
+        let depth = if depth_refs > 0 {
+            Some(parse_book_depth(book_msg, instrument, ts_init))
+        } else {
+            None
+        };
+
+        let deltas = if deltas_subscribed {
+            Some(parse_book_msg(book_msg, instrument, ts_init))
+        } else {
+            None
+        };
+
+        let (depth, deltas) = self.parse_grouped_snapshot(
+            &key,
+            channel,
+            book_msg.instrument_name.as_str(),
+            depth,
+            deltas,
+        )?;
+
+        if book_msg.msg_type == DeribitBookMsgType::Snapshot
+            && !matches!(
+                self.book_sync.validate(
+                    &key,
+                    book_msg.msg_type,
+                    book_msg.change_id,
+                    book_msg.prev_change_id,
+                    Instant::now(),
+                ),
+                BookSequenceOutcome::Accept
+            )
+        {
+            return None;
+        }
+
+        if let Some(depth) = depth {
+            if let Some(deltas) = deltas {
+                self.pending_outgoing
+                    .push_back(NautilusWsMessage::Deltas(deltas));
+            }
+
+            return Some(NautilusWsMessage::Data(vec![Data::BookDepth(Box::new(
+                depth,
+            ))]));
+        }
+
+        deltas.map(NautilusWsMessage::Deltas)
+    }
+
+    fn reject_book_frame(&mut self, key: &BookKey, error: DeribitWsError) {
+        if self.book_sync.reject_snapshot(key, error) == BookSequenceOutcome::Recover {
+            self.start_book_recovery(key);
+        }
+    }
+
+    fn reject_book_delta(&mut self, key: &BookKey, error: DeribitWsError) {
+        if self.book_sync.reject_delta(key, error) == BookSequenceOutcome::Recover {
+            self.start_book_recovery(key);
+        }
+    }
+
+    fn start_book_recovery(&mut self, key: &BookKey) {
+        // Check what the replacement needs before claiming, so an early return leaves the
+        // book unowned and its next frame requests recovery again
+        if self.book_replacement_channels(key).is_empty() {
+            return;
+        }
+
+        let Some(cmd_tx) = self.book_cmd_tx.clone() else {
+            return;
+        };
+
+        let Some(recovery) = self.book_sync.claim(key) else {
+            return;
+        };
+
+        log::debug!("Starting book recovery for {key}");
+        let timeout = self.book_snapshot_timeout;
+        self.book_sync
+            .work
+            .push(recover(key.clone(), recovery, cmd_tx, timeout));
+    }
+
+    fn poll_book_recoveries(&mut self) {
+        if self.book_sync.is_empty() {
+            return;
+        }
+
+        let now = Instant::now();
+        let elapsed = now
+            .checked_duration_since(self.book_monitor_last)
+            .unwrap_or_default();
+
+        if elapsed < Duration::from_secs(1) {
+            return;
+        }
+
+        self.book_monitor_last = now;
+
+        for (key, signal) in
+            self.book_sync
+                .recoveries(self.book_stale_threshold, self.book_snapshot_timeout, now)
+        {
+            signal.log();
+            self.start_book_recovery(&key);
+        }
+    }
+
+    // Channels a replacement resubscribes for a book: every desired raw channel of a raw
+    // book, or the grouped channel itself while desired
+    fn book_replacement_channels(&self, key: &BookKey) -> Vec<String> {
+        match key {
+            BookKey::Raw(instrument) => self
+                .subscriptions_state
+                .all_topics()
+                .into_iter()
+                .filter(|t| {
+                    is_instrument_book_channel(t, instrument) && !is_grouped_book_channel(t)
+                })
+                .collect(),
+            BookKey::Grouped(channel) => {
+                if self.subscriptions_state.get_reference_count(channel) > 0 {
+                    vec![channel.clone()]
+                } else {
+                    Vec::new()
+                }
+            }
+        }
+    }
+
+    // Whether another desired channel still feeds a book after `removed` goes away
+    fn book_key_still_desired(&self, key: &BookKey, removed: &str) -> bool {
+        match key {
+            BookKey::Raw(instrument) => self.subscriptions_state.all_topics().iter().any(|t| {
+                t != removed
+                    && is_instrument_book_channel(t, instrument)
+                    && !is_grouped_book_channel(t)
+            }),
+            BookKey::Grouped(_) => false,
+        }
+    }
+
+    // Recovery replacements unsubscribe without touching refcounts, so an unsubscribe
+    // command means the last consumer released the channel; drop tracking unless another
+    // desired channel still feeds the same book
+    fn drop_released_book_tracking(&mut self, channels: &[String]) {
+        for channel in channels {
+            if let Some(key) = BookKey::for_channel(channel)
+                && !self.book_key_still_desired(&key, channel)
+            {
+                self.book_sync.remove(&key);
+                self.book_recovery_requests.remove(&key);
+            }
+        }
+    }
+
+    fn replace_book_subscription(
+        &mut self,
+        instrument: Ustr,
+        channel: Option<String>,
+        cancel: &CancellationToken,
+        gate: SnapshotGate,
+        completion: tokio::sync::oneshot::Sender<Result<(), DeribitWsError>>,
+        recovery: &Arc<BookRecovery>,
+    ) {
+        let key = match channel {
+            Some(channel) => BookKey::Grouped(channel),
+            None => BookKey::Raw(instrument),
+        };
+
+        let channels = self.book_replacement_channels(&key);
+
+        if channels.is_empty() || cancel.is_cancelled() {
+            return;
+        }
+
+        if !self
+            .book_sync
+            .begin_recovery_write(&key, recovery, gate, completion, channels.clone())
+        {
+            return;
+        }
+
+        // A new attempt supersedes prior attempts: drop their unacknowledged
+        // requests so late acks cannot drive this transition
+        self.retire_superseded_recovery_requests(&key);
+
+        match self.handle_unsubscribe(channels) {
+            Ok(ids) => self
+                .book_recovery_requests
+                .entry(key)
+                .or_default()
+                .extend(ids),
+            Err(e) => self.book_sync.abort_recovery_write(&key, e),
+        }
+    }
+
+    fn retire_superseded_recovery_requests(&mut self, key: &BookKey) {
+        // Ownership by request id: only this book's recovery-created requests are
+        // recorded, so user, initial, and other books' requests always survive
+        if let Some(ids) = self.book_recovery_requests.remove(key) {
+            for id in ids {
+                self.pending_requests.remove(&id);
+            }
+        }
+    }
+
+    fn abort_book_replacements(&mut self, channels: &[String], code: i64, message: &str) {
+        for channel in channels {
+            if let Some(key) = BookKey::for_channel(channel) {
+                self.book_sync.abort_recovery_write(
+                    &key,
+                    DeribitWsError::DeribitError {
+                        code,
+                        message: message.to_owned(),
+                    },
+                );
+            }
+        }
+    }
+
+    fn recover_rejected_book_subscriptions(&mut self, channels: &[String]) {
+        // A rejected initial subscribe never resolves its wait; recover those books
+        for channel in channels {
+            if let Some(key) = BookKey::for_channel(channel)
+                && self.book_sync.has_unacked_subscription(&key)
+            {
+                self.start_book_recovery(&key);
+            }
+        }
+    }
+
+    fn confirm_book_subscription(&mut self, channel: &str) {
+        if let Some(key) = BookKey::for_channel(channel) {
+            let timeout = self.book_snapshot_timeout;
+            self.book_sync.subscribed(&key, timeout, Instant::now());
+        }
+    }
+
+    fn handle_book_unsubscribe_ack(&mut self, channel: &str) {
+        let Some(key) = BookKey::for_channel(channel) else {
+            return;
+        };
+
+        let lost = DeribitWsError::Transport("book replacement lost before resubscribe".to_owned());
+
+        match self.book_sync.unsubscribed(&key, channel, lost) {
+            UnsubscribedOutcome::Resubscribe(pending) => {
+                let desired: Vec<String> = pending
+                    .into_iter()
+                    .filter(|channel| self.subscriptions_state.get_reference_count(channel) > 0)
+                    .collect();
+
+                if desired.is_empty() {
+                    self.book_sync.abort_recovery_write(
+                        &key,
+                        DeribitWsError::ClientError("book replacement cancelled".to_owned()),
+                    );
+                    self.book_sync.remove(&key);
+                } else {
+                    match self.handle_subscribe(&desired) {
+                        Ok(ids) => self
+                            .book_recovery_requests
+                            .entry(key.clone())
+                            .or_default()
+                            .extend(ids),
+                        Err(e) => self.book_sync.abort_recovery_write(&key, e),
+                    }
+                }
+            }
+            UnsubscribedOutcome::RejectRecovery => {
+                log::debug!("Book replacement lost for {key}, failing its attempt");
+            }
+            UnsubscribedOutcome::Ignored => {}
+        }
+    }
+
+    // Validate an incremental frame; a gap starts recovery and fails validation
+    fn validate_book_frame(
+        &mut self,
+        key: &BookKey,
+        msg_type: DeribitBookMsgType,
+        change_id: u64,
+        prev_change_id: Option<u64>,
+    ) -> bool {
+        match self
+            .book_sync
+            .validate(key, msg_type, change_id, prev_change_id, Instant::now())
+        {
+            BookSequenceOutcome::Accept => true,
+            BookSequenceOutcome::Suppress => false,
+            BookSequenceOutcome::Recover => {
+                self.start_book_recovery(key);
+                false
+            }
+        }
+    }
+
+    // Parse both legs of a grouped snapshot, requesting recovery when either fails conversion
+    fn parse_grouped_snapshot<T, U>(
+        &mut self,
+        key: &BookKey,
+        channel: &str,
+        instrument_name: &str,
+        depth: Option<anyhow::Result<T>>,
+        deltas: Option<anyhow::Result<U>>,
+    ) -> Option<(Option<T>, Option<U>)> {
+        let depth = match depth.transpose() {
+            Ok(depth) => depth,
+            Err(e) => {
+                log::error!(
+                    "Failed to parse grouped book snapshot for {instrument_name} on {channel}: {e}, requesting recovery",
+                );
+                self.reject_book_frame(key, DeribitWsError::ParsingError(e.to_string()));
+                return None;
+            }
+        };
+
+        let deltas = match deltas.transpose() {
+            Ok(deltas) => deltas,
+            Err(e) => {
+                log::error!(
+                    "Failed to parse grouped book snapshot for {instrument_name} on {channel}: {e}, requesting recovery",
+                );
+                self.reject_book_frame(key, DeribitWsError::ParsingError(e.to_string()));
+                return None;
+            }
+        };
+
+        Some((depth, deltas))
+    }
+
+    fn handle_order_submit_response(
+        &mut self,
+        submit_context: &OrderContext,
+        request_id: u64,
+        response: &DeribitJsonRpcResponse<Box<RawValue>>,
+        ts_init: UnixNanos,
+    ) -> Option<NautilusWsMessage> {
+        let client_order_id = submit_context.client_order_id;
+        let trader_id = submit_context.trader_id;
+        let strategy_id = submit_context.strategy_id;
+        let instrument_id = submit_context.instrument_id;
+
+        let Some(result) = &response.result else {
+            let error = response.error.as_ref()?;
+            let (reason, due_post_only) =
+                Self::venue_command_reason(error.code, &error.message, error.data.as_ref())?;
+            self.submitted_order_contexts.remove(&client_order_id);
+            return Some(NautilusWsMessage::OrderRejected(self.order_rejected(
+                trader_id,
+                strategy_id,
+                instrument_id,
+                client_order_id,
+                &reason,
+                due_post_only,
+            )));
+        };
+
+        let order_response = match serde_json::from_str::<DeribitOrderResponse>(result.get()) {
+            Ok(order_response) => order_response,
+            Err(e) => {
+                log::error!("Failed to parse order response: request_id={request_id}, error={e}");
+                return None;
+            }
+        };
+
+        let venue_order_id_str = &order_response.order.order_id;
+        let venue_order_id = VenueOrderId::new(venue_order_id_str.as_str());
+        let order_state = &order_response.order.order_state;
+        log::debug!(
+            "Order response: venue_order_id={venue_order_id}, client_order_id={client_order_id}, state={order_state}"
+        );
+
+        let was_terminal = self.terminal_order_contexts.contains_key(&venue_order_id);
+
+        let mut context = self
+            .find_order_context(venue_order_id, Some(client_order_id))
+            .unwrap_or_else(|| OrderContext {
+                last_order_signature: Some(Self::order_signature(&order_response.order)),
+                ..submit_context.clone()
+            });
+
+        context.last_order_signature = Some(Self::order_signature(&order_response.order));
+        if was_terminal {
+            self.finish_order_context(venue_order_id, &context, false);
+        } else {
+            self.bind_order_context(venue_order_id, context.clone());
+        }
+
+        if order_state == "rejected" {
+            self.submitted_order_contexts.remove(&client_order_id);
+            self.finish_order_context(venue_order_id, &context, true);
+            let due_post_only =
+                order_response.order.reject_reason.as_deref() == Some("post_only_reject");
+            let reason = sanitize_strategy_reason(
+                order_response.order.reject_reason.as_deref().unwrap_or(""),
+            );
+            log::warn!(
+                "Venue rejected order in result: client_order_id={client_order_id}, reason={reason}"
+            );
+            return Some(NautilusWsMessage::OrderRejected(self.order_rejected(
+                trader_id,
+                strategy_id,
+                instrument_id,
+                client_order_id,
+                &reason,
+                due_post_only,
+            )));
+        }
+
+        if !order_response.trades.is_empty() {
+            let outgoing = self.route_user_trades(&order_response.trades, ts_init);
+            self.pending_outgoing.extend(outgoing);
+            return None;
+        }
+
+        if order_state == "filled" {
+            log::debug!(
+                "Deferring acceptance for fast-filled order until its trade arrives: venue_order_id={venue_order_id}, client_order_id={client_order_id}"
+            );
+            self.finish_order_context(venue_order_id, &context, false);
+            return None;
+        }
+
+        if was_terminal {
+            log::debug!(
+                "Skipping OrderAccepted for terminal order: client_order_id={client_order_id}"
+            );
+            return None;
+        }
+
+        if context.accepted {
+            log::trace!(
+                "Skipping duplicate OrderAccepted response: venue_order_id={venue_order_id}"
+            );
+            return None;
+        }
+
+        let instrument_name_ustr = order_response.order.instrument_name;
+
+        let Some(instrument) = self.instruments_cache.get(&instrument_name_ustr) else {
+            log::warn!("Instrument {instrument_name_ustr} not found in cache for order response");
+            return None;
+        };
+
+        let Some(account_id) = self.account_id else {
+            log::warn!("Cannot create OrderAccepted: account_id not set");
+            return None;
+        };
+
+        let event = parse_order_accepted_with_client_order_id(
+            &order_response.order,
+            instrument,
+            account_id,
+            trader_id,
+            strategy_id,
+            client_order_id,
+            ts_init,
+        );
+        context.accepted = true;
+        self.bind_order_context(venue_order_id, context);
+        Some(NautilusWsMessage::OrderAccepted(event))
+    }
+
+    fn order_signature(order: &DeribitOrderMsg) -> OrderSignature {
+        (order.amount, order.price, order.trigger_price)
+    }
+
+    fn find_order_context(
+        &self,
+        venue_order_id: VenueOrderId,
+        client_order_id: Option<ClientOrderId>,
+    ) -> Option<OrderContext> {
+        self.order_contexts
+            .get(&venue_order_id)
+            .or_else(|| {
+                self.terminal_order_contexts
+                    .get(&venue_order_id)
+                    .map(|terminal| &terminal.context)
+            })
+            .cloned()
+            .or_else(|| {
+                client_order_id.and_then(|client_order_id| {
+                    self.submitted_order_contexts.get(&client_order_id).cloned()
+                })
+            })
+    }
+
+    fn bind_order_context(&mut self, venue_order_id: VenueOrderId, context: OrderContext) {
+        self.submitted_order_contexts
+            .remove(&context.client_order_id);
+        self.terminal_order_contexts.remove(&venue_order_id);
+        self.order_contexts.insert(venue_order_id, context);
+    }
+
+    fn finish_order_context(
+        &mut self,
+        venue_order_id: VenueOrderId,
+        context: &OrderContext,
+        late_fills_as_reports: bool,
+    ) {
+        self.order_contexts.remove(&venue_order_id);
+        self.submitted_order_contexts
+            .remove(&context.client_order_id);
+        let late_fills_as_reports = late_fills_as_reports
+            || self
+                .terminal_order_contexts
+                .get(&venue_order_id)
+                .is_some_and(|terminal| terminal.late_fills_as_reports);
+
+        let terminal = TerminalOrderContext {
+            context: context.clone(),
+            late_fills_as_reports,
+        };
+
+        self.terminal_order_contexts
+            .insert(venue_order_id, terminal);
+    }
+
+    fn route_user_trades(
+        &mut self,
+        trades: &[DeribitUserTradeMsg],
+        ts_init: UnixNanos,
+    ) -> Vec<NautilusWsMessage> {
+        let Some(account_id) = self.account_id else {
+            log::warn!("Cannot parse user trades: account_id not set");
+            return Vec::new();
+        };
+
+        let mut outgoing = Vec::with_capacity(trades.len() + 1);
+        let mut reports = Vec::new();
+        let mut completed_contexts = IndexMap::new();
+
+        for trade in trades {
+            let instrument_name = trade.instrument_name;
+            let Some((report, quote_currency)) =
+                self.instruments_cache
+                    .get(&instrument_name)
+                    .map(|instrument| {
+                        (
+                            parse_user_trade_msg(trade, instrument, account_id, ts_init),
+                            instrument.quote_currency(),
+                        )
+                    })
+            else {
+                log::warn!("Instrument {instrument_name} not found in cache");
+                continue;
+            };
+
+            let report = match report {
+                Ok(report) => report,
+                Err(e) => {
+                    log::warn!("Failed to parse trade {}: {e}", trade.trade_id);
+                    continue;
+                }
+            };
+
+            self.route_user_trade(
+                trade,
+                report,
+                quote_currency,
+                &mut outgoing,
+                &mut reports,
+                &mut completed_contexts,
+            );
+        }
+
+        for (venue_order_id, context) in completed_contexts {
+            self.finish_order_context(venue_order_id, &context, true);
+        }
+
+        if !reports.is_empty() {
+            outgoing.push(NautilusWsMessage::FillReports(reports));
+        }
+
+        // Preserve order-context updates before suppressing duplicate trade output
+        outgoing.retain_mut(|message| match message {
+            NautilusWsMessage::OrderFilled(fill) => self
+                .emitted_trades
+                .insert((fill.venue_order_id, fill.trade_id)),
+            NautilusWsMessage::FillReports(reports) => {
+                reports.retain(|report| {
+                    self.emitted_trades
+                        .insert((report.venue_order_id, report.trade_id))
+                });
+
+                !reports.is_empty()
+            }
+            _ => true,
+        });
+
+        outgoing
+    }
+
+    fn route_user_trade(
+        &mut self,
+        trade: &DeribitUserTradeMsg,
+        mut report: FillReport,
+        quote_currency: Currency,
+        outgoing: &mut Vec<NautilusWsMessage>,
+        reports: &mut Vec<FillReport>,
+        completed_contexts: &mut IndexMap<VenueOrderId, OrderContext>,
+    ) {
+        let venue_order_id = report.venue_order_id;
+        let terminal = self.terminal_order_contexts.get(&venue_order_id);
+        let was_terminal = terminal.is_some();
+        let late_fills_as_reports = terminal.is_some_and(|terminal| terminal.late_fills_as_reports);
+
+        let Some(mut context) = self.find_order_context(venue_order_id, report.client_order_id)
+        else {
+            log::debug!(
+                "Parsed external fill report: {} @ {}",
+                report.trade_id,
+                report.last_px
+            );
+            reports.push(report);
+            return;
+        };
+
+        if late_fills_as_reports {
+            report.client_order_id = Some(context.client_order_id);
+            log::debug!(
+                "Parsed post-terminal fill report: {} @ {}",
+                report.trade_id,
+                report.last_px
+            );
+            reports.push(report);
+            return;
+        }
+
+        if !reports.is_empty() {
+            outgoing.push(NautilusWsMessage::FillReports(std::mem::take(reports)));
+        }
+
+        let account_id = report.account_id;
+
+        if !context.accepted {
+            outgoing.push(NautilusWsMessage::OrderAccepted(OrderAccepted::new(
+                context.trader_id,
+                context.strategy_id,
+                context.instrument_id,
+                context.client_order_id,
+                venue_order_id,
+                account_id,
+                UUID4::new(),
+                report.ts_event,
+                report.ts_init,
+                false,
+            )));
+            context.accepted = true;
+        }
+
+        log::debug!(
+            "Parsed tracked fill event: {} @ {}",
+            report.trade_id,
+            report.last_px
+        );
+        outgoing.push(NautilusWsMessage::OrderFilled(OrderFilled::new(
+            context.trader_id,
+            context.strategy_id,
+            context.instrument_id,
+            context.client_order_id,
+            venue_order_id,
+            account_id,
+            report.trade_id,
+            context.order_side,
+            context.order_type,
+            report.last_qty,
+            report.last_px,
+            quote_currency,
+            report.liquidity_side,
+            UUID4::new(),
+            report.ts_event,
+            report.ts_init,
+            false,
+            report.venue_position_id,
+            Some(report.commission),
+            None,
+        )));
+
+        if trade.state == "filled" {
+            completed_contexts.insert(venue_order_id, context.clone());
+        }
+
+        if was_terminal {
+            self.finish_order_context(venue_order_id, &context, false);
+        } else {
+            self.bind_order_context(venue_order_id, context);
+        }
+    }
+
+    /// Main message processing loop.
+    ///
+    /// Returns `None` when the handler should stop.
+    /// Messages that need client-side handling (e.g., Reconnected) are returned.
+    /// Data messages are sent directly to `out_tx` for the user stream.
+    pub async fn next(&mut self) -> Option<NautilusWsMessage> {
+        // A persistent interval: recreating a sleep each pass would starve under traffic
+        let mut book_monitor = tokio::time::interval(tokio::time::Duration::from_millis(100));
+
+        loop {
+            if let Some(msg) = self.pending_outgoing.pop_front() {
+                match msg {
+                    NautilusWsMessage::Reconnected
+                    | NautilusWsMessage::Authenticated(_)
+                    | NautilusWsMessage::AuthenticationFailed(_) => {
+                        return Some(msg);
+                    }
+                    _ => {
+                        let _ = self.out_tx.send(msg);
+                        continue;
+                    }
+                }
+            }
+
+            if self.signal.load(Ordering::Relaxed) {
+                self.subscription_send = None;
+                self.fail_unsent_order_commands();
+                self.process_command(HandlerCommand::Disconnect).await;
+                return None;
+            }
+
+            if self.subscription_send.is_none()
+                && let Some((request_id, payload)) = self.subscription_requests.pop_front()
+            {
+                let send = self.send_secret_with_retry(
+                    payload.into(),
+                    Some(&[Ustr::from(DERIBIT_WS_SUBSCRIPTION_KEY)]),
+                );
+                self.subscription_send = Some(Box::pin(async move { (request_id, send.await) }));
+            }
+
+            tokio::select! {
+                (request_id, result) = async {
+                    match &mut self.subscription_send {
+                        Some(send) => send.await,
+                        None => std::future::pending().await,
+                    }
+                } => {
+                    self.subscription_send = None;
+
+                    if let Err(e) = result {
+                        if matches!(
+                            self.pending_requests.remove(&request_id),
+                            Some(PendingRequestType::Subscribe { .. })
+                        ) {
+                            self.subscribe_errors.lock().push(e.to_string());
+                        }
+                        log::error!("Subscription request send failed: request_id={request_id}, {e}");
+                    }
+                }
+                Some(_) = self.book_sync.work.next(), if !self.book_sync.work.is_empty() => {
+                    // Recovery ends once a snapshot is accepted or the episode is cancelled
+                }
+                // Keep later commands behind all queued subscription batches
+                Some(cmd) = async {
+                    match self.pending_command.take() {
+                        Some(cmd) => Some(cmd),
+                        None => self.cmd_rx.recv().await,
+                    }
+                }, if self.subscription_send.is_none() && self.subscription_requests.is_empty() => {
+                    let cmd = match cmd {
+                        HandlerCommand::Subscribe { channels } => {
+                            let channels = self.coalesce_subscriptions(channels);
+                            HandlerCommand::Subscribe { channels }
+                        }
+                        cmd => cmd,
+                    };
+                    self.process_command(cmd).await;
+                }
+                // Process raw WebSocket messages
+                Some(msg) = self.raw_rx.recv() => {
+                    match msg {
+                        Message::Text(text) => {
+                            if let Some(nautilus_msg) = self.process_raw_message(&text).await {
+                                // Send data messages to user stream
+                                match &nautilus_msg {
+                                    NautilusWsMessage::Data(_)
+                                    | NautilusWsMessage::Deltas(_)
+                                    | NautilusWsMessage::Instrument(_)
+                                    | NautilusWsMessage::InstrumentStatus(_)
+                                    | NautilusWsMessage::OptionGreeks(_)
+                                    | NautilusWsMessage::Raw(_)
+                                    | NautilusWsMessage::Error(_) => {
+                                        let _ = self.out_tx.send(nautilus_msg);
+                                    }
+                                    NautilusWsMessage::FundingRates(rates) => {
+                                        let msg_to_send =
+                                            NautilusWsMessage::FundingRates(rates.clone());
+
+                                        if let Err(e) = self.out_tx.send(msg_to_send) {
+                                            log::error!("Failed to send funding rates: {e}");
+                                        }
+                                    }
+                                    NautilusWsMessage::OrderStatusReports(_)
+                                    | NautilusWsMessage::FillReports(_)
+                                    | NautilusWsMessage::OrderFilled(_)
+                                    | NautilusWsMessage::OrderAccepted(_)
+                                    | NautilusWsMessage::OrderCanceled(_)
+                                    | NautilusWsMessage::OrderExpired(_)
+                                    | NautilusWsMessage::OrderUpdated(_)
+                                    | NautilusWsMessage::OrderRejected(_)
+                                    | NautilusWsMessage::OrderCancelRejected(_)
+                                    | NautilusWsMessage::OrderModifyDenied(_)
+                                    | NautilusWsMessage::OrderModifyRejected(_)
+                                    | NautilusWsMessage::OrderCancelDenied(_)
+                                    | NautilusWsMessage::AccountState(_) => {
+                                        let _ = self.out_tx.send(nautilus_msg);
+                                    }
+                                    // Return messages that need client-side handling
+                                    NautilusWsMessage::Reconnected
+                                    | NautilusWsMessage::Authenticated(_)
+                                    | NautilusWsMessage::AuthenticationFailed(_) => {
+                                        return Some(nautilus_msg);
+                                    }
+                                }
+                            }
+                        }
+                        Message::Ping(data) => {
+                            // Respond to ping with pong
+                            if let Some(client) = &self.inner {
+                                let _ = client.send_pong(data.to_vec()).await;
+                            }
+                        }
+                        Message::Close(_) => {
+                            log::debug!("Received close frame");
+                        }
+                        _ => {}
+                    }
+                }
+                // Check for stop signal, and poll book health on its own cadence
+                _ = book_monitor.tick() => {
+                    self.poll_book_recoveries();
+                }
+            }
+        }
+    }
+}
+
+type SubscriptionSend = BoxFuture<'static, (u64, Result<(), DeribitWsError>)>;
+
+fn subscription_batches(
+    channels: Vec<String>,
+    method: &DeribitWsMethod,
+) -> Result<Vec<Vec<String>>, DeribitWsError> {
+    let envelope = DeribitJsonRpcRequest::new(
+        u64::MAX,
+        method.as_method_str(),
+        DeribitSubscribeParams {
+            channels: Vec::new(),
+        },
+    );
+
+    let overhead = serde_json::to_string(&envelope)
+        .map_err(|e| DeribitWsError::Json(e.to_string()))?
+        .len();
+    let mut batches = Vec::new();
+    let mut batch = Vec::new();
+    let mut bytes = overhead;
+
+    for channel in channels {
+        let encoded =
+            serde_json::to_string(&channel).map_err(|e| DeribitWsError::Json(e.to_string()))?;
+
+        if overhead + encoded.len() > SUBSCRIPTION_REQUEST_MAX_BYTES {
+            return Err(DeribitWsError::Subscribe(
+                "Channel exceeds the WebSocket request byte limit".to_string(),
+            ));
+        }
+
+        let separator = usize::from(!batch.is_empty());
+        if bytes + separator + encoded.len() > SUBSCRIPTION_REQUEST_MAX_BYTES {
+            batches.push(std::mem::take(&mut batch));
+            bytes = overhead;
+        }
+
+        bytes += usize::from(!batch.is_empty()) + encoded.len();
+        batch.push(channel);
+    }
+
+    if !batch.is_empty() {
+        batches.push(batch);
+    }
+
+    Ok(batches)
+}
+
+fn is_instrument_book_channel(channel: &str, instrument_name: &str) -> bool {
+    channel.starts_with("book.")
+        && channel
+            .split('.')
+            .nth(1)
+            .is_some_and(|s| s == instrument_name)
+}
+
+// Grouped channels have the form `book.{instrument}.{group}.{depth}.{interval}`
+fn is_grouped_book_channel(channel: &str) -> bool {
+    channel.starts_with("book.") && channel.split('.').count() == 5
+}
+
+fn book_instrument_id(channel: &str) -> Option<InstrumentId> {
+    let symbol = channel.split('.').nth(1)?;
+    Some(InstrumentId::new(
+        Symbol::from(Ustr::from(symbol)),
+        *DERIBIT_VENUE,
+    ))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use futures_util::{SinkExt, StreamExt};
+    use nautilus_live::book::BookSyncSignalKind;
+    use nautilus_model::{
+        enums::{BookType, LiquiditySide},
+        events::OrderEventAny,
+        instruments::Instrument,
+        orderbook::OrderBook,
+        types::{Currency, Money, Price, Quantity},
+    };
+    use nautilus_network::{
+        ratelimiter::quota::Quota,
+        websocket::{WebSocketConfig, channel_message_handler},
+    };
+    use rstest::rstest;
+
+    use super::*;
+    use crate::{
+        common::{
+            parse::parse_deribit_instrument_any,
+            testing::{load_test_json, routed_spot_instrument},
+        },
+        http::models::{DeribitInstrument, DeribitJsonRpcResponse},
+    };
+
+    fn routing_test_handler() -> DeribitWsFeedHandler {
+        let signal = Arc::new(AtomicBool::new(false));
+        let (_cmd_tx, cmd_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (_raw_tx, raw_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (out_tx, _out_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut handler = DeribitWsFeedHandler::new(
+            signal,
+            cmd_rx,
+            raw_rx,
+            out_tx,
+            AuthTracker::new(),
+            SubscriptionState::new('.'),
+            Arc::new(AtomicSet::new()),
+            Arc::new(AtomicSet::new()),
+            Arc::new(AtomicSet::new()),
+            Some(AccountId::from("DERIBIT-001")),
+            true,
+            Arc::new(Mutex::new(Vec::new())),
+        );
+        let json = load_test_json("http_get_instruments.json");
+        let response: DeribitJsonRpcResponse<Vec<DeribitInstrument>> =
+            serde_json::from_str(&json).unwrap();
+        let instrument = parse_deribit_instrument_any(
+            &response.result.unwrap()[0],
+            UnixNanos::default(),
+            UnixNanos::default(),
+        )
+        .unwrap()
+        .unwrap();
+        handler
+            .instruments_cache
+            .insert(instrument.raw_symbol().inner(), instrument);
+        handler
+    }
+
+    fn order_data(order_state: &str, replaced: bool) -> serde_json::Value {
+        serde_json::json!({
+            "order_id": "ETH-584830574",
+            "label": "O-19700101-000000-001-001-1",
+            "instrument_name": "BTC-PERPETUAL",
+            "direction": "buy",
+            "order_type": "market",
+            "order_state": order_state,
+            "replaced": replaced,
+            "price": 203.8,
+            "amount": 2.0,
+            "filled_amount": if order_state == "filled" { 2.0 } else { 0.0 },
+            "average_price": 203.8,
+            "creation_timestamp": 1_590_480_712_700_u64,
+            "last_update_timestamp": 1_590_480_712_800_u64,
+            "time_in_force": "good_til_cancelled",
+            "commission": 0.00073602,
+            "post_only": false,
+            "reduce_only": false,
+            "trigger_price": null,
+            "trigger": null,
+            "max_show": null,
+            "api": true,
+            "reject_reason": null,
+            "cancel_reason": null
+        })
+    }
+
+    fn trade_data() -> serde_json::Value {
+        serde_json::json!({
+            "trade_id": "ETH-2696068",
+            "order_id": "ETH-584830574",
+            "instrument_name": "BTC-PERPETUAL",
+            "direction": "buy",
+            "price": 203.8,
+            "amount": 2.0,
+            "fee": 0.00073602,
+            "fee_currency": "USDT",
+            "timestamp": 1_590_480_712_800_u64,
+            "trade_seq": 1_966_042_u64,
+            "liquidity": "T",
+            "order_type": "market",
+            "index_price": 203.89,
+            "mark_price": 203.78,
+            "tick_direction": 3,
+            "state": "filled",
+            "label": "O-19700101-000000-001-001-1",
+            "reduce_only": false,
+            "post_only": false,
+            "liquidation": null,
+            "profit_loss": null
+        })
+    }
+
+    fn subscription(channel: &str, data: &serde_json::Value) -> String {
+        serde_json::json!({
+            "jsonrpc": "2.0",
+            "method": "subscription",
+            "params": { "channel": channel, "data": data }
+        })
+        .to_string()
+    }
+
+    #[rstest]
+    #[case([0, 1, 2])]
+    #[case([0, 2, 1])]
+    #[case([1, 0, 2])]
+    #[case([1, 2, 0])]
+    #[case([2, 0, 1])]
+    #[case([2, 1, 0])]
+    #[tokio::test]
+    async fn routed_spot_async_fills_emit_once(
+        #[case] sequence: [usize; 3],
+        #[values("open", "filled")] ack_state: &str,
+    ) {
+        let mut handler = routing_test_handler();
+        let instrument = routed_spot_instrument();
+        let instrument_id = instrument.id();
+        handler
+            .instruments_cache
+            .insert(instrument.raw_symbol().inner(), instrument);
+        let client_order_id = ClientOrderId::from("routed-904");
+        handler.submitted_order_contexts.insert(
+            client_order_id,
+            OrderContext {
+                client_order_id,
+                trader_id: TraderId::from("TRADER-001"),
+                strategy_id: StrategyId::from("S-001"),
+                instrument_id,
+                order_side: OrderSide::Buy,
+                order_type: OrderType::Limit,
+                accepted: false,
+                last_order_signature: None,
+            },
+        );
+
+        handler.pending_requests.insert(
+            42,
+            PendingRequestType::Buy {
+                client_order_id,
+                trader_id: TraderId::from("TRADER-001"),
+                strategy_id: StrategyId::from("S-001"),
+                instrument_id,
+                order_side: OrderSide::Buy,
+                order_type: OrderType::Limit,
+            },
+        );
+
+        let mut messages: Vec<serde_json::Value> = serde_json::from_str(include_str!(
+            "../../test_data/ws_routed_spot_execution.json"
+        ))
+        .unwrap();
+        messages[0]["result"]["order"]["order_state"] = ack_state.into();
+        let mut events = Vec::new();
+
+        for _ in 0..2 {
+            for index in sequence {
+                if let Some(event) = handler
+                    .process_raw_message(&messages[index].to_string())
+                    .await
+                {
+                    events.push(event);
+                }
+
+                events.extend(handler.pending_outgoing.drain(..));
+            }
+        }
+
+        assert_eq!(events.len(), 2);
+
+        let accepted = match &events[0] {
+            NautilusWsMessage::OrderAccepted(event) => event,
+            other => panic!("Expected acceptance, received {other:?}"),
+        };
+
+        let filled = match &events[1] {
+            NautilusWsMessage::OrderFilled(event) => event,
+            other => panic!("Expected fill, received {other:?}"),
+        };
+
+        assert_eq!(accepted.trader_id, TraderId::from("TRADER-001"));
+        assert_eq!(accepted.strategy_id, StrategyId::from("S-001"));
+        assert_eq!(accepted.instrument_id, instrument_id);
+        assert_eq!(accepted.client_order_id, client_order_id);
+        assert_eq!(accepted.venue_order_id, VenueOrderId::from("CSR-ORDER-904"));
+        assert_eq!(accepted.account_id, AccountId::from("DERIBIT-001"));
+        assert_eq!(filled.trader_id, accepted.trader_id);
+        assert_eq!(filled.strategy_id, accepted.strategy_id);
+        assert_eq!(filled.instrument_id, instrument_id);
+        assert_eq!(filled.client_order_id, client_order_id);
+        assert_eq!(filled.venue_order_id, accepted.venue_order_id);
+        assert_eq!(filled.account_id, accepted.account_id);
+        assert_eq!(filled.trade_id, TradeId::from("CSR-TRADE-904"));
+        assert_eq!(filled.order_side, OrderSide::Buy);
+        assert_eq!(filled.order_type, OrderType::Limit);
+        assert_eq!(filled.last_qty, Quantity::from("0.0042"));
+        assert_eq!(filled.last_px, Price::from("45000.25"));
+        assert_eq!(filled.currency, Currency::USDC());
+        assert_eq!(filled.liquidity_side, LiquiditySide::Taker);
+        assert_eq!(filled.commission, Some(Money::from("0.01911000 USDC")));
+        assert_eq!(filled.ts_event, UnixNanos::from(1_787_011_200_500_000_000));
+        assert_eq!(filled.position_id, None);
+        assert!(!filled.reconciliation);
+    }
+
+    #[rstest]
+    #[tokio::test]
+    async fn tracked_fast_fill_synthesizes_accepted_before_filled() {
+        let mut handler = routing_test_handler();
+        let client_order_id = ClientOrderId::from("O-19700101-000000-001-001-1");
+        let instrument_id = InstrumentId::from("BTC-PERPETUAL.DERIBIT");
+        handler.submitted_order_contexts.insert(
+            client_order_id,
+            OrderContext {
+                client_order_id,
+                trader_id: TraderId::from("TRADER-001"),
+                strategy_id: StrategyId::from("S-001"),
+                instrument_id,
+                order_side: OrderSide::Buy,
+                order_type: OrderType::Market,
+                accepted: false,
+                last_order_signature: None,
+            },
+        );
+        handler.pending_requests.insert(
+            42,
+            PendingRequestType::Buy {
+                client_order_id,
+                trader_id: TraderId::from("TRADER-001"),
+                strategy_id: StrategyId::from("S-001"),
+                instrument_id,
+                order_side: OrderSide::Buy,
+                order_type: OrderType::Market,
+            },
+        );
+        let response = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 42,
+            "result": { "order": order_data("filled", false), "trades": [] }
+        });
+
+        handler.process_raw_message(&response.to_string()).await;
+        assert!(handler.pending_outgoing.is_empty());
+        assert!(
+            !handler
+                .terminal_order_contexts
+                .get(&VenueOrderId::from("ETH-584830574"))
+                .unwrap()
+                .context
+                .accepted
+        );
+
+        handler
+            .process_raw_message(&subscription(
+                "user.trades.any.any.raw",
+                &serde_json::json!([trade_data()]),
+            ))
+            .await;
+
+        assert!(matches!(
+            handler.pending_outgoing.pop_front().unwrap(),
+            NautilusWsMessage::OrderAccepted(event)
+                if event.client_order_id == client_order_id
+        ));
+        assert!(matches!(
+            handler.pending_outgoing.pop_front().unwrap(),
+            NautilusWsMessage::OrderFilled(event)
+                if event.client_order_id == client_order_id
+                    && event.trade_id.to_string() == "ETH-2696068"
+                    && event.order_side == OrderSide::Buy
+                    && event.order_type == OrderType::Market
+                    && event.last_qty.to_string() == "2"
+                    && event.last_px.to_string() == "203.8"
+                    && event.liquidity_side == LiquiditySide::Taker
+                    && event.commission == Some(Money::from("0.00073602 USDT"))
+        ));
+        assert!(handler.pending_outgoing.is_empty());
+
+        handler
+            .process_raw_message(&subscription(
+                "user.trades.any.any.raw",
+                &serde_json::json!([trade_data()]),
+            ))
+            .await;
+
+        assert!(handler.pending_outgoing.is_empty());
+    }
+
+    #[rstest]
+    #[case::response_first(false)]
+    #[case::subscription_first(true)]
+    #[tokio::test]
+    async fn submit_response_trades_use_tracked_event_path(
+        #[case] subscription_first: bool,
+        #[values("filled", "open")] trade_state: &str,
+    ) {
+        let mut handler = routing_test_handler();
+        let client_order_id = ClientOrderId::from("O-19700101-000000-001-001-1");
+        let context = OrderContext {
+            client_order_id,
+            trader_id: TraderId::from("TRADER-001"),
+            strategy_id: StrategyId::from("S-001"),
+            instrument_id: InstrumentId::from("BTC-PERPETUAL.DERIBIT"),
+            order_side: OrderSide::Buy,
+            order_type: OrderType::Market,
+            accepted: false,
+            last_order_signature: None,
+        };
+        handler
+            .submitted_order_contexts
+            .insert(client_order_id, context.clone());
+        handler.pending_requests.insert(
+            42,
+            PendingRequestType::Buy {
+                client_order_id,
+                trader_id: context.trader_id,
+                strategy_id: context.strategy_id,
+                instrument_id: context.instrument_id,
+                order_side: context.order_side,
+                order_type: context.order_type,
+            },
+        );
+
+        let mut trade = trade_data();
+        trade["state"] = serde_json::json!(trade_state);
+        trade["amount"] = serde_json::json!(if trade_state == "filled" { 2 } else { 1 });
+        let mut order = order_data(trade_state, false);
+        order["filled_amount"] = trade["amount"].clone();
+        let response = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 42,
+            "result": { "order": order, "trades": [trade.clone()] }
+        });
+        let trade_update = subscription("user.trades.any.any.raw", &serde_json::json!([trade]));
+
+        let (raw_tx, raw_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (out_tx, mut out_rx) = tokio::sync::mpsc::unbounded_channel();
+        handler.raw_rx = raw_rx;
+        handler.out_tx = out_tx;
+        let response = response.to_string();
+        let messages = if subscription_first {
+            [trade_update, response]
+        } else {
+            [response, trade_update]
+        };
+
+        for message in messages {
+            raw_tx.send(Message::Text(message.into())).unwrap();
+        }
+
+        raw_tx.send(Message::Text(RECONNECTED.into())).unwrap();
+        let reconnected = tokio::time::timeout(std::time::Duration::from_secs(2), handler.next())
+            .await
+            .unwrap();
+
+        assert!(matches!(reconnected, Some(NautilusWsMessage::Reconnected)));
+        assert!(matches!(
+            out_rx.try_recv().unwrap(),
+            NautilusWsMessage::OrderAccepted(event)
+                if event.client_order_id == client_order_id
+        ));
+        assert!(matches!(
+            out_rx.try_recv().unwrap(),
+            NautilusWsMessage::OrderFilled(event)
+                if event.client_order_id == client_order_id
+                    && event.trade_id.to_string() == "ETH-2696068"
+                    && event.last_qty.to_string() == if trade_state == "filled" { "2" } else { "1" }
+        ));
+        assert!(out_rx.try_recv().is_err());
+        assert!(handler.pending_outgoing.is_empty());
+        let venue_order_id = VenueOrderId::from("ETH-584830574");
+        assert_eq!(
+            handler
+                .terminal_order_contexts
+                .contains_key(&venue_order_id),
+            trade_state == "filled",
+        );
+        assert_eq!(
+            handler.order_contexts.contains_key(&venue_order_id),
+            trade_state == "open",
+        );
+        assert!(
+            !handler
+                .submitted_order_contexts
+                .contains_key(&client_order_id)
+        );
+    }
+
+    #[rstest]
+    #[case::tracked(true)]
+    #[case::external(false)]
+    #[tokio::test]
+    async fn trade_replays_after_reconnect_preserve_new_fills(#[case] tracked: bool) {
+        let mut handler = routing_test_handler();
+        let client_order_id = ClientOrderId::from("O-19700101-000000-001-001-1");
+        let venue_order_id = VenueOrderId::from("ETH-584830574");
+
+        if tracked {
+            handler.order_contexts.insert(
+                venue_order_id,
+                OrderContext {
+                    client_order_id,
+                    trader_id: TraderId::from("TRADER-001"),
+                    strategy_id: StrategyId::from("S-001"),
+                    instrument_id: InstrumentId::from("BTC-PERPETUAL.DERIBIT"),
+                    order_side: OrderSide::Buy,
+                    order_type: OrderType::Market,
+                    accepted: true,
+                    last_order_signature: None,
+                },
+            );
+        }
+
+        let mut first_trade = trade_data();
+        first_trade["amount"] = serde_json::json!(1);
+        let mut second_trade = first_trade.clone();
+        second_trade["trade_id"] = serde_json::json!("ETH-2696069");
+        second_trade["price"] = serde_json::json!(204.1);
+        second_trade["fee"] = serde_json::json!(0.00083602);
+        let first_update = subscription(
+            "user.trades.any.any.raw",
+            &serde_json::json!([first_trade.clone(), first_trade.clone()]),
+        );
+        let replay_update = subscription(
+            "user.trades.any.any.raw",
+            &serde_json::json!([first_trade, second_trade.clone(), second_trade]),
+        );
+
+        handler.process_raw_message(&first_update).await;
+        let first = handler.pending_outgoing.pop_front().unwrap();
+        assert!(handler.pending_outgoing.is_empty());
+        let reconnected = handler.process_raw_message(RECONNECTED).await;
+        handler.process_raw_message(&replay_update).await;
+        let second = handler.pending_outgoing.pop_front().unwrap();
+
+        let fills: Vec<_> = [first, second]
+            .into_iter()
+            .enumerate()
+            .map(|(index, message)| match message {
+                NautilusWsMessage::OrderFilled(fill) => {
+                    assert!(tracked && index == 0);
+                    assert_eq!(fill.client_order_id, client_order_id);
+                    (
+                        fill.trade_id,
+                        fill.last_qty,
+                        fill.last_px,
+                        fill.commission.unwrap(),
+                    )
+                }
+                NautilusWsMessage::FillReports(mut reports) => {
+                    assert!(!tracked || index == 1);
+                    assert_eq!(reports.len(), 1);
+                    let report = reports.pop().unwrap();
+                    assert_eq!(report.client_order_id, Some(client_order_id));
+                    (
+                        report.trade_id,
+                        report.last_qty,
+                        report.last_px,
+                        report.commission,
+                    )
+                }
+                message => panic!("unexpected fill message: {message:?}"),
+            })
+            .collect();
+
+        assert!(matches!(reconnected, Some(NautilusWsMessage::Reconnected)));
+        assert!(handler.pending_outgoing.is_empty());
+        assert_eq!(
+            fills,
+            vec![
+                (
+                    TradeId::from("ETH-2696068"),
+                    Quantity::from(1),
+                    Price::from("203.8"),
+                    Money::from("0.00073602 USDT")
+                ),
+                (
+                    TradeId::from("ETH-2696069"),
+                    Quantity::from(1),
+                    Price::from("204.1"),
+                    Money::from("0.00083602 USDT")
+                ),
+            ],
+        );
+        assert_eq!(
+            handler
+                .terminal_order_contexts
+                .contains_key(&venue_order_id),
+            tracked
+        );
+        assert!(!handler.order_contexts.contains_key(&venue_order_id));
+    }
+
+    #[rstest]
+    fn trade_dedup_is_scoped_to_venue_order() {
+        let mut handler = routing_test_handler();
+        let first_trade = trade_data();
+        let mut second_trade = first_trade.clone();
+        second_trade["order_id"] = serde_json::json!("ETH-584830575");
+        let trades: Vec<DeribitUserTradeMsg> = serde_json::from_str(
+            &serde_json::json!([first_trade.clone(), first_trade, second_trade]).to_string(),
+        )
+        .unwrap();
+
+        let messages = handler.route_user_trades(&trades, UnixNanos::default());
+
+        assert_eq!(messages.len(), 1);
+
+        let NautilusWsMessage::FillReports(reports) = &messages[0] else {
+            panic!("expected external fill reports");
+        };
+
+        assert_eq!(
+            reports
+                .iter()
+                .map(|report| (report.venue_order_id, report.trade_id))
+                .collect::<Vec<_>>(),
+            vec![
+                (
+                    VenueOrderId::from("ETH-584830574"),
+                    TradeId::from("ETH-2696068")
+                ),
+                (
+                    VenueOrderId::from("ETH-584830575"),
+                    TradeId::from("ETH-2696068")
+                ),
+            ],
+        );
+    }
+
+    #[rstest]
+    #[tokio::test]
+    async fn reconnect_preserves_submit_identity_before_response() {
+        let mut handler = routing_test_handler();
+        let client_order_id = ClientOrderId::from("O-19700101-000000-001-001-1");
+        handler.submitted_order_contexts.insert(
+            client_order_id,
+            OrderContext {
+                client_order_id,
+                trader_id: TraderId::from("TRADER-001"),
+                strategy_id: StrategyId::from("S-001"),
+                instrument_id: InstrumentId::from("BTC-PERPETUAL.DERIBIT"),
+                order_side: OrderSide::Buy,
+                order_type: OrderType::Market,
+                accepted: false,
+                last_order_signature: None,
+            },
+        );
+        handler
+            .pending_requests
+            .insert(42, PendingRequestType::Test);
+
+        handler.clear_state();
+        handler
+            .process_raw_message(&subscription(
+                "user.orders.any.any.raw",
+                &serde_json::json!([order_data("open", false)]),
+            ))
+            .await;
+
+        assert!(handler.pending_requests.is_empty());
+        assert!(matches!(
+            handler.pending_outgoing.pop_front().unwrap(),
+            NautilusWsMessage::OrderAccepted(event)
+                if event.client_order_id == client_order_id
+        ));
+        assert!(
+            handler
+                .order_contexts
+                .get(&VenueOrderId::from("ETH-584830574"))
+                .unwrap()
+                .accepted
+        );
+        assert!(
+            !handler
+                .submitted_order_contexts
+                .contains_key(&client_order_id)
+        );
+    }
+
+    #[tokio::test]
+    async fn pending_submit_survives_replay_cache_eviction_pressure() {
+        let mut handler = routing_test_handler();
+        let client_order_id = ClientOrderId::from("O-19700101-000000-001-001-1");
+        let instrument_id = InstrumentId::from("BTC-PERPETUAL.DERIBIT");
+        handler.track_submit(
+            1,
+            OrderContext {
+                client_order_id,
+                trader_id: TraderId::from("TRADER-001"),
+                strategy_id: StrategyId::from("S-001"),
+                instrument_id,
+                order_side: OrderSide::Buy,
+                order_type: OrderType::Market,
+                accepted: false,
+                last_order_signature: None,
+            },
+        );
+
+        for seq in 2..=(REPLAY_CACHE_CAPACITY as u64 + 1) {
+            let filler_id = ClientOrderId::from(format!("O-FILLER-{seq:05}"));
+            handler.track_submit(
+                seq,
+                OrderContext {
+                    client_order_id: filler_id,
+                    trader_id: TraderId::from("TRADER-001"),
+                    strategy_id: StrategyId::from("S-001"),
+                    instrument_id,
+                    order_side: OrderSide::Buy,
+                    order_type: OrderType::Market,
+                    accepted: false,
+                    last_order_signature: None,
+                },
+            );
+        }
+
+        assert!(
+            handler
+                .submitted_order_contexts
+                .contains_key(&client_order_id)
+        );
+
+        handler
+            .process_raw_message(&subscription(
+                "user.orders.any.any.raw",
+                &serde_json::json!([order_data("open", false)]),
+            ))
+            .await;
+
+        assert!(matches!(
+            handler.pending_outgoing.pop_front().unwrap(),
+            NautilusWsMessage::OrderAccepted(event)
+                if event.client_order_id == client_order_id
+        ));
+        assert!(
+            handler
+                .order_contexts
+                .get(&VenueOrderId::from("ETH-584830574"))
+                .unwrap()
+                .accepted
+        );
+        assert!(
+            !handler
+                .submitted_order_contexts
+                .contains_key(&client_order_id)
+        );
+    }
+
+    #[tokio::test]
+    async fn active_order_survives_terminal_cache_eviction_pressure() {
+        let mut handler = routing_test_handler();
+        let venue_order_id = VenueOrderId::from("ETH-584830574");
+        let client_order_id = ClientOrderId::from("O-19700101-000000-001-001-1");
+        let instrument_id = InstrumentId::from("BTC-PERPETUAL.DERIBIT");
+        handler.order_contexts.insert(
+            venue_order_id,
+            OrderContext {
+                client_order_id,
+                trader_id: TraderId::from("TRADER-001"),
+                strategy_id: StrategyId::from("S-001"),
+                instrument_id,
+                order_side: OrderSide::Buy,
+                order_type: OrderType::Market,
+                accepted: false,
+                last_order_signature: None,
+            },
+        );
+
+        for seq in 0..=REPLAY_CACHE_CAPACITY {
+            let filler_id = VenueOrderId::from(format!("ETH-FILLER-{seq:05}"));
+            let filler_client_id = ClientOrderId::from(format!("O-FILLER-{seq:05}"));
+            handler.terminal_order_contexts.insert(
+                filler_id,
+                TerminalOrderContext {
+                    context: OrderContext {
+                        client_order_id: filler_client_id,
+                        trader_id: TraderId::from("TRADER-001"),
+                        strategy_id: StrategyId::from("S-001"),
+                        instrument_id,
+                        order_side: OrderSide::Buy,
+                        order_type: OrderType::Market,
+                        accepted: true,
+                        last_order_signature: None,
+                    },
+                    late_fills_as_reports: true,
+                },
+            );
+        }
+
+        handler
+            .process_raw_message(&subscription(
+                "user.orders.any.any.raw",
+                &serde_json::json!([order_data("open", false)]),
+            ))
+            .await;
+
+        assert!(matches!(
+            handler.pending_outgoing.pop_front().unwrap(),
+            NautilusWsMessage::OrderAccepted(event)
+                if event.client_order_id == client_order_id
+        ));
+        assert!(
+            handler
+                .order_contexts
+                .get(&venue_order_id)
+                .unwrap()
+                .accepted
+        );
+    }
+
+    #[tokio::test]
+    async fn submitted_order_cancelled_before_bind_releases_pending_context() {
+        let mut handler = routing_test_handler();
+        let venue_order_id = VenueOrderId::from("ETH-584830574");
+        let client_order_id = ClientOrderId::from("O-19700101-000000-001-001-1");
+        handler.submitted_order_contexts.insert(
+            client_order_id,
+            OrderContext {
+                client_order_id,
+                trader_id: TraderId::from("TRADER-001"),
+                strategy_id: StrategyId::from("S-001"),
+                instrument_id: InstrumentId::from("BTC-PERPETUAL.DERIBIT"),
+                order_side: OrderSide::Buy,
+                order_type: OrderType::Market,
+                accepted: false,
+                last_order_signature: None,
+            },
+        );
+
+        handler
+            .process_raw_message(&subscription(
+                "user.orders.any.any.raw",
+                &serde_json::json!([order_data("cancelled", false)]),
+            ))
+            .await;
+
+        assert!(matches!(
+            handler.pending_outgoing.pop_front().unwrap(),
+            NautilusWsMessage::OrderAccepted(event)
+                if event.client_order_id == client_order_id
+        ));
+        assert!(matches!(
+            handler.pending_outgoing.pop_front().unwrap(),
+            NautilusWsMessage::OrderCanceled(event)
+                if event.client_order_id == client_order_id
+        ));
+        assert!(
+            !handler
+                .submitted_order_contexts
+                .contains_key(&client_order_id)
+        );
+        assert!(
+            handler
+                .terminal_order_contexts
+                .contains_key(&venue_order_id)
+        );
+    }
+
+    #[rstest]
+    #[case("cancelled")]
+    #[case("expired")]
+    #[tokio::test]
+    async fn tracked_terminal_order_synthesizes_accepted_first(#[case] order_state: &str) {
+        let mut handler = routing_test_handler();
+        let venue_order_id = VenueOrderId::from("ETH-584830574");
+        let client_order_id = ClientOrderId::from("O-19700101-000000-001-001-1");
+        handler.order_contexts.insert(
+            venue_order_id,
+            OrderContext {
+                client_order_id,
+                trader_id: TraderId::from("TRADER-001"),
+                strategy_id: StrategyId::from("S-001"),
+                instrument_id: InstrumentId::from("BTC-PERPETUAL.DERIBIT"),
+                order_side: OrderSide::Buy,
+                order_type: OrderType::Market,
+                accepted: false,
+                last_order_signature: None,
+            },
+        );
+
+        handler
+            .process_raw_message(&subscription(
+                "user.orders.any.any.raw",
+                &serde_json::json!([order_data(order_state, false)]),
+            ))
+            .await;
+
+        let accepted = handler.pending_outgoing.pop_front().unwrap();
+        let terminal = handler.pending_outgoing.pop_front().unwrap();
+        assert!(matches!(
+            accepted,
+            NautilusWsMessage::OrderAccepted(event)
+                if event.client_order_id == client_order_id
+        ));
+        assert!(
+            matches!(
+                (order_state, terminal),
+                ("cancelled", NautilusWsMessage::OrderCanceled(_))
+                    | ("expired", NautilusWsMessage::OrderExpired(_))
+            ),
+            "unexpected terminal message for {order_state}",
+        );
+        assert!(handler.pending_outgoing.is_empty());
+        assert!(!handler.order_contexts.contains_key(&venue_order_id));
+    }
+
+    #[rstest]
+    #[case("filled")]
+    #[case("open")]
+    #[tokio::test]
+    async fn late_fill_after_terminal_status_uses_report_recovery(
+        #[case] trade_state: &str,
+        #[values("cancelled", "expired", "rejected")] terminal_state: &str,
+        #[values(None, Some("STALE-CLIENT-ID"))] label: Option<&str>,
+    ) {
+        let mut handler = routing_test_handler();
+        let venue_order_id = VenueOrderId::from("ETH-584830574");
+        let client_order_id = ClientOrderId::from("O-19700101-000000-001-001-1");
+        handler.order_contexts.insert(
+            venue_order_id,
+            OrderContext {
+                client_order_id,
+                trader_id: TraderId::from("TRADER-001"),
+                strategy_id: StrategyId::from("S-001"),
+                instrument_id: InstrumentId::from("BTC-PERPETUAL.DERIBIT"),
+                order_side: OrderSide::Buy,
+                order_type: OrderType::Market,
+                accepted: true,
+                last_order_signature: None,
+            },
+        );
+
+        handler
+            .process_raw_message(&subscription(
+                "user.orders.any.any.raw",
+                &serde_json::json!([order_data(terminal_state, false)]),
+            ))
+            .await;
+        let mut trade = trade_data();
+        trade["state"] = serde_json::Value::String(trade_state.to_string());
+
+        trade["label"] = match label {
+            Some(label) => serde_json::json!(label),
+            None => serde_json::Value::Null,
+        };
+
+        handler
+            .process_raw_message(&subscription(
+                "user.trades.any.any.raw",
+                &serde_json::json!([trade.clone(), trade.clone()]),
+            ))
+            .await;
+
+        match terminal_state {
+            "cancelled" | "expired" => {
+                let terminal = handler.pending_outgoing.pop_front().unwrap();
+                assert!(
+                    matches!(
+                        (terminal_state, terminal),
+                        ("cancelled", NautilusWsMessage::OrderCanceled(_))
+                            | ("expired", NautilusWsMessage::OrderExpired(_))
+                    ),
+                    "unexpected terminal message for {terminal_state}",
+                );
+            }
+            "rejected" => {}
+            _ => unreachable!(),
+        }
+
+        let message = handler.pending_outgoing.pop_front().unwrap();
+
+        let NautilusWsMessage::FillReports(reports) = message else {
+            panic!("expected late fill reports, was {message:?}");
+        };
+
+        assert_eq!(reports.len(), 1);
+        let report = &reports[0];
+        assert_eq!(report.account_id, AccountId::from("DERIBIT-001"));
+        assert_eq!(
+            report.instrument_id,
+            InstrumentId::from("BTC-PERPETUAL.DERIBIT")
+        );
+        assert_eq!(report.venue_order_id, venue_order_id);
+        assert_eq!(report.trade_id, TradeId::from("ETH-2696068"));
+        assert_eq!(report.order_side, OrderSide::Buy);
+        assert_eq!(report.last_qty, Quantity::from(2));
+        assert_eq!(report.last_px, Price::from("203.8"));
+        assert_eq!(report.commission, Money::from("0.00073602 USDT"));
+        assert_eq!(report.liquidity_side, LiquiditySide::Taker);
+        assert_eq!(report.client_order_id, Some(client_order_id));
+        assert_eq!(report.venue_position_id, None);
+        assert_eq!(report.avg_px, None);
+        assert_eq!(report.ts_event, UnixNanos::from(1_590_480_712_800_000_000));
+
+        handler
+            .process_raw_message(&subscription(
+                "user.trades.any.any.raw",
+                &serde_json::json!([trade]),
+            ))
+            .await;
+
+        assert!(handler.pending_outgoing.is_empty());
+        assert!(!handler.order_contexts.contains_key(&venue_order_id));
+        assert!(
+            handler
+                .terminal_order_contexts
+                .get(&venue_order_id)
+                .unwrap()
+                .late_fills_as_reports
+        );
+    }
+
+    #[rstest]
+    #[case("cancelled")]
+    #[case("rejected")]
+    #[tokio::test]
+    async fn late_fill_after_command_response_uses_report_recovery(#[case] terminal_state: &str) {
+        let mut handler = routing_test_handler();
+        let venue_order_id = VenueOrderId::from("ETH-584830574");
+        let client_order_id = ClientOrderId::from("O-19700101-000000-001-001-1");
+        let trader_id = TraderId::from("TRADER-001");
+        let strategy_id = StrategyId::from("S-001");
+        let instrument_id = InstrumentId::from("BTC-PERPETUAL.DERIBIT");
+        handler.order_contexts.insert(
+            venue_order_id,
+            OrderContext {
+                client_order_id,
+                trader_id,
+                strategy_id,
+                instrument_id,
+                order_side: OrderSide::Buy,
+                order_type: OrderType::Market,
+                accepted: true,
+                last_order_signature: None,
+            },
+        );
+
+        let pending = if terminal_state == "cancelled" {
+            PendingRequestType::Cancel {
+                venue_order_id: Some(venue_order_id),
+                causation_id: None,
+                client_order_id,
+                trader_id,
+                strategy_id,
+                instrument_id,
+            }
+        } else {
+            PendingRequestType::Buy {
+                client_order_id,
+                trader_id,
+                strategy_id,
+                instrument_id,
+                order_side: OrderSide::Buy,
+                order_type: OrderType::Market,
+            }
+        };
+
+        handler.pending_requests.insert(42, pending);
+
+        let result = if terminal_state == "cancelled" {
+            order_data(terminal_state, false)
+        } else {
+            serde_json::json!({
+                "order": order_data(terminal_state, false),
+                "trades": []
+            })
+        };
+
+        let response = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 42,
+            "result": result,
+        });
+
+        let terminal = handler.process_raw_message(&response.to_string()).await;
+
+        assert!(
+            matches!(
+                (terminal_state, terminal),
+                ("cancelled", Some(NautilusWsMessage::OrderCanceled(_)))
+                    | ("rejected", Some(NautilusWsMessage::OrderRejected(_)))
+            ),
+            "unexpected terminal response for {terminal_state}",
+        );
+
+        handler
+            .process_raw_message(&subscription(
+                "user.trades.any.any.raw",
+                &serde_json::json!([trade_data()]),
+            ))
+            .await;
+
+        let message = handler.pending_outgoing.pop_front().unwrap();
+
+        let NautilusWsMessage::FillReports(reports) = message else {
+            panic!("expected late fill reports, was {message:?}");
+        };
+
+        assert_eq!(reports.len(), 1);
+        assert_eq!(reports[0].venue_order_id, venue_order_id);
+        assert_eq!(reports[0].client_order_id, Some(client_order_id));
+        assert_eq!(reports[0].trade_id, TradeId::from("ETH-2696068"));
+        assert!(handler.pending_outgoing.is_empty());
+        assert!(!handler.order_contexts.contains_key(&venue_order_id));
+        assert!(
+            handler
+                .terminal_order_contexts
+                .get(&venue_order_id)
+                .unwrap()
+                .late_fills_as_reports
+        );
+    }
+
+    #[rstest]
+    #[case::direct_stream("direct_stream")]
+    #[case::venue_status("venue_status")]
+    #[case::submit_response("submit_response")]
+    #[tokio::test]
+    async fn final_trade_routing_handles_batches_and_split_delivery(#[case] delivery: &str) {
+        let mut handler = routing_test_handler();
+        let venue_order_id = VenueOrderId::from("ETH-584830574");
+        let client_order_id = ClientOrderId::from("O-19700101-000000-001-001-1");
+        handler.order_contexts.insert(
+            venue_order_id,
+            OrderContext {
+                client_order_id,
+                trader_id: TraderId::from("TRADER-001"),
+                strategy_id: StrategyId::from("S-001"),
+                instrument_id: InstrumentId::from("BTC-PERPETUAL.DERIBIT"),
+                order_side: OrderSide::Buy,
+                order_type: OrderType::Market,
+                accepted: true,
+                last_order_signature: None,
+            },
+        );
+
+        let mut first_trade = trade_data();
+        first_trade["amount"] = serde_json::json!(1);
+        let mut second_trade = trade_data();
+        second_trade["trade_id"] = serde_json::json!("ETH-2696069");
+        second_trade["amount"] = serde_json::json!(1);
+        second_trade["price"] = serde_json::json!(204.1);
+        second_trade["fee"] = serde_json::json!(0.00083602);
+
+        match delivery {
+            "direct_stream" => {
+                handler
+                    .process_raw_message(&subscription(
+                        "user.trades.any.any.raw",
+                        &serde_json::json!([first_trade.clone(), second_trade.clone()]),
+                    ))
+                    .await;
+            }
+            "venue_status" => {
+                handler
+                    .process_raw_message(&subscription(
+                        "user.orders.any.any.raw",
+                        &serde_json::json!([order_data("filled", false)]),
+                    ))
+                    .await;
+                assert!(handler.pending_outgoing.is_empty());
+                handler
+                    .process_raw_message(&subscription(
+                        "user.trades.any.any.raw",
+                        &serde_json::json!([first_trade.clone(), second_trade.clone()]),
+                    ))
+                    .await;
+            }
+            "submit_response" => {
+                handler.pending_requests.insert(
+                    42,
+                    PendingRequestType::Buy {
+                        client_order_id,
+                        trader_id: TraderId::from("TRADER-001"),
+                        strategy_id: StrategyId::from("S-001"),
+                        instrument_id: InstrumentId::from("BTC-PERPETUAL.DERIBIT"),
+                        order_side: OrderSide::Buy,
+                        order_type: OrderType::Market,
+                    },
+                );
+
+                let response = serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": 42,
+                    "result": {
+                        "order": order_data("filled", false),
+                        "trades": [first_trade.clone()],
+                    }
+                });
+                handler.process_raw_message(&response.to_string()).await;
+                handler
+                    .process_raw_message(&subscription(
+                        "user.trades.any.any.raw",
+                        &serde_json::json!([second_trade.clone()]),
+                    ))
+                    .await;
+            }
+            _ => unreachable!(),
+        }
+
+        assert!(matches!(
+            handler.pending_outgoing.pop_front().unwrap(),
+            NautilusWsMessage::OrderFilled(event)
+                if event.client_order_id == client_order_id
+                    && event.trade_id == TradeId::from("ETH-2696068")
+                    && event.last_qty == Quantity::from(1)
+                    && event.last_px == Price::from("203.8")
+                    && event.commission == Some(Money::from("0.00073602 USDT"))
+        ));
+        let second_message = handler.pending_outgoing.pop_front().unwrap();
+
+        match delivery {
+            "direct_stream" | "venue_status" => {
+                assert!(matches!(
+                    second_message,
+                    NautilusWsMessage::OrderFilled(event)
+                        if event.client_order_id == client_order_id
+                            && event.trade_id == TradeId::from("ETH-2696069")
+                            && event.last_qty == Quantity::from(1)
+                            && event.last_px == Price::from("204.1")
+                            && event.commission == Some(Money::from("0.00083602 USDT"))
+                ));
+            }
+            "submit_response" => {
+                let NautilusWsMessage::FillReports(reports) = second_message else {
+                    panic!("expected split-delivery fill report, was {second_message:?}");
+                };
+
+                assert_eq!(reports.len(), 1);
+                assert_eq!(reports[0].client_order_id, Some(client_order_id));
+                assert_eq!(reports[0].trade_id, TradeId::from("ETH-2696069"));
+                assert_eq!(reports[0].last_qty, Quantity::from(1));
+                assert_eq!(reports[0].last_px, Price::from("204.1"));
+                assert_eq!(reports[0].commission, Money::from("0.00083602 USDT"));
+            }
+            _ => unreachable!(),
+        }
+
+        assert!(handler.pending_outgoing.is_empty());
+        assert!(!handler.order_contexts.contains_key(&venue_order_id));
+        assert!(
+            handler
+                .terminal_order_contexts
+                .get(&venue_order_id)
+                .unwrap()
+                .late_fills_as_reports
+        );
+
+        let mut late_trade = trade_data();
+        late_trade["trade_id"] = serde_json::json!("ETH-2696070");
+        handler
+            .process_raw_message(&subscription(
+                "user.trades.any.any.raw",
+                &serde_json::json!([first_trade, late_trade]),
+            ))
+            .await;
+
+        let message = handler.pending_outgoing.pop_front().unwrap();
+
+        let NautilusWsMessage::FillReports(reports) = message else {
+            panic!("expected post-terminal fill reports, was {message:?}");
+        };
+
+        assert_eq!(reports.len(), 1);
+        assert_eq!(reports[0].client_order_id, Some(client_order_id));
+        assert_eq!(reports[0].trade_id, TradeId::from("ETH-2696070"));
+        assert!(handler.pending_outgoing.is_empty());
+    }
+
+    #[rstest]
+    #[tokio::test]
+    async fn venue_filled_status_before_trade_keeps_first_fill_typed() {
+        let mut handler = routing_test_handler();
+        let venue_order_id = VenueOrderId::from("ETH-584830574");
+        let client_order_id = ClientOrderId::from("O-19700101-000000-001-001-1");
+        handler.order_contexts.insert(
+            venue_order_id,
+            OrderContext {
+                client_order_id,
+                trader_id: TraderId::from("TRADER-001"),
+                strategy_id: StrategyId::from("S-001"),
+                instrument_id: InstrumentId::from("BTC-PERPETUAL.DERIBIT"),
+                order_side: OrderSide::Buy,
+                order_type: OrderType::Market,
+                accepted: true,
+                last_order_signature: None,
+            },
+        );
+
+        handler
+            .process_raw_message(&subscription(
+                "user.orders.any.any.raw",
+                &serde_json::json!([order_data("filled", false)]),
+            ))
+            .await;
+
+        assert!(handler.pending_outgoing.is_empty());
+        assert!(
+            !handler
+                .terminal_order_contexts
+                .get(&venue_order_id)
+                .unwrap()
+                .late_fills_as_reports
+        );
+
+        handler
+            .process_raw_message(&subscription(
+                "user.trades.any.any.raw",
+                &serde_json::json!([trade_data()]),
+            ))
+            .await;
+
+        assert!(matches!(
+            handler.pending_outgoing.pop_front().unwrap(),
+            NautilusWsMessage::OrderFilled(event)
+                if event.client_order_id == client_order_id
+                    && event.trade_id == TradeId::from("ETH-2696068")
+        ));
+        assert!(handler.pending_outgoing.is_empty());
+        assert!(!handler.order_contexts.contains_key(&venue_order_id));
+        assert!(
+            handler
+                .terminal_order_contexts
+                .get(&venue_order_id)
+                .unwrap()
+                .late_fills_as_reports
+        );
+    }
+
+    #[rstest]
+    #[tokio::test]
+    async fn mixed_late_report_and_tracked_fill_preserve_trade_order() {
+        let mut handler = routing_test_handler();
+        let terminal_venue_order_id = VenueOrderId::from("ETH-584830574");
+        let terminal_client_order_id = ClientOrderId::from("O-19700101-000000-001-001-1");
+        handler.order_contexts.insert(
+            terminal_venue_order_id,
+            OrderContext {
+                client_order_id: terminal_client_order_id,
+                trader_id: TraderId::from("TRADER-001"),
+                strategy_id: StrategyId::from("S-001"),
+                instrument_id: InstrumentId::from("BTC-PERPETUAL.DERIBIT"),
+                order_side: OrderSide::Buy,
+                order_type: OrderType::Market,
+                accepted: true,
+                last_order_signature: None,
+            },
+        );
+
+        handler
+            .process_raw_message(&subscription(
+                "user.orders.any.any.raw",
+                &serde_json::json!([order_data("cancelled", false)]),
+            ))
+            .await;
+        assert!(matches!(
+            handler.pending_outgoing.pop_front().unwrap(),
+            NautilusWsMessage::OrderCanceled(_)
+        ));
+
+        let active_venue_order_id = VenueOrderId::from("ETH-584830575");
+        let active_client_order_id = ClientOrderId::from("O-19700101-000000-001-001-2");
+        handler.order_contexts.insert(
+            active_venue_order_id,
+            OrderContext {
+                client_order_id: active_client_order_id,
+                trader_id: TraderId::from("TRADER-001"),
+                strategy_id: StrategyId::from("S-001"),
+                instrument_id: InstrumentId::from("BTC-PERPETUAL.DERIBIT"),
+                order_side: OrderSide::Buy,
+                order_type: OrderType::Market,
+                accepted: true,
+                last_order_signature: None,
+            },
+        );
+
+        let mut late_trade = trade_data();
+        late_trade["state"] = serde_json::json!("open");
+        let mut active_trade = trade_data();
+        active_trade["order_id"] = serde_json::json!(active_venue_order_id.to_string());
+        active_trade["trade_id"] = serde_json::json!("ETH-2696069");
+        active_trade["label"] = serde_json::json!(active_client_order_id.to_string());
+
+        handler
+            .process_raw_message(&subscription(
+                "user.trades.any.any.raw",
+                &serde_json::json!([late_trade, active_trade]),
+            ))
+            .await;
+
+        let late_message = handler.pending_outgoing.pop_front().unwrap();
+
+        let NautilusWsMessage::FillReports(reports) = late_message else {
+            panic!("expected late report first, was {late_message:?}");
+        };
+
+        assert_eq!(reports.len(), 1);
+        assert_eq!(reports[0].venue_order_id, terminal_venue_order_id);
+        assert_eq!(reports[0].client_order_id, Some(terminal_client_order_id));
+        assert!(matches!(
+            handler.pending_outgoing.pop_front().unwrap(),
+            NautilusWsMessage::OrderFilled(event)
+                if event.venue_order_id == active_venue_order_id
+                    && event.client_order_id == active_client_order_id
+                    && event.trade_id == TradeId::from("ETH-2696069")
+        ));
+        assert!(handler.pending_outgoing.is_empty());
+    }
+
+    #[rstest]
+    #[case::filled_terminal_first("filled", true)]
+    #[case::cancelled_terminal_first("cancelled", true)]
+    #[case::filled_response_first("filled", false)]
+    #[case::cancelled_response_first("cancelled", false)]
+    #[tokio::test]
+    async fn delayed_open_submit_response_preserves_terminal_context(
+        #[case] terminal_state: &str,
+        #[case] terminal_first: bool,
+    ) {
+        let mut handler = routing_test_handler();
+        let venue_order_id = VenueOrderId::from("ETH-584830574");
+        let client_order_id = ClientOrderId::from("O-19700101-000000-001-001-1");
+        handler.order_contexts.insert(
+            venue_order_id,
+            OrderContext {
+                client_order_id,
+                trader_id: TraderId::from("TRADER-001"),
+                strategy_id: StrategyId::from("S-001"),
+                instrument_id: InstrumentId::from("BTC-PERPETUAL.DERIBIT"),
+                order_side: OrderSide::Buy,
+                order_type: OrderType::Market,
+                accepted: false,
+                last_order_signature: None,
+            },
+        );
+
+        handler.pending_requests.insert(
+            42,
+            PendingRequestType::Buy {
+                client_order_id,
+                trader_id: TraderId::from("TRADER-001"),
+                strategy_id: StrategyId::from("S-001"),
+                instrument_id: InstrumentId::from("BTC-PERPETUAL.DERIBIT"),
+                order_side: OrderSide::Buy,
+                order_type: OrderType::Market,
+            },
+        );
+
+        let response = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 42,
+            "result": { "order": order_data("open", false), "trades": [] }
+        })
+        .to_string();
+
+        let terminal_update = if terminal_state == "filled" {
+            subscription(
+                "user.trades.any.any.raw",
+                &serde_json::json!([trade_data()]),
+            )
+        } else {
+            subscription(
+                "user.orders.any.any.raw",
+                &serde_json::json!([order_data("cancelled", false)]),
+            )
+        };
+
+        let mut new_trade = trade_data();
+        new_trade["trade_id"] = serde_json::json!("ETH-2696069");
+        let new_trade_update =
+            subscription("user.trades.any.any.raw", &serde_json::json!([new_trade]));
+        let mut events = Vec::new();
+
+        if terminal_first {
+            handler.process_raw_message(&terminal_update).await;
+            events.extend(handler.pending_outgoing.drain(..));
+            assert!(
+                handler
+                    .terminal_order_contexts
+                    .contains_key(&venue_order_id)
+            );
+
+            let result = handler.process_raw_message(&response).await;
+
+            assert!(result.is_none());
+            events.extend(handler.pending_outgoing.drain(..));
+            assert!(!handler.order_contexts.contains_key(&venue_order_id));
+            assert!(
+                handler
+                    .terminal_order_contexts
+                    .contains_key(&venue_order_id)
+            );
+
+            // Replayed terminal evidence stays suppressed
+            handler.process_raw_message(&terminal_update).await;
+            events.extend(handler.pending_outgoing.drain(..));
+
+            // New trade evidence uses terminal report recovery
+            handler.process_raw_message(&new_trade_update).await;
+            events.extend(handler.pending_outgoing.drain(..));
+        } else {
+            let result = handler.process_raw_message(&response).await;
+            events.extend(result);
+            events.extend(handler.pending_outgoing.drain(..));
+            handler.process_raw_message(&terminal_update).await;
+            events.extend(handler.pending_outgoing.drain(..));
+        }
+
+        assert!(!handler.order_contexts.contains_key(&venue_order_id));
+        assert!(
+            handler
+                .terminal_order_contexts
+                .get(&venue_order_id)
+                .unwrap()
+                .context
+                .accepted
+        );
+
+        let kinds: Vec<&str> = events
+            .iter()
+            .map(|event| match event {
+                NautilusWsMessage::OrderAccepted(_) => "accepted",
+                NautilusWsMessage::OrderFilled(_) => "filled",
+                NautilusWsMessage::FillReports(_) => "fill_report",
+                NautilusWsMessage::OrderCanceled(_) => "canceled",
+                other => panic!("unexpected message: {other:?}"),
+            })
+            .collect();
+
+        let expected: &[&str] = match (terminal_state, terminal_first) {
+            ("filled", true) => &["accepted", "filled", "fill_report"],
+            ("cancelled", true) => &["accepted", "canceled", "fill_report"],
+            ("filled", false) => &["accepted", "filled"],
+            ("cancelled", false) => &["accepted", "canceled"],
+            _ => unreachable!(),
+        };
+
+        assert_eq!(kinds, expected);
+
+        if terminal_first {
+            assert!(matches!(
+                events.last(),
+                Some(NautilusWsMessage::FillReports(reports))
+                    if reports.len() == 1
+                        && reports[0].trade_id == TradeId::from("ETH-2696069")
+                        && reports[0].client_order_id == Some(client_order_id)
+            ));
+        }
+    }
+
+    #[rstest]
+    #[tokio::test]
+    async fn delayed_open_submit_response_after_fast_fill_keeps_terminal() {
+        let mut handler = routing_test_handler();
+        let venue_order_id = VenueOrderId::from("ETH-584830574");
+        let client_order_id = ClientOrderId::from("O-19700101-000000-001-001-1");
+
+        let context = OrderContext {
+            client_order_id,
+            trader_id: TraderId::from("TRADER-001"),
+            strategy_id: StrategyId::from("S-001"),
+            instrument_id: InstrumentId::from("BTC-PERPETUAL.DERIBIT"),
+            order_side: OrderSide::Buy,
+            order_type: OrderType::Market,
+            accepted: false,
+            last_order_signature: None,
+        };
+
+        handler
+            .submitted_order_contexts
+            .insert(client_order_id, context.clone());
+        handler.pending_requests.insert(
+            42,
+            PendingRequestType::Buy {
+                client_order_id,
+                trader_id: context.trader_id,
+                strategy_id: context.strategy_id,
+                instrument_id: context.instrument_id,
+                order_side: context.order_side,
+                order_type: context.order_type,
+            },
+        );
+
+        let filled_response = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 42,
+            "result": { "order": order_data("filled", false), "trades": [] }
+        });
+        handler
+            .process_raw_message(&filled_response.to_string())
+            .await;
+        assert!(
+            !handler
+                .terminal_order_contexts
+                .get(&venue_order_id)
+                .unwrap()
+                .context
+                .accepted
+        );
+
+        // The delayed open acknowledgement arrives after the fast fill terminalized the order
+        handler.pending_requests.insert(
+            43,
+            PendingRequestType::Buy {
+                client_order_id,
+                trader_id: context.trader_id,
+                strategy_id: context.strategy_id,
+                instrument_id: context.instrument_id,
+                order_side: context.order_side,
+                order_type: context.order_type,
+            },
+        );
+
+        let open_response = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 43,
+            "result": { "order": order_data("open", false), "trades": [] }
+        });
+
+        let result = handler
+            .process_raw_message(&open_response.to_string())
+            .await;
+
+        assert!(result.is_none());
+        assert!(handler.pending_outgoing.is_empty());
+        assert!(!handler.order_contexts.contains_key(&venue_order_id));
+        assert!(
+            !handler
+                .terminal_order_contexts
+                .get(&venue_order_id)
+                .unwrap()
+                .context
+                .accepted
+        );
+
+        // Fast-fill acceptance ordering is preserved when the trade arrives
+        handler
+            .process_raw_message(&subscription(
+                "user.trades.any.any.raw",
+                &serde_json::json!([trade_data()]),
+            ))
+            .await;
+
+        assert!(matches!(
+            handler.pending_outgoing.pop_front().unwrap(),
+            NautilusWsMessage::OrderAccepted(event)
+                if event.client_order_id == client_order_id
+        ));
+        assert!(matches!(
+            handler.pending_outgoing.pop_front().unwrap(),
+            NautilusWsMessage::OrderFilled(event)
+                if event.client_order_id == client_order_id
+                    && event.trade_id == TradeId::from("ETH-2696068")
+        ));
+        assert!(handler.pending_outgoing.is_empty());
+        assert!(!handler.order_contexts.contains_key(&venue_order_id));
+        assert!(
+            handler
+                .terminal_order_contexts
+                .get(&venue_order_id)
+                .unwrap()
+                .context
+                .accepted
+        );
+    }
+
+    #[rstest]
+    #[tokio::test]
+    async fn tracked_order_uses_stored_client_id_when_label_changes() {
+        let mut handler = routing_test_handler();
+        let venue_order_id = VenueOrderId::from("ETH-584830574");
+        let client_order_id = ClientOrderId::from("ORIGINAL-CLIENT-ID");
+        handler.order_contexts.insert(
+            venue_order_id,
+            OrderContext {
+                client_order_id,
+                trader_id: TraderId::from("TRADER-001"),
+                strategy_id: StrategyId::from("S-001"),
+                instrument_id: InstrumentId::from("BTC-PERPETUAL.DERIBIT"),
+                order_side: OrderSide::Buy,
+                order_type: OrderType::Market,
+                accepted: false,
+                last_order_signature: None,
+            },
+        );
+        let mut order = order_data("open", false);
+        order["label"] = serde_json::Value::Null;
+
+        handler
+            .process_raw_message(&subscription(
+                "user.orders.any.any.raw",
+                &serde_json::json!([order]),
+            ))
+            .await;
+
+        assert!(matches!(
+            handler.pending_outgoing.pop_front().unwrap(),
+            NautilusWsMessage::OrderAccepted(event)
+                if event.client_order_id == client_order_id
+        ));
+        assert!(handler.pending_outgoing.is_empty());
+    }
+
+    #[rstest]
+    #[tokio::test]
+    async fn subscription_accept_before_submit_response_is_not_duplicated() {
+        let mut handler = routing_test_handler();
+        let client_order_id = ClientOrderId::from("O-19700101-000000-001-001-1");
+        handler.submitted_order_contexts.insert(
+            client_order_id,
+            OrderContext {
+                client_order_id,
+                trader_id: TraderId::from("TRADER-001"),
+                strategy_id: StrategyId::from("S-001"),
+                instrument_id: InstrumentId::from("BTC-PERPETUAL.DERIBIT"),
+                order_side: OrderSide::Buy,
+                order_type: OrderType::Market,
+                accepted: false,
+                last_order_signature: None,
+            },
+        );
+        handler.pending_requests.insert(
+            42,
+            PendingRequestType::Buy {
+                client_order_id,
+                trader_id: TraderId::from("TRADER-001"),
+                strategy_id: StrategyId::from("S-001"),
+                instrument_id: InstrumentId::from("BTC-PERPETUAL.DERIBIT"),
+                order_side: OrderSide::Buy,
+                order_type: OrderType::Market,
+            },
+        );
+
+        handler
+            .process_raw_message(&subscription(
+                "user.orders.any.any.raw",
+                &serde_json::json!([order_data("open", false)]),
+            ))
+            .await;
+        let accepted = handler.pending_outgoing.pop_front().unwrap();
+        let response = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 42,
+            "result": { "order": order_data("open", false), "trades": [] }
+        });
+        let duplicate = handler.process_raw_message(&response.to_string()).await;
+        handler.clear_state();
+        handler
+            .process_raw_message(&subscription(
+                "user.orders.any.any.raw",
+                &serde_json::json!([order_data("open", false)]),
+            ))
+            .await;
+
+        assert!(matches!(accepted, NautilusWsMessage::OrderAccepted(_)));
+        assert!(duplicate.is_none());
+        assert!(handler.pending_outgoing.is_empty());
+        assert!(
+            handler
+                .order_contexts
+                .get(&VenueOrderId::from("ETH-584830574"))
+                .unwrap()
+                .accepted
+        );
+    }
+
+    #[rstest]
+    #[tokio::test]
+    async fn untracked_live_order_and_fill_use_report_paths() {
+        let mut handler = routing_test_handler();
+
+        handler
+            .process_raw_message(&subscription(
+                "user.orders.any.any.raw",
+                &serde_json::json!([order_data("open", false)]),
+            ))
+            .await;
+        handler
+            .process_raw_message(&subscription(
+                "user.trades.any.any.raw",
+                &serde_json::json!([trade_data()]),
+            ))
+            .await;
+
+        assert!(matches!(
+            handler.pending_outgoing.pop_front().unwrap(),
+            NautilusWsMessage::OrderStatusReports(reports) if reports.len() == 1
+        ));
+        assert!(matches!(
+            handler.pending_outgoing.pop_front().unwrap(),
+            NautilusWsMessage::FillReports(reports) if reports.len() == 1
+        ));
+        assert!(handler.pending_outgoing.is_empty());
+    }
+
+    #[rstest]
+    #[case::modify(false)]
+    #[case::cancel(true)]
+    #[tokio::test]
+    async fn command_failure_preserves_causation_and_venue_identity(
+        #[case] cancel: bool,
+        #[values(false, true)] not_sent: bool,
+    ) {
+        let mut handler = routing_test_handler();
+        handler.clock = Box::leak(Box::new(AtomicTime::new(false, UnixNanos::from(17))));
+        let client_order_id = ClientOrderId::from("O-COMMAND-FAILURE");
+        let trader_id = TraderId::from("TRADER-001");
+        let strategy_id = StrategyId::from("S-001");
+        let instrument_id = InstrumentId::from("BTC-PERPETUAL.DERIBIT");
+        let venue_order_id = VenueOrderId::from("ETH-584830574");
+        let causation_id = UUID4::new();
+
+        let message = if not_sent {
+            let command = if cancel {
+                HandlerCommand::Cancel {
+                    causation_id: Some(causation_id),
+                    params: DeribitCancelParams {
+                        order_id: venue_order_id.to_string(),
+                    },
+                    client_order_id,
+                    trader_id,
+                    strategy_id,
+                    instrument_id,
+                }
+            } else {
+                HandlerCommand::Edit {
+                    causation_id: Some(causation_id),
+                    params: DeribitEditParams {
+                        order_id: venue_order_id.to_string(),
+                        amount: Decimal::from(2),
+                        price: Some(Decimal::from(205)),
+                        post_only: None,
+                        reject_post_only: None,
+                        reduce_only: None,
+                        trigger_price: None,
+                    },
+                    client_order_id,
+                    trader_id,
+                    strategy_id,
+                    instrument_id,
+                }
+            };
+
+            handler.process_command(command).await;
+            handler
+                .pending_outgoing
+                .pop_front()
+                .expect("pre-send failure publishes a denial")
+        } else {
+            let pending = if cancel {
+                PendingRequestType::Cancel {
+                    venue_order_id: Some(venue_order_id),
+                    causation_id: Some(causation_id),
+                    client_order_id,
+                    trader_id,
+                    strategy_id,
+                    instrument_id,
+                }
+            } else {
+                PendingRequestType::Edit {
+                    venue_order_id: Some(venue_order_id),
+                    causation_id: Some(causation_id),
+                    client_order_id,
+                    trader_id,
+                    strategy_id,
+                    instrument_id,
+                }
+            };
+
+            handler.pending_requests.insert(1, pending);
+            let response = serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "error": {"code": 10004, "message": "order_not_found", "data": null}
+            });
+            handler
+                .process_raw_message(&response.to_string())
+                .await
+                .expect("venue refusal produces a rejection")
+        };
+
+        let (event, cause, reason, ts_init) = match message {
+            NautilusWsMessage::OrderModifyDenied(event) if not_sent && !cancel => (
+                OrderEventAny::ModifyDenied(event),
+                event.causation_id,
+                event.reason,
+                event.ts_init,
+            ),
+            NautilusWsMessage::OrderCancelDenied(event) if not_sent && cancel => (
+                OrderEventAny::CancelDenied(event),
+                event.causation_id,
+                event.reason,
+                event.ts_init,
+            ),
+            NautilusWsMessage::OrderModifyRejected(event) if !not_sent && !cancel => (
+                OrderEventAny::ModifyRejected(event),
+                event.causation_id,
+                event.reason,
+                event.ts_init,
+            ),
+            NautilusWsMessage::OrderCancelRejected(event) if !not_sent && cancel => (
+                OrderEventAny::CancelRejected(event),
+                event.causation_id,
+                event.reason,
+                event.ts_init,
+            ),
+            other => panic!("unexpected command outcome {other:?}"),
+        };
+
+        assert_eq!(event.trader_id(), trader_id);
+        assert_eq!(event.strategy_id(), strategy_id);
+        assert_eq!(event.instrument_id(), instrument_id);
+        assert_eq!(event.client_order_id(), client_order_id);
+        assert_eq!(event.venue_order_id(), Some(venue_order_id));
+        assert_eq!(event.account_id(), Some(AccountId::from("DERIBIT-001")));
+        assert_eq!(event.ts_event(), UnixNanos::from(17));
+        assert_eq!(ts_init, UnixNanos::from(17));
+        assert_eq!(cause, Some(causation_id));
+        assert_eq!(
+            reason.as_str(),
+            if not_sent {
+                "not connected"
+            } else {
+                "order_not_found"
+            }
+        );
+        assert!(handler.pending_requests.is_empty());
+        assert!(handler.pending_outgoing.is_empty());
+    }
+
+    #[rstest]
+    #[case::modify(false)]
+    #[case::cancel(true)]
+    #[tokio::test]
+    async fn ambiguous_venue_code_emits_no_command_event(#[case] cancel: bool) {
+        let mut handler = routing_test_handler();
+        let client_order_id = ClientOrderId::from("O-AMBIGUOUS");
+
+        let pending = if cancel {
+            PendingRequestType::Cancel {
+                venue_order_id: Some(VenueOrderId::from("ETH-584830574")),
+                causation_id: Some(UUID4::new()),
+                client_order_id,
+                trader_id: TraderId::from("TRADER-001"),
+                strategy_id: StrategyId::from("S-001"),
+                instrument_id: InstrumentId::from("BTC-PERPETUAL.DERIBIT"),
+            }
+        } else {
+            PendingRequestType::Edit {
+                venue_order_id: Some(VenueOrderId::from("ETH-584830574")),
+                causation_id: Some(UUID4::new()),
+                client_order_id,
+                trader_id: TraderId::from("TRADER-001"),
+                strategy_id: StrategyId::from("S-001"),
+                instrument_id: InstrumentId::from("BTC-PERPETUAL.DERIBIT"),
+            }
+        };
+
+        handler.pending_requests.insert(1, pending);
+        let message = handler
+            .process_raw_message(&load_test_json("ws_error.json"))
+            .await;
+
+        assert!(message.is_none());
+        assert!(handler.pending_requests.is_empty());
+        assert!(handler.pending_outgoing.is_empty());
+    }
+
+    #[rstest]
+    #[tokio::test]
+    async fn edit_response_without_tracked_context_uses_report_path() {
+        let mut handler = routing_test_handler();
+        handler.pending_requests.insert(
+            42,
+            PendingRequestType::Edit {
+                venue_order_id: None,
+                causation_id: None,
+                client_order_id: ClientOrderId::from("UNKNOWN-CLIENT-ID"),
+                trader_id: TraderId::from("TRADER-001"),
+                strategy_id: StrategyId::from("S-001"),
+                instrument_id: InstrumentId::from("BTC-PERPETUAL.DERIBIT"),
+            },
+        );
+        let response = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 42,
+            "result": { "order": order_data("open", true), "trades": [trade_data()] }
+        });
+
+        let message = handler.process_raw_message(&response.to_string()).await;
+        let fill = handler.pending_outgoing.pop_front().unwrap();
+
+        assert!(matches!(
+            message,
+            Some(NautilusWsMessage::OrderStatusReports(reports)) if reports.len() == 1
+        ));
+        assert!(matches!(
+            fill,
+            NautilusWsMessage::FillReports(reports) if reports.len() == 1
+        ));
+        assert!(handler.order_contexts.is_empty());
+        assert!(handler.pending_outgoing.is_empty());
+    }
+
+    #[rstest]
+    #[tokio::test]
+    async fn tracked_edit_response_routes_fill_and_deduplicates_subscription_echo() {
+        let mut handler = routing_test_handler();
+        let venue_order_id = VenueOrderId::from("ETH-584830574");
+        let client_order_id = ClientOrderId::from("O-19700101-000000-001-001-1");
+        handler.order_contexts.insert(
+            venue_order_id,
+            OrderContext {
+                client_order_id,
+                trader_id: TraderId::from("TRADER-001"),
+                strategy_id: StrategyId::from("S-001"),
+                instrument_id: InstrumentId::from("BTC-PERPETUAL.DERIBIT"),
+                order_side: OrderSide::Buy,
+                order_type: OrderType::Market,
+                accepted: true,
+                last_order_signature: None,
+            },
+        );
+        handler.pending_requests.insert(
+            42,
+            PendingRequestType::Edit {
+                venue_order_id: None,
+                causation_id: None,
+                client_order_id,
+                trader_id: TraderId::from("TRADER-001"),
+                strategy_id: StrategyId::from("S-001"),
+                instrument_id: InstrumentId::from("BTC-PERPETUAL.DERIBIT"),
+            },
+        );
+        let response = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 42,
+            "result": { "order": order_data("open", true), "trades": [trade_data()] }
+        });
+
+        let updated = handler.process_raw_message(&response.to_string()).await;
+        let filled = handler.pending_outgoing.pop_front().unwrap();
+        handler
+            .process_raw_message(&subscription(
+                "user.orders.any.any.raw",
+                &serde_json::json!([order_data("open", true)]),
+            ))
+            .await;
+
+        assert!(matches!(
+            updated,
+            Some(NautilusWsMessage::OrderUpdated(event))
+                if event.client_order_id == client_order_id
+        ));
+        assert!(matches!(
+            filled,
+            NautilusWsMessage::OrderFilled(event)
+                if event.client_order_id == client_order_id
+        ));
+        assert!(handler.pending_outgoing.is_empty());
+        assert!(!handler.order_contexts.contains_key(&venue_order_id));
+        assert!(
+            handler
+                .terminal_order_contexts
+                .get(&venue_order_id)
+                .unwrap()
+                .context
+                .last_order_signature
+                .is_some(),
+        );
+    }
+
+    #[rstest]
+    #[tokio::test]
+    async fn subscription_edit_echo_before_response_is_not_duplicated() {
+        let mut handler = routing_test_handler();
+        let venue_order_id = VenueOrderId::from("ETH-584830574");
+        let client_order_id = ClientOrderId::from("O-19700101-000000-001-001-1");
+        handler.order_contexts.insert(
+            venue_order_id,
+            OrderContext {
+                client_order_id,
+                trader_id: TraderId::from("TRADER-001"),
+                strategy_id: StrategyId::from("S-001"),
+                instrument_id: InstrumentId::from("BTC-PERPETUAL.DERIBIT"),
+                order_side: OrderSide::Buy,
+                order_type: OrderType::Market,
+                accepted: true,
+                last_order_signature: None,
+            },
+        );
+        handler.pending_requests.insert(
+            42,
+            PendingRequestType::Edit {
+                venue_order_id: None,
+                causation_id: None,
+                client_order_id,
+                trader_id: TraderId::from("TRADER-001"),
+                strategy_id: StrategyId::from("S-001"),
+                instrument_id: InstrumentId::from("BTC-PERPETUAL.DERIBIT"),
+            },
+        );
+        handler
+            .process_raw_message(&subscription(
+                "user.orders.any.any.raw",
+                &serde_json::json!([order_data("open", true)]),
+            ))
+            .await;
+        let updated = handler.pending_outgoing.pop_front().unwrap();
+        let response = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 42,
+            "result": { "order": order_data("open", true), "trades": [trade_data()] }
+        });
+
+        let duplicate = handler.process_raw_message(&response.to_string()).await;
+        let filled = handler.pending_outgoing.pop_front().unwrap();
+
+        assert!(matches!(
+            updated,
+            NautilusWsMessage::OrderUpdated(event)
+                if event.client_order_id == client_order_id
+        ));
+        assert!(duplicate.is_none());
+        assert!(matches!(
+            filled,
+            NautilusWsMessage::OrderFilled(event)
+                if event.client_order_id == client_order_id
+        ));
+        assert!(handler.pending_outgoing.is_empty());
+    }
+
+    #[rstest]
+    #[case::new_trade(true)]
+    #[case::repeated_trade(false)]
+    #[tokio::test]
+    async fn delayed_edit_response_keeps_partial_fill_terminal(#[case] new_trade: bool) {
+        let mut handler = routing_test_handler();
+        let venue_order_id = VenueOrderId::from("ETH-584830574");
+        let client_order_id = ClientOrderId::from("O-19700101-000000-001-001-1");
+        handler.order_contexts.insert(
+            venue_order_id,
+            OrderContext {
+                client_order_id,
+                trader_id: TraderId::from("TRADER-001"),
+                strategy_id: StrategyId::from("S-001"),
+                instrument_id: InstrumentId::from("BTC-PERPETUAL.DERIBIT"),
+                order_side: OrderSide::Buy,
+                order_type: OrderType::Market,
+                accepted: true,
+                last_order_signature: None,
+            },
+        );
+        handler
+            .process_raw_message(&subscription(
+                "user.trades.any.any.raw",
+                &serde_json::json!([trade_data()]),
+            ))
+            .await;
+        handler.pending_outgoing.clear();
+        handler.pending_requests.insert(
+            42,
+            PendingRequestType::Edit {
+                venue_order_id: None,
+                causation_id: None,
+                client_order_id,
+                trader_id: TraderId::from("TRADER-001"),
+                strategy_id: StrategyId::from("S-001"),
+                instrument_id: InstrumentId::from("BTC-PERPETUAL.DERIBIT"),
+            },
+        );
+        let mut partial_trade = trade_data();
+        partial_trade["state"] = serde_json::Value::String("open".to_string());
+        if new_trade {
+            partial_trade["trade_id"] = serde_json::json!("ETH-2696069");
+        }
+
+        let response = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 42,
+            "result": { "order": order_data("open", true), "trades": [partial_trade] }
+        });
+
+        let updated = handler.process_raw_message(&response.to_string()).await;
+        let filled = handler.pending_outgoing.pop_front();
+
+        assert!(updated.is_none());
+
+        match filled {
+            Some(NautilusWsMessage::FillReports(reports)) => {
+                assert!(new_trade);
+                assert_eq!(reports.len(), 1);
+                assert_eq!(reports[0].client_order_id, Some(client_order_id));
+                assert_eq!(reports[0].trade_id, TradeId::from("ETH-2696069"));
+            }
+            None => assert!(!new_trade),
+            message => panic!("unexpected fill message: {message:?}"),
+        }
+
+        assert!(!handler.order_contexts.contains_key(&venue_order_id));
+        assert!(
+            handler
+                .terminal_order_contexts
+                .contains_key(&venue_order_id)
+        );
+        assert!(handler.pending_outgoing.is_empty());
+    }
+
+    #[rstest]
+    #[tokio::test]
+    async fn tracked_replaced_order_emits_updated_event() {
+        let mut handler = routing_test_handler();
+        let venue_order_id = VenueOrderId::from("ETH-584830574");
+        let client_order_id = ClientOrderId::from("O-19700101-000000-001-001-1");
+        handler.order_contexts.insert(
+            venue_order_id,
+            OrderContext {
+                client_order_id,
+                trader_id: TraderId::from("TRADER-001"),
+                strategy_id: StrategyId::from("S-001"),
+                instrument_id: InstrumentId::from("BTC-PERPETUAL.DERIBIT"),
+                order_side: OrderSide::Buy,
+                order_type: OrderType::Market,
+                accepted: true,
+                last_order_signature: None,
+            },
+        );
+
+        handler
+            .process_raw_message(&subscription(
+                "user.orders.any.any.raw",
+                &serde_json::json!([order_data("open", true)]),
+            ))
+            .await;
+
+        assert!(matches!(
+            handler.pending_outgoing.pop_front().unwrap(),
+            NautilusWsMessage::OrderUpdated(event)
+                if event.client_order_id == client_order_id
+        ));
+
+        let mut partial_fill = order_data("open", true);
+        partial_fill["filled_amount"] = serde_json::json!(1.0);
+        partial_fill["last_update_timestamp"] = serde_json::json!(1_590_480_712_900_u64);
+        handler
+            .process_raw_message(&subscription(
+                "user.orders.any.any.raw",
+                &serde_json::json!([partial_fill]),
+            ))
+            .await;
+
+        assert!(handler.pending_outgoing.is_empty());
+    }
+
+    #[rstest]
+    #[tokio::test]
+    async fn unaccepted_amendment_synthesizes_accepted_first() {
+        let mut handler = routing_test_handler();
+        let venue_order_id = VenueOrderId::from("ETH-584830574");
+        let client_order_id = ClientOrderId::from("O-19700101-000000-001-001-1");
+        handler.order_contexts.insert(
+            venue_order_id,
+            OrderContext {
+                client_order_id,
+                trader_id: TraderId::from("TRADER-001"),
+                strategy_id: StrategyId::from("S-001"),
+                instrument_id: InstrumentId::from("BTC-PERPETUAL.DERIBIT"),
+                order_side: OrderSide::Buy,
+                order_type: OrderType::Market,
+                accepted: false,
+                last_order_signature: None,
+            },
+        );
+
+        handler
+            .process_raw_message(&subscription(
+                "user.orders.any.any.raw",
+                &serde_json::json!([order_data("open", true)]),
+            ))
+            .await;
+
+        assert!(matches!(
+            handler.pending_outgoing.pop_front().unwrap(),
+            NautilusWsMessage::OrderAccepted(event)
+                if event.client_order_id == client_order_id
+        ));
+        assert!(matches!(
+            handler.pending_outgoing.pop_front().unwrap(),
+            NautilusWsMessage::OrderUpdated(event)
+                if event.client_order_id == client_order_id
+        ));
+        assert!(handler.order_contexts[&venue_order_id].accepted);
+        assert!(handler.pending_outgoing.is_empty());
+    }
+
+    const BOOK_CHANNEL: &str = "book.BTC-PERPETUAL.100ms";
+    const GROUPED_CHANNEL: &str = "book.BTC-PERPETUAL.none.10.100ms";
+
+    // Exceeds the Price range, so a level at this price fails domain conversion
+    const UNCONVERTIBLE_PRICE: f64 = 1e20;
+
+    fn book_message(
+        msg_type: &str,
+        change_id: u64,
+        prev_change_id: Option<u64>,
+        bid_price: f64,
+    ) -> String {
+        subscription(
+            BOOK_CHANNEL,
+            &serde_json::json!({
+                "type": msg_type,
+                "instrument_name": "BTC-PERPETUAL",
+                "timestamp": 1_700_000_000_000_u64,
+                "change_id": change_id,
+                "prev_change_id": prev_change_id,
+                "bids": [["new", bid_price, 10.0]],
+                "asks": [],
+            }),
+        )
+    }
+
+    // The other instrument's book and this instrument's trades must survive a book resync
+    fn grouped_book_message(change_id: u64, bid_price: f64) -> String {
+        subscription(
+            GROUPED_CHANNEL,
+            &serde_json::json!({
+                "instrument_name": "BTC-PERPETUAL",
+                "timestamp": 1_700_000_000_000_u64,
+                "change_id": change_id,
+                "bids": [[bid_price, 10.0]],
+                "asks": [],
+            }),
+        )
+    }
+
+    async fn book_test_handler() -> (
+        DeribitWsFeedHandler,
+        tokio::sync::mpsc::UnboundedReceiver<HandlerCommand>,
+    ) {
+        let mut handler = routing_test_handler();
+        let (cmd_tx, cmd_rx) = tokio::sync::mpsc::unbounded_channel();
+        handler.set_book_sync(cmd_tx, Duration::from_secs(10), Duration::from_secs(120));
+        for channel in [
+            BOOK_CHANNEL,
+            "book.ETH-PERPETUAL.100ms",
+            "trades.BTC-PERPETUAL.100ms",
+        ] {
+            subscribe_channel(&mut handler, channel).await;
+        }
+
+        (handler, cmd_rx)
+    }
+
+    async fn subscribe_channel(handler: &mut DeribitWsFeedHandler, channel: &str) {
+        handler.subscriptions_state.mark_subscribe(channel);
+        handler.subscriptions_state.add_reference(channel);
+        handler
+            .process_command(HandlerCommand::Subscribe {
+                channels: vec![channel.to_owned()],
+            })
+            .await;
+
+        let requests: Vec<(u64, Vec<String>)> = handler
+            .pending_requests
+            .iter()
+            .filter_map(|(id, request)| match request {
+                PendingRequestType::Subscribe { channels } => Some((*id, channels.clone())),
+                _ => None,
+            })
+            .collect();
+
+        for (id, channels) in requests {
+            let ack = serde_json::json!({"jsonrpc": "2.0", "id": id, "result": channels});
+            handler.process_raw_message(&ack.to_string()).await;
+        }
+    }
+
+    async fn next_recover_command(
+        handler: &mut DeribitWsFeedHandler,
+        cmd_rx: &mut tokio::sync::mpsc::UnboundedReceiver<HandlerCommand>,
+    ) -> HandlerCommand {
+        let work = handler.book_sync.work.next();
+        tokio::pin!(work);
+
+        tokio::select! {
+            cmd = cmd_rx.recv() => cmd.expect("recovery sends its replacement command"),
+            _ = &mut work => panic!("recovery ended without replacement"),
+        }
+    }
+
+    fn pending_unsubscribe_channels(handler: &DeribitWsFeedHandler) -> Vec<Vec<String>> {
+        handler
+            .pending_requests
+            .values()
+            .filter_map(|request| match request {
+                PendingRequestType::Unsubscribe { channels } => Some(channels.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn pending_subscribe_channels(handler: &DeribitWsFeedHandler) -> Vec<Vec<String>> {
+        handler
+            .pending_requests
+            .values()
+            .filter_map(|request| match request {
+                PendingRequestType::Subscribe { channels } => Some(channels.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[rstest]
+    #[tokio::test]
+    async fn book_sequence_gap_starts_recovery_and_resubscribes() {
+        let (mut handler, mut cmd_rx) = book_test_handler().await;
+
+        let snapshot = handler
+            .process_raw_message(&book_message("snapshot", 100, None, 42500.0))
+            .await;
+        let contiguous = handler
+            .process_raw_message(&book_message("change", 101, Some(100), 42499.5))
+            .await;
+
+        assert!(matches!(
+            snapshot,
+            Some(NautilusWsMessage::Deltas(deltas)) if deltas.sequence == 100
+        ));
+        assert!(matches!(
+            contiguous,
+            Some(NautilusWsMessage::Deltas(deltas)) if deltas.sequence == 101
+        ));
+        assert!(handler.book_sync.work.is_empty());
+
+        let gap = handler
+            .process_raw_message(&book_message("change", 103, Some(102), 42499.0))
+            .await;
+
+        assert!(gap.is_none());
+        assert_eq!(handler.book_sync.work.len(), 1);
+
+        let command = next_recover_command(&mut handler, &mut cmd_rx).await;
+        handler.process_command(command).await;
+
+        assert_eq!(
+            pending_unsubscribe_channels(&handler),
+            vec![vec![BOOK_CHANNEL.to_string()]]
+        );
+
+        let unsubscribe_id = handler
+            .pending_requests
+            .iter()
+            .find_map(|(id, request)| {
+                matches!(request, PendingRequestType::Unsubscribe { .. }).then_some(*id)
+            })
+            .unwrap();
+
+        let ack = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": unsubscribe_id,
+            "result": [BOOK_CHANNEL],
+        });
+        handler.process_raw_message(&ack.to_string()).await;
+
+        assert_eq!(
+            pending_subscribe_channels(&handler),
+            vec![vec![BOOK_CHANNEL.to_string()]]
+        );
+
+        let subscribe_id = handler
+            .pending_requests
+            .iter()
+            .find_map(|(id, request)| {
+                matches!(request, PendingRequestType::Subscribe { .. }).then_some(*id)
+            })
+            .unwrap();
+
+        let ack = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": subscribe_id,
+            "result": [BOOK_CHANNEL],
+        });
+        handler.process_raw_message(&ack.to_string()).await;
+
+        let recovered = handler
+            .process_raw_message(&book_message("snapshot", 200, None, 42500.0))
+            .await;
+
+        assert!(matches!(
+            recovered,
+            Some(NautilusWsMessage::Deltas(deltas)) if deltas.sequence == 200
+        ));
+    }
+
+    #[rstest]
+    #[tokio::test]
+    async fn first_delta_without_snapshot_is_suppressed() {
+        let (mut handler, _cmd_rx) = book_test_handler().await;
+
+        let delta = handler
+            .process_raw_message(&book_message("change", 101, Some(100), 42499.5))
+            .await;
+
+        assert!(delta.is_none());
+        // The armed snapshot deadline owns the book; recovery starts at expiry
+        assert!(handler.book_sync.work.is_empty());
+    }
+
+    #[tokio::test]
+    async fn grouped_book_waits_for_depth_subscription_update() {
+        let (mut handler, _cmd_rx) = book_test_handler().await;
+        subscribe_channel(&mut handler, GROUPED_CHANNEL).await;
+        handler
+            .book_depth_subs
+            .lock()
+            .await
+            .add_reference(GROUPED_CHANNEL);
+        handler
+            .process_raw_message(&book_message("snapshot", 100, None, 42500.0))
+            .await;
+        let depth_subs = Arc::clone(&handler.book_depth_subs);
+        let subscriptions = handler.subscriptions_state.clone();
+        let depth_guard = depth_subs.lock().await;
+        depth_guard.add_reference(GROUPED_CHANNEL);
+        let message = grouped_book_message(999, 89532.5);
+        let mut processing = Box::pin(handler.process_raw_message(&message));
+
+        assert!(futures_util::poll!(processing.as_mut()).is_pending());
+
+        subscriptions.add_reference(GROUPED_CHANNEL);
+        drop(depth_guard);
+        let output = processing.await.unwrap();
+
+        let NautilusWsMessage::Data(data) = output else {
+            panic!("expected grouped depth");
+        };
+
+        let [Data::BookDepth(depth)] = data.as_slice() else {
+            panic!("expected only depth data");
+        };
+
+        assert_eq!(depth.sequence, 999);
+        assert!(handler.pending_outgoing.is_empty());
+        assert!(handler.book_sync.work.is_empty());
+
+        let contiguous = handler
+            .process_raw_message(&book_message("change", 101, Some(100), 42499.5))
+            .await;
+
+        assert!(matches!(
+            contiguous,
+            Some(NautilusWsMessage::Deltas(deltas)) if deltas.sequence == 101
+        ));
+    }
+
+    #[rstest]
+    #[case::depth_only(false)]
+    #[case::shared_grouped_channel(true)]
+    #[tokio::test]
+    async fn grouped_depth_does_not_change_raw_book_sequence(#[case] grouped_deltas: bool) {
+        let (mut handler, _cmd_rx) = book_test_handler().await;
+        subscribe_channel(&mut handler, GROUPED_CHANNEL).await;
+        handler
+            .book_depth_subs
+            .lock()
+            .await
+            .add_reference(GROUPED_CHANNEL);
+
+        if grouped_deltas {
+            handler.subscriptions_state.add_reference(GROUPED_CHANNEL);
+        }
+
+        let snapshot = handler
+            .process_raw_message(&book_message("snapshot", 100, None, 42500.0))
+            .await
+            .unwrap();
+        let grouped = handler
+            .process_raw_message(&grouped_book_message(999, 89532.5))
+            .await
+            .unwrap();
+        let contiguous = handler
+            .process_raw_message(&book_message("change", 101, Some(100), 42499.5))
+            .await
+            .unwrap();
+
+        let mut book = OrderBook::new(
+            InstrumentId::from("BTC-PERPETUAL.DERIBIT"),
+            BookType::L2_MBP,
+        );
+
+        let NautilusWsMessage::Deltas(snapshot) = snapshot else {
+            panic!("expected raw snapshot");
+        };
+
+        book.apply_deltas(&snapshot).unwrap();
+
+        let NautilusWsMessage::Data(data) = grouped else {
+            panic!("expected grouped depth");
+        };
+
+        let [Data::BookDepth(depth)] = data.as_slice() else {
+            panic!("expected only depth data");
+        };
+
+        let NautilusWsMessage::Deltas(contiguous) = contiguous else {
+            panic!("expected raw delta");
+        };
+
+        book.apply_deltas(&contiguous).unwrap();
+
+        assert_eq!(depth.sequence, 999);
+        assert_eq!(depth.bids[0].price, Price::from("89532.5"));
+        assert_eq!(
+            book.bids_as_map(None).into_iter().collect::<Vec<_>>(),
+            vec![
+                (Decimal::from(42500), Decimal::from(10)),
+                (Decimal::new(424995, 1), Decimal::from(10)),
+            ]
+        );
+        assert!(handler.book_sync.work.is_empty());
+        assert!(pending_unsubscribe_channels(&handler).is_empty());
+        assert_eq!(handler.pending_outgoing.len(), usize::from(grouped_deltas));
+
+        if grouped_deltas {
+            let Some(NautilusWsMessage::Deltas(deltas)) = handler.pending_outgoing.pop_front()
+            else {
+                panic!("expected requested grouped deltas");
+            };
+
+            assert_eq!(deltas.sequence, 999);
+        }
+    }
+
+    #[rstest]
+    #[case::deltas(false)]
+    #[case::depth(true)]
+    #[tokio::test]
+    async fn rejected_grouped_book_snapshot_requests_recovery(#[case] depth: bool) {
+        let (mut handler, _cmd_rx) = book_test_handler().await;
+        subscribe_channel(&mut handler, GROUPED_CHANNEL).await;
+        if depth {
+            handler
+                .book_depth_subs
+                .lock()
+                .await
+                .add_reference(GROUPED_CHANNEL);
+        }
+
+        let first = handler
+            .process_raw_message(&grouped_book_message(100, 42500.0))
+            .await;
+
+        match first.unwrap() {
+            NautilusWsMessage::Deltas(deltas) if !depth => assert_eq!(deltas.sequence, 100),
+            NautilusWsMessage::Data(data) if depth => {
+                let [Data::BookDepth(snapshot)] = data.as_slice() else {
+                    panic!("expected depth");
+                };
+
+                assert_eq!(snapshot.sequence, 100);
+            }
+            message => panic!("unexpected message: {message:?}"),
+        }
+
+        let rejected = handler
+            .process_raw_message(&grouped_book_message(101, UNCONVERTIBLE_PRICE))
+            .await;
+
+        assert!(rejected.is_none());
+        assert_eq!(handler.book_sync.work.len(), 1);
+        assert!(pending_unsubscribe_channels(&handler).is_empty());
+
+        let next = handler
+            .process_raw_message(&grouped_book_message(102, 42500.0))
+            .await;
+
+        match next.unwrap() {
+            NautilusWsMessage::Deltas(deltas) if !depth => assert_eq!(deltas.sequence, 102),
+            NautilusWsMessage::Data(data) if depth => {
+                let [Data::BookDepth(snapshot)] = data.as_slice() else {
+                    panic!("expected depth");
+                };
+
+                assert_eq!(snapshot.sequence, 102);
+            }
+            message => panic!("unexpected message: {message:?}"),
+        }
+    }
+
+    #[rstest]
+    #[case::deltas(false)]
+    #[case::depth(true)]
+    #[tokio::test]
+    async fn delta_channel_recovery_survives_grouped_snapshot_before_unsubscribe_ack(
+        #[case] depth: bool,
+    ) {
+        let (mut handler, mut cmd_rx) = book_test_handler().await;
+        subscribe_channel(&mut handler, GROUPED_CHANNEL).await;
+        if depth {
+            handler
+                .book_depth_subs
+                .lock()
+                .await
+                .add_reference(GROUPED_CHANNEL);
+        }
+
+        handler
+            .process_raw_message(&book_message("snapshot", 100, None, 42500.0))
+            .await;
+        let rejected = handler
+            .process_raw_message(&book_message("change", 101, Some(100), UNCONVERTIBLE_PRICE))
+            .await;
+        let grouped = handler
+            .process_raw_message(&grouped_book_message(102, 42500.0))
+            .await;
+
+        assert!(rejected.is_none());
+        assert_eq!(handler.book_sync.work.len(), 1);
+
+        match grouped.unwrap() {
+            NautilusWsMessage::Deltas(deltas) if !depth => assert_eq!(deltas.sequence, 102),
+            NautilusWsMessage::Data(data) if depth => {
+                let [Data::BookDepth(snapshot)] = data.as_slice() else {
+                    panic!("expected depth");
+                };
+
+                assert_eq!(snapshot.sequence, 102);
+            }
+            message => panic!("unexpected message: {message:?}"),
+        }
+
+        let command = next_recover_command(&mut handler, &mut cmd_rx).await;
+        handler.process_command(command).await;
+
+        assert_eq!(
+            pending_unsubscribe_channels(&handler),
+            vec![vec![BOOK_CHANNEL.to_string()]]
+        );
+
+        let unsubscribe_id = handler
+            .pending_requests
+            .iter()
+            .find_map(|(id, request)| {
+                matches!(request, PendingRequestType::Unsubscribe { .. }).then_some(*id)
+            })
+            .unwrap();
+
+        let ack = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": unsubscribe_id,
+            "result": [BOOK_CHANNEL],
+        });
+        handler.process_raw_message(&ack.to_string()).await;
+
+        assert_eq!(
+            pending_subscribe_channels(&handler),
+            vec![vec![BOOK_CHANNEL.to_string()]]
+        );
+    }
+
+    #[rstest]
+    #[tokio::test]
+    async fn rejected_book_delta_forces_recovery_and_drops_successor() {
+        let (mut handler, _cmd_rx) = book_test_handler().await;
+
+        let snapshot = handler
+            .process_raw_message(&book_message("snapshot", 100, None, 42500.0))
+            .await;
+        let rejected = handler
+            .process_raw_message(&book_message("change", 101, Some(100), UNCONVERTIBLE_PRICE))
+            .await;
+        let successor = handler
+            .process_raw_message(&book_message("change", 102, Some(101), 42499.5))
+            .await;
+
+        assert!(matches!(
+            snapshot,
+            Some(NautilusWsMessage::Deltas(deltas)) if deltas.sequence == 100
+        ));
+        assert!(rejected.is_none());
+        assert!(successor.is_none());
+        assert_eq!(handler.book_sync.work.len(), 1);
+        assert!(pending_unsubscribe_channels(&handler).is_empty());
+
+        let recovered = handler
+            .process_raw_message(&book_message("snapshot", 200, None, 42500.0))
+            .await;
+
+        assert!(matches!(
+            recovered,
+            Some(NautilusWsMessage::Deltas(deltas)) if deltas.sequence == 200
+        ));
+
+        let contiguous = handler
+            .process_raw_message(&book_message("change", 201, Some(200), 42499.5))
+            .await;
+
+        assert!(matches!(
+            contiguous,
+            Some(NautilusWsMessage::Deltas(deltas)) if deltas.sequence == 201
+        ));
+    }
+
+    #[rstest]
+    #[tokio::test]
+    async fn rejected_snapshot_during_recovery_keeps_episode() {
+        let (mut handler, mut cmd_rx) = book_test_handler().await;
+
+        handler
+            .process_raw_message(&book_message("snapshot", 100, None, 42500.0))
+            .await;
+        let gap = handler
+            .process_raw_message(&book_message("change", 105, Some(104), 42499.0))
+            .await;
+
+        assert!(gap.is_none());
+        assert_eq!(handler.book_sync.work.len(), 1);
+
+        // The corrupt frame never completes the episode: the same recovery keeps
+        // ownership and its replacement still runs
+        let rejected = handler
+            .process_raw_message(&book_message("snapshot", 200, None, UNCONVERTIBLE_PRICE))
+            .await;
+
+        assert!(rejected.is_none());
+        assert_eq!(handler.book_sync.work.len(), 1);
+
+        let command = next_recover_command(&mut handler, &mut cmd_rx).await;
+        handler.process_command(command).await;
+
+        assert_eq!(
+            pending_unsubscribe_channels(&handler),
+            vec![vec![BOOK_CHANNEL.to_string()]]
+        );
+
+        let unsubscribe_id = handler
+            .pending_requests
+            .iter()
+            .find_map(|(id, request)| {
+                matches!(request, PendingRequestType::Unsubscribe { .. }).then_some(*id)
+            })
+            .unwrap();
+
+        let ack = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": unsubscribe_id,
+            "result": [BOOK_CHANNEL],
+        });
+        handler.process_raw_message(&ack.to_string()).await;
+
+        let subscribe_id = handler
+            .pending_requests
+            .iter()
+            .find_map(|(id, request)| {
+                matches!(request, PendingRequestType::Subscribe { .. }).then_some(*id)
+            })
+            .unwrap();
+
+        let ack = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": subscribe_id,
+            "result": [BOOK_CHANNEL],
+        });
+        handler.process_raw_message(&ack.to_string()).await;
+
+        let recovered = handler
+            .process_raw_message(&book_message("snapshot", 300, None, 42500.0))
+            .await;
+
+        assert!(matches!(
+            recovered,
+            Some(NautilusWsMessage::Deltas(deltas)) if deltas.sequence == 300
+        ));
+    }
+
+    #[rstest]
+    #[tokio::test]
+    async fn corrupt_snapshot_awaiting_replacement_retries_fast() {
+        let (mut handler, mut cmd_rx) = book_test_handler().await;
+
+        handler
+            .process_raw_message(&book_message("snapshot", 100, None, 42500.0))
+            .await;
+        handler
+            .process_raw_message(&book_message("change", 105, Some(104), 42499.0))
+            .await;
+
+        // Drive the replacement to its resubscribe acknowledgement, so the attempt
+        // waits for the fresh snapshot with the gate open
+        let command = next_recover_command(&mut handler, &mut cmd_rx).await;
+        handler.process_command(command).await;
+
+        let unsubscribe_id = handler
+            .pending_requests
+            .iter()
+            .find_map(|(id, request)| {
+                matches!(request, PendingRequestType::Unsubscribe { .. }).then_some(*id)
+            })
+            .unwrap();
+
+        let ack = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": unsubscribe_id,
+            "result": [BOOK_CHANNEL],
+        });
+        handler.process_raw_message(&ack.to_string()).await;
+
+        let subscribe_id = handler
+            .pending_requests
+            .iter()
+            .find_map(|(id, request)| {
+                matches!(request, PendingRequestType::Subscribe { .. }).then_some(*id)
+            })
+            .unwrap();
+
+        let ack = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": subscribe_id,
+            "result": [BOOK_CHANNEL],
+        });
+        handler.process_raw_message(&ack.to_string()).await;
+
+        // The corrupt snapshot fails the waiting attempt, which must retry in about
+        // a second rather than skipping to the 60s ceiling
+        let corrupt = handler
+            .process_raw_message(&book_message("snapshot", 200, None, UNCONVERTIBLE_PRICE))
+            .await;
+
+        assert!(corrupt.is_none());
+
+        // Poll the recovery like the handler loop so the failed attempt retries
+        let next = handler.book_sync.work.next();
+        tokio::pin!(next);
+        let retried = tokio::select! {
+            cmd = cmd_rx.recv() => cmd,
+            _ = &mut next => panic!("recovery ended without retry"),
+            () = tokio::time::sleep(Duration::from_secs(10)) => {
+                panic!("replacement did not retry fast")
+            }
+        };
+        retried.expect("recovery sends its next replacement");
+    }
+
+    #[rstest]
+    #[tokio::test]
+    async fn superseded_attempt_ack_is_ignored() {
+        let (mut handler, mut cmd_rx) = book_test_handler().await;
+
+        handler
+            .process_raw_message(&book_message("snapshot", 100, None, 42500.0))
+            .await;
+        handler
+            .process_raw_message(&book_message("change", 105, Some(104), 42499.0))
+            .await;
+
+        // The first attempt sends its unsubscribe, then times out
+        let command = next_recover_command(&mut handler, &mut cmd_rx).await;
+        handler.process_command(command).await;
+
+        let first_id = handler
+            .pending_requests
+            .iter()
+            .find_map(|(id, request)| {
+                matches!(request, PendingRequestType::Unsubscribe { .. }).then_some(*id)
+            })
+            .unwrap();
+
+        let key = BookKey::for_channel(BOOK_CHANNEL).expect("book key");
+        handler
+            .book_sync
+            .abort_recovery_write(&key, DeribitWsError::Timeout("book replacement".to_owned()));
+
+        // The retry supersedes the first attempt and retires its request
+        let command = next_recover_command(&mut handler, &mut cmd_rx).await;
+        handler.process_command(command).await;
+
+        assert_eq!(
+            pending_unsubscribe_channels(&handler),
+            vec![vec![BOOK_CHANNEL.to_string()]]
+        );
+
+        // The late acknowledgement to the first attempt is ignored
+        let ack = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": first_id,
+            "result": [BOOK_CHANNEL],
+        });
+        handler.process_raw_message(&ack.to_string()).await;
+
+        assert!(pending_subscribe_channels(&handler).is_empty());
+
+        // The current attempt's acknowledgement resubscribes, and a duplicate
+        // response to the same request is ignored by request-id removal
+        let second_id = handler
+            .pending_requests
+            .iter()
+            .find_map(|(id, request)| {
+                matches!(request, PendingRequestType::Unsubscribe { .. }).then_some(*id)
+            })
+            .unwrap();
+
+        let ack = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": second_id,
+            "result": [BOOK_CHANNEL],
+        });
+        handler.process_raw_message(&ack.to_string()).await;
+        handler.process_raw_message(&ack.to_string()).await;
+
+        assert_eq!(
+            pending_subscribe_channels(&handler),
+            vec![vec![BOOK_CHANNEL.to_string()]]
+        );
+    }
+
+    #[rstest]
+    #[tokio::test]
+    async fn withheld_subscribe_acks_stay_bounded_across_attempts() {
+        let (mut handler, mut cmd_rx) = book_test_handler().await;
+
+        handler
+            .process_raw_message(&book_message("snapshot", 100, None, 42500.0))
+            .await;
+        handler
+            .process_raw_message(&book_message("change", 105, Some(104), 42499.0))
+            .await;
+
+        let key = BookKey::for_channel(BOOK_CHANNEL).expect("book key");
+
+        for _ in 0..3 {
+            let command = next_recover_command(&mut handler, &mut cmd_rx).await;
+            handler.process_command(command).await;
+
+            // Only the current attempt holds requests: earlier resubscribes retired
+            assert!(pending_subscribe_channels(&handler).is_empty());
+            assert_eq!(pending_unsubscribe_channels(&handler).len(), 1);
+
+            // The unsubscribe is acknowledged but the resubscribe is not
+            let id = handler
+                .pending_requests
+                .iter()
+                .find_map(|(id, request)| {
+                    matches!(request, PendingRequestType::Unsubscribe { .. }).then_some(*id)
+                })
+                .unwrap();
+
+            let ack = serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "result": [BOOK_CHANNEL],
+            });
+            handler.process_raw_message(&ack.to_string()).await;
+
+            handler
+                .book_sync
+                .abort_recovery_write(&key, DeribitWsError::Timeout("book replacement".to_owned()));
+        }
+    }
+
+    #[rstest]
+    #[tokio::test]
+    async fn recovery_retirement_preserves_unacked_initial_subscribe() {
+        let mut handler = routing_test_handler();
+        let (cmd_tx, mut cmd_rx) = tokio::sync::mpsc::unbounded_channel();
+        handler.set_book_sync(cmd_tx, Duration::from_secs(10), Duration::from_secs(120));
+
+        // The initial subscribe is sent but never acknowledged
+        handler.subscriptions_state.mark_subscribe(BOOK_CHANNEL);
+        handler.subscriptions_state.add_reference(BOOK_CHANNEL);
+        handler
+            .process_command(HandlerCommand::Subscribe {
+                channels: vec![BOOK_CHANNEL.to_owned()],
+            })
+            .await;
+
+        let initial_id = handler
+            .pending_requests
+            .iter()
+            .find_map(|(id, request)| {
+                matches!(request, PendingRequestType::Subscribe { .. }).then_some(*id)
+            })
+            .unwrap();
+
+        // A delta before any snapshot starts recovery while still unacked
+        handler
+            .process_raw_message(&book_message("change", 101, Some(100), 42499.5))
+            .await;
+
+        let key = BookKey::for_channel(BOOK_CHANNEL).expect("book key");
+
+        for _ in 0..2 {
+            let command = next_recover_command(&mut handler, &mut cmd_rx).await;
+            handler.process_command(command).await;
+
+            let id = handler
+                .pending_requests
+                .iter()
+                .find_map(|(id, request)| {
+                    matches!(request, PendingRequestType::Unsubscribe { .. }).then_some(*id)
+                })
+                .unwrap();
+
+            let ack = serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "result": [BOOK_CHANNEL],
+            });
+            handler.process_raw_message(&ack.to_string()).await;
+
+            handler
+                .book_sync
+                .abort_recovery_write(&key, DeribitWsError::Timeout("book replacement".to_owned()));
+        }
+
+        // One more attempt retires the withheld resubscribes but keeps the
+        // initial subscribe for the identical channel
+        let command = next_recover_command(&mut handler, &mut cmd_rx).await;
+        handler.process_command(command).await;
+
+        assert_eq!(
+            pending_subscribe_channels(&handler),
+            vec![vec![BOOK_CHANNEL.to_string()]]
+        );
+        assert!(handler.pending_requests.contains_key(&initial_id));
+
+        // The late initial acknowledgement still confirms the subscription
+        let ack = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": initial_id,
+            "result": [BOOK_CHANNEL],
+        });
+        handler.process_raw_message(&ack.to_string()).await;
+
+        assert!(!handler.pending_requests.contains_key(&initial_id));
+        assert!(
+            handler
+                .subscriptions_state
+                .pending_subscribe_topics()
+                .is_empty()
+        );
+    }
+
+    #[rstest]
+    #[tokio::test]
+    async fn concurrent_book_recoveries_keep_their_own_requests() {
+        let (mut handler, mut cmd_rx) = book_test_handler().await;
+        subscribe_channel(&mut handler, GROUPED_CHANNEL).await;
+
+        handler
+            .process_raw_message(&book_message("snapshot", 100, None, 42500.0))
+            .await;
+        handler
+            .process_raw_message(&grouped_book_message(500, 42500.0))
+            .await;
+        handler
+            .process_raw_message(&book_message("change", 105, Some(104), 42499.0))
+            .await;
+
+        let grouped_gap = subscription(
+            GROUPED_CHANNEL,
+            &serde_json::json!({
+                "type": "change",
+                "instrument_name": "BTC-PERPETUAL",
+                "timestamp": 1_700_000_000_000_u64,
+                "change_id": 505,
+                "prev_change_id": 504,
+                "bids": [],
+                "asks": [],
+            }),
+        );
+        handler.process_raw_message(&grouped_gap).await;
+
+        assert_eq!(handler.book_sync.work.len(), 2);
+
+        // Both replacements hold their own requests: neither begin retires the
+        // other book's entries
+        for _ in 0..2 {
+            let command = next_recover_command(&mut handler, &mut cmd_rx).await;
+            handler.process_command(command).await;
+        }
+
+        let unsubs = pending_unsubscribe_channels(&handler);
+        assert_eq!(unsubs.len(), 2);
+        assert!(unsubs.contains(&vec![BOOK_CHANNEL.to_string()]));
+        assert!(unsubs.contains(&vec![GROUPED_CHANNEL.to_owned()]));
+
+        // Both acknowledgements still drive their own resubscribe
+        for (id, request) in handler.pending_requests.clone() {
+            if let PendingRequestType::Unsubscribe { channels } = request {
+                let ack = serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": id,
+                    "result": channels,
+                });
+                handler.process_raw_message(&ack.to_string()).await;
+            }
+        }
+
+        let subs = pending_subscribe_channels(&handler);
+        assert_eq!(subs.len(), 2);
+        assert!(subs.contains(&vec![BOOK_CHANNEL.to_string()]));
+        assert!(subs.contains(&vec![GROUPED_CHANNEL.to_owned()]));
+    }
+
+    #[rstest]
+    #[tokio::test]
+    async fn unsubscribe_ack_after_cancel_is_ignored() {
+        let (mut handler, mut cmd_rx) = book_test_handler().await;
+
+        handler
+            .process_raw_message(&book_message("snapshot", 100, None, 42500.0))
+            .await;
+        handler
+            .process_raw_message(&book_message("change", 105, Some(104), 42499.0))
+            .await;
+
+        let command = next_recover_command(&mut handler, &mut cmd_rx).await;
+        handler.process_command(command).await;
+
+        let request_id = handler
+            .pending_requests
+            .iter()
+            .find_map(|(id, request)| {
+                matches!(request, PendingRequestType::Unsubscribe { .. }).then_some(*id)
+            })
+            .unwrap();
+
+        // The user unsubscribes while the replacement is queued
+        handler.subscriptions_state.remove_reference(BOOK_CHANNEL);
+        handler
+            .process_command(HandlerCommand::Unsubscribe {
+                channels: vec![BOOK_CHANNEL.to_string()],
+            })
+            .await;
+
+        assert_eq!(handler.book_sync.len(), 1);
+
+        let ack = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": request_id,
+            "result": [BOOK_CHANNEL],
+        });
+        handler.process_raw_message(&ack.to_string()).await;
+
+        assert!(pending_subscribe_channels(&handler).is_empty());
+        assert_eq!(handler.book_sync.len(), 1);
+    }
+
+    #[rstest]
+    fn retire_superseded_recovery_requests_keeps_user_requests() {
+        let mut handler = routing_test_handler();
+
+        handler.pending_requests.insert(
+            901,
+            PendingRequestType::Unsubscribe {
+                channels: vec![BOOK_CHANNEL.to_owned()],
+            },
+        );
+
+        handler.pending_requests.insert(
+            902,
+            PendingRequestType::Subscribe {
+                channels: vec![BOOK_CHANNEL.to_owned()],
+            },
+        );
+
+        handler.pending_requests.insert(
+            903,
+            PendingRequestType::Unsubscribe {
+                channels: vec!["book.ETH-PERPETUAL.100ms".to_owned()],
+            },
+        );
+
+        // Recorded ids alone decide ownership: 901 is this book's recovery residue
+        // while the user's subscribe and the other book's recovery request survive
+        let btc = BookKey::for_channel(BOOK_CHANNEL).expect("book key");
+        let eth = BookKey::for_channel("book.ETH-PERPETUAL.100ms").expect("book key");
+        handler
+            .book_recovery_requests
+            .insert(btc.clone(), AHashSet::from([901]));
+        handler
+            .book_recovery_requests
+            .insert(eth, AHashSet::from([903]));
+
+        handler.retire_superseded_recovery_requests(&btc);
+
+        assert!(!handler.pending_requests.contains_key(&901));
+        assert!(handler.pending_requests.contains_key(&902));
+        assert!(handler.pending_requests.contains_key(&903));
+    }
+
+    #[rstest]
+    #[tokio::test]
+    async fn corrupt_snapshot_before_ack_starts_no_recovery() {
+        let mut handler = routing_test_handler();
+        let (cmd_tx, _cmd_rx) = tokio::sync::mpsc::unbounded_channel();
+        handler.set_book_sync(cmd_tx, Duration::from_secs(10), Duration::from_secs(120));
+        handler.subscriptions_state.mark_subscribe(BOOK_CHANNEL);
+        handler.subscriptions_state.add_reference(BOOK_CHANNEL);
+        let key = BookKey::for_channel(BOOK_CHANNEL).expect("book key");
+        handler
+            .book_sync
+            .record_subscription(key, InstrumentId::from("BTC-PERPETUAL.DERIBIT"));
+
+        // The gate stays closed until the subscribe acknowledgement; the snapshot
+        // timer owns the wait, so a corrupt frame is dropped, not rejected
+        let corrupt = handler
+            .process_raw_message(&book_message("snapshot", 100, None, UNCONVERTIBLE_PRICE))
+            .await;
+
+        assert!(corrupt.is_none());
+        assert!(handler.book_sync.work.is_empty());
+    }
+
+    #[rstest]
+    #[case::deltas(false)]
+    #[case::depth(true)]
+    #[tokio::test]
+    async fn corrupt_grouped_snapshot_before_ack_starts_no_recovery(#[case] depth: bool) {
+        let mut handler = routing_test_handler();
+        let (cmd_tx, _cmd_rx) = tokio::sync::mpsc::unbounded_channel();
+        handler.set_book_sync(cmd_tx, Duration::from_secs(10), Duration::from_secs(120));
+        handler.subscriptions_state.mark_subscribe(GROUPED_CHANNEL);
+        handler.subscriptions_state.add_reference(GROUPED_CHANNEL);
+        if depth {
+            handler
+                .book_depth_subs
+                .lock()
+                .await
+                .add_reference(GROUPED_CHANNEL);
+        }
+
+        let key = BookKey::for_channel(GROUPED_CHANNEL).expect("book key");
+        handler
+            .book_sync
+            .record_subscription(key, InstrumentId::from("BTC-PERPETUAL.DERIBIT"));
+
+        let corrupt = handler
+            .process_raw_message(&grouped_book_message(100, UNCONVERTIBLE_PRICE))
+            .await;
+
+        assert!(corrupt.is_none());
+        assert!(handler.book_sync.work.is_empty());
+    }
+
+    #[rstest]
+    #[tokio::test]
+    async fn corrupt_snapshot_after_ack_requests_recovery() {
+        let (mut handler, _cmd_rx) = book_test_handler().await;
+
+        handler
+            .process_raw_message(&book_message("snapshot", 100, None, 42500.0))
+            .await;
+
+        let corrupt = handler
+            .process_raw_message(&book_message("snapshot", 101, None, UNCONVERTIBLE_PRICE))
+            .await;
+
+        assert!(corrupt.is_none());
+        assert_eq!(handler.book_sync.work.len(), 1);
+    }
+
+    #[rstest]
+    #[tokio::test]
+    async fn user_unsubscribe_removes_book_tracking() {
+        let (mut handler, _cmd_rx) = book_test_handler().await;
+
+        handler
+            .process_raw_message(&book_message("snapshot", 100, None, 42500.0))
+            .await;
+        assert_eq!(handler.book_sync.len(), 2);
+
+        handler.subscriptions_state.remove_reference(BOOK_CHANNEL);
+        handler
+            .process_command(HandlerCommand::Unsubscribe {
+                channels: vec![BOOK_CHANNEL.to_string()],
+            })
+            .await;
+
+        assert_eq!(handler.book_sync.len(), 1);
+
+        let delta = handler
+            .process_raw_message(&book_message("change", 101, Some(100), 42499.5))
+            .await;
+
+        assert!(delta.is_none());
+        assert!(handler.book_sync.work.is_empty());
+    }
+
+    #[rstest]
+    #[tokio::test]
+    async fn reconnect_during_recovery_keeps_episode_and_arms_deadline() {
+        let (mut handler, _cmd_rx) = book_test_handler().await;
+
+        handler
+            .process_raw_message(&book_message("snapshot", 100, None, 42500.0))
+            .await;
+        handler
+            .process_raw_message(&book_message("change", 105, Some(104), 42499.0))
+            .await;
+
+        assert_eq!(handler.book_sync.work.len(), 1);
+
+        handler.process_raw_message(RECONNECTED).await;
+
+        // The episode survives the reconnect instead of restarting
+        assert_eq!(handler.book_sync.len(), 2);
+        assert_eq!(handler.book_sync.work.len(), 1);
+        let key = BookKey::Raw(Ustr::from("BTC-PERPETUAL"));
+        assert!(handler.book_sync.claim(&key).is_none());
+
+        // A snapshot deadline is armed for the replayed subscription
+        let now = Instant::now() + Duration::from_secs(11);
+        let recoveries =
+            handler
+                .book_sync
+                .recoveries(Duration::from_secs(120), Duration::from_secs(10), now);
+        let btc = recoveries
+            .iter()
+            .find(|(k, _)| *k == key)
+            .expect("btc recovery signal");
+        assert_eq!(btc.1.kind, BookSyncSignalKind::SnapshotMissing);
+    }
+
+    #[rstest]
+    #[tokio::test]
+    async fn user_unsubscribe_during_recovery_cancels_episode() {
+        let (mut handler, _cmd_rx) = book_test_handler().await;
+
+        handler
+            .process_raw_message(&book_message("snapshot", 100, None, 42500.0))
+            .await;
+        handler
+            .process_raw_message(&book_message("change", 105, Some(104), 42499.0))
+            .await;
+
+        assert_eq!(handler.book_sync.work.len(), 1);
+
+        handler.subscriptions_state.remove_reference(BOOK_CHANNEL);
+        handler
+            .process_command(HandlerCommand::Unsubscribe {
+                channels: vec![BOOK_CHANNEL.to_string()],
+            })
+            .await;
+
+        assert_eq!(handler.book_sync.len(), 1);
+        // Dropping the episode completes its work without resubscribing
+        assert!(handler.book_sync.work.next().await.is_some());
+        assert!(handler.book_sync.work.is_empty());
+        assert!(pending_subscribe_channels(&handler).is_empty());
+
+        let delta = handler
+            .process_raw_message(&book_message("change", 106, Some(105), 42499.5))
+            .await;
+
+        assert!(delta.is_none());
+        assert!(handler.book_sync.work.is_empty());
+    }
+
+    #[rstest]
+    #[tokio::test]
+    async fn rejected_initial_subscribe_starts_recovery() {
+        let (mut handler, mut cmd_rx) = book_test_handler().await;
+
+        handler.subscriptions_state.mark_subscribe(GROUPED_CHANNEL);
+        handler.subscriptions_state.add_reference(GROUPED_CHANNEL);
+        handler
+            .process_command(HandlerCommand::Subscribe {
+                channels: vec![GROUPED_CHANNEL.to_owned()],
+            })
+            .await;
+
+        let id = handler
+            .pending_requests
+            .iter()
+            .find_map(|(id, request)| match request {
+                PendingRequestType::Subscribe { .. } => Some(*id),
+                _ => None,
+            })
+            .expect("subscribe request");
+
+        let rejection = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "error": {"code": 10028, "message": "too many requests"},
+        });
+        handler.process_raw_message(&rejection.to_string()).await;
+
+        // The rejected wait retires into a running recovery that resubscribes
+        assert_eq!(handler.book_sync.work.len(), 1);
+        let key = BookKey::Grouped(GROUPED_CHANNEL.to_owned());
+        assert!(!handler.book_sync.has_unacked_subscription(&key));
+
+        let HandlerCommand::RecoverBook { .. } =
+            next_recover_command(&mut handler, &mut cmd_rx).await
+        else {
+            panic!("expected a recovery command");
+        };
+    }
+
+    #[rstest]
+    #[tokio::test]
+    async fn book_monitor_runs_while_socket_stays_busy() {
+        let (mut handler, _cmd_rx) = book_test_handler().await;
+
+        handler
+            .process_raw_message(&book_message("snapshot", 100, None, 42500.0))
+            .await;
+        handler.book_stale_threshold = Duration::from_secs(1);
+
+        let (raw_tx, raw_rx) = tokio::sync::mpsc::unbounded_channel();
+        handler.raw_rx = raw_rx;
+        let signal = handler.signal.clone();
+
+        // Keep the socket busy with pings the handler answers without book work
+        let busy = tokio::spawn(async move {
+            while raw_tx.send(Message::Ping(vec![].into())).is_ok() {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        });
+
+        let looping = tokio::spawn(async move {
+            while handler.next().await.is_some() {}
+            handler
+        });
+
+        // The silent books must still reach stale recovery under traffic
+        tokio::time::sleep(Duration::from_secs(4)).await;
+        signal.store(true, Ordering::SeqCst);
+        let handler = looping.await.expect("loop task");
+        busy.abort();
+
+        assert_eq!(handler.book_sync.work.len(), 2);
+    }
+
+    #[rstest]
+    #[tokio::test]
+    async fn cancelled_recovery_command_sends_nothing() {
+        let (mut handler, mut cmd_rx) = book_test_handler().await;
+
+        handler
+            .process_raw_message(&book_message("snapshot", 100, None, 42500.0))
+            .await;
+        handler
+            .process_raw_message(&book_message("change", 105, Some(104), 42499.0))
+            .await;
+
+        let command = next_recover_command(&mut handler, &mut cmd_rx).await;
+
+        let HandlerCommand::RecoverBook { cancel, .. } = &command else {
+            panic!("expected a recovery command");
+        };
+
+        cancel.cancel();
+        handler.process_command(command).await;
+
+        assert!(pending_unsubscribe_channels(&handler).is_empty());
+        assert_eq!(handler.book_sync.work.len(), 1);
+    }
+
+    #[rstest]
+    #[case(OrderSide::Buy)]
+    #[case(OrderSide::Sell)]
+    #[tokio::test]
+    async fn order_serialization_failure_leaves_no_order_context(#[case] side: OrderSide) {
+        let mut handler = routing_test_handler();
+        let client_order_id = ClientOrderId::from("O-19700101-000000-001-001-1");
+        let trader_id = TraderId::from("TRADER-001");
+        let strategy_id = StrategyId::from("S-001");
+        let instrument_id = InstrumentId::from("BTC-PERPETUAL.DERIBIT");
+
+        let params = DeribitOrderParams {
+            instrument_name: "BTC-PERPETUAL".to_string(),
+            amount: Decimal::from_str_exact("100000000.005000001").unwrap(),
+            order_type: "limit".to_string(),
+            label: Some(client_order_id.to_string()),
+            price: Some(Decimal::from_str_exact("65000.5").unwrap()),
+            time_in_force: Some("good_til_cancelled".to_string()),
+            post_only: None,
+            reject_post_only: None,
+            reduce_only: None,
+            trigger_price: None,
+            trigger: None,
+            max_show: None,
+            valid_until: None,
+        };
+
+        let result = match side {
+            OrderSide::Buy => {
+                handler
+                    .handle_submit(
+                        OrderSide::Buy,
+                        params,
+                        client_order_id,
+                        trader_id,
+                        strategy_id,
+                        instrument_id,
+                    )
+                    .await
+            }
+            OrderSide::Sell => {
+                handler
+                    .handle_submit(
+                        OrderSide::Sell,
+                        params,
+                        client_order_id,
+                        trader_id,
+                        strategy_id,
+                        instrument_id,
+                    )
+                    .await
+            }
+        };
+
+        // `serde_json/arbitrary_precision` keeps a number's text, so the amount serializes
+        // and the missing client proves the command was not sent.
+        if "0.10".parse::<serde_json::Number>().unwrap().to_string() == "0.10" {
+            assert!(matches!(result, Err(DeribitWsError::NotConnected)));
+        } else {
+            assert!(matches!(
+                result,
+                Err(DeribitWsError::Encode(message))
+                    if message == "exact decimal number serialization requires serde_json/arbitrary_precision"
+            ));
+        }
+
+        assert!(
+            handler
+                .submitted_order_contexts
+                .get(&client_order_id)
+                .is_none()
+        );
+        assert!(handler.pending_requests.is_empty());
+    }
+
+    #[tokio::test]
+    async fn stop_before_write_rejects_queued_submit() {
+        let signal = Arc::new(AtomicBool::new(true));
+        let (cmd_tx, cmd_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (_raw_tx, raw_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (out_tx, mut out_rx) = tokio::sync::mpsc::unbounded_channel();
+
+        let mut handler = DeribitWsFeedHandler::new(
+            signal,
+            cmd_rx,
+            raw_rx,
+            out_tx,
+            AuthTracker::new(),
+            SubscriptionState::new('.'),
+            Arc::new(AtomicSet::new()),
+            Arc::new(AtomicSet::new()),
+            Arc::new(AtomicSet::new()),
+            Some(AccountId::from("DERIBIT-001")),
+            true,
+            Arc::new(Mutex::new(Vec::new())),
+        );
+        let client_order_id = ClientOrderId::new("stop-before-write-001");
+        cmd_tx
+            .send(HandlerCommand::Buy {
+                params: DeribitOrderParams {
+                    instrument_name: "BTC-PERPETUAL".to_string(),
+                    amount: Decimal::new(1, 0),
+                    order_type: "limit".to_string(),
+                    label: Some(client_order_id.to_string()),
+                    price: Some(Decimal::new(50_000, 0)),
+                    time_in_force: Some("good_til_cancelled".to_string()),
+                    post_only: None,
+                    reject_post_only: None,
+                    reduce_only: None,
+                    trigger_price: None,
+                    trigger: None,
+                    max_show: None,
+                    valid_until: None,
+                },
+                client_order_id,
+                trader_id: TraderId::from("TESTER-001"),
+                strategy_id: StrategyId::from("S-001"),
+                instrument_id: InstrumentId::from("BTC-PERPETUAL.DERIBIT"),
+            })
+            .unwrap();
+
+        assert!(handler.next().await.is_none());
+        let message = out_rx.try_recv().expect("queued submit rejection");
+
+        let NautilusWsMessage::OrderRejected(rejected) = message else {
+            panic!("expected OrderRejected, was {message:?}");
+        };
+
+        assert_eq!(rejected.client_order_id, client_order_id);
+        assert_eq!(rejected.reason.as_str(), "canceled before transmission");
+        assert!(!rejected.due_post_only);
+        assert!(out_rx.try_recv().is_err());
+        assert!(cmd_tx.send(HandlerCommand::Disconnect).is_err());
+    }
+
+    #[rstest]
+    #[case(true)]
+    #[case(false)]
+    #[tokio::test]
+    async fn stop_before_write_denies_queued_modify_or_cancel(#[case] cancel: bool) {
+        let signal = Arc::new(AtomicBool::new(true));
+        let (cmd_tx, cmd_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (_raw_tx, raw_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (out_tx, mut out_rx) = tokio::sync::mpsc::unbounded_channel();
+
+        let mut handler = DeribitWsFeedHandler::new(
+            signal,
+            cmd_rx,
+            raw_rx,
+            out_tx,
+            AuthTracker::new(),
+            SubscriptionState::new('.'),
+            Arc::new(AtomicSet::new()),
+            Arc::new(AtomicSet::new()),
+            Arc::new(AtomicSet::new()),
+            Some(AccountId::from("DERIBIT-001")),
+            true,
+            Arc::new(Mutex::new(Vec::new())),
+        );
+        let client_order_id = ClientOrderId::new("stop-before-write-002");
+        let venue_order_id = VenueOrderId::from("DERIBIT-ORDER-1");
+        let causation_id = UUID4::new();
+
+        let command = if cancel {
+            HandlerCommand::Cancel {
+                causation_id: Some(causation_id),
+                params: DeribitCancelParams {
+                    order_id: venue_order_id.to_string(),
+                },
+                client_order_id,
+                trader_id: TraderId::from("TESTER-001"),
+                strategy_id: StrategyId::from("S-001"),
+                instrument_id: InstrumentId::from("BTC-PERPETUAL.DERIBIT"),
+            }
+        } else {
+            HandlerCommand::Edit {
+                causation_id: Some(causation_id),
+                params: DeribitEditParams {
+                    order_id: venue_order_id.to_string(),
+                    amount: Decimal::new(1, 0),
+                    price: Some(Decimal::new(50_000, 0)),
+                    post_only: None,
+                    reject_post_only: None,
+                    reduce_only: None,
+                    trigger_price: None,
+                },
+                client_order_id,
+                trader_id: TraderId::from("TESTER-001"),
+                strategy_id: StrategyId::from("S-001"),
+                instrument_id: InstrumentId::from("BTC-PERPETUAL.DERIBIT"),
+            }
+        };
+
+        cmd_tx.send(command).unwrap();
+        assert!(handler.next().await.is_none());
+        let message = out_rx.try_recv().expect("queued command denial");
+
+        let (id, reason, venue, cause) = match message {
+            NautilusWsMessage::OrderCancelDenied(event) if cancel => (
+                event.client_order_id,
+                event.reason,
+                event.venue_order_id,
+                event.causation_id,
+            ),
+            NautilusWsMessage::OrderModifyDenied(event) if !cancel => (
+                event.client_order_id,
+                event.reason,
+                event.venue_order_id,
+                event.causation_id,
+            ),
+            other => panic!("expected one denial, was {other:?}"),
+        };
+
+        assert_eq!(id, client_order_id);
+        assert_eq!(reason.as_str(), "canceled before transmission");
+        assert_eq!(venue, Some(venue_order_id));
+        assert_eq!(cause, Some(causation_id));
+        assert!(out_rx.try_recv().is_err());
+        assert!(cmd_tx.send(HandlerCommand::Disconnect).is_err());
+    }
+
+    #[rstest]
+    #[case(true)]
+    #[case(false)]
+    #[tokio::test]
+    async fn stopping_handler_flushes_queued_modify_or_cancel_denial(#[case] cancel: bool) {
+        let signal = Arc::new(AtomicBool::new(false));
+        let (_cmd_tx, cmd_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (_raw_tx, raw_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (out_tx, mut out_rx) = tokio::sync::mpsc::unbounded_channel();
+
+        let mut handler = DeribitWsFeedHandler::new(
+            signal.clone(),
+            cmd_rx,
+            raw_rx,
+            out_tx,
+            AuthTracker::new(),
+            SubscriptionState::new('.'),
+            Arc::new(AtomicSet::new()),
+            Arc::new(AtomicSet::new()),
+            Arc::new(AtomicSet::new()),
+            Some(AccountId::from("DERIBIT-001")),
+            true,
+            Arc::new(Mutex::new(Vec::new())),
+        );
+        let client_order_id = ClientOrderId::new("flush-denial-001");
+        let venue_order_id = VenueOrderId::from("DERIBIT-ORDER-1");
+        let causation_id = UUID4::new();
+
+        let command = if cancel {
+            HandlerCommand::Cancel {
+                causation_id: Some(causation_id),
+                params: DeribitCancelParams {
+                    order_id: venue_order_id.to_string(),
+                },
+                client_order_id,
+                trader_id: TraderId::from("TESTER-001"),
+                strategy_id: StrategyId::from("S-001"),
+                instrument_id: InstrumentId::from("BTC-PERPETUAL.DERIBIT"),
+            }
+        } else {
+            HandlerCommand::Edit {
+                causation_id: Some(causation_id),
+                params: DeribitEditParams {
+                    order_id: venue_order_id.to_string(),
+                    amount: Decimal::new(1, 0),
+                    price: Some(Decimal::new(50_000, 0)),
+                    post_only: None,
+                    reject_post_only: None,
+                    reduce_only: None,
+                    trigger_price: None,
+                },
+                client_order_id,
+                trader_id: TraderId::from("TESTER-001"),
+                strategy_id: StrategyId::from("S-001"),
+                instrument_id: InstrumentId::from("BTC-PERPETUAL.DERIBIT"),
+            }
+        };
+
+        signal.store(true, Ordering::Relaxed);
+        handler.process_command(command).await;
+        assert!(handler.next().await.is_none());
+
+        let message = out_rx.try_recv().expect("shutdown should flush the denial");
+
+        let id = match message {
+            NautilusWsMessage::OrderCancelDenied(event) if cancel => event.client_order_id,
+            NautilusWsMessage::OrderModifyDenied(event) if !cancel => event.client_order_id,
+            other => panic!("expected one denial, was {other:?}"),
+        };
+
+        assert_eq!(id, client_order_id);
+        assert!(out_rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn ambiguous_submit_error_keeps_order_context() {
+        let mut handler = routing_test_handler();
+        let client_order_id = ClientOrderId::from("O-AMBIGUOUS-SUBMIT");
+        handler.submitted_order_contexts.insert(
+            client_order_id,
+            OrderContext {
+                client_order_id,
+                trader_id: TraderId::from("TRADER-001"),
+                strategy_id: StrategyId::from("S-001"),
+                instrument_id: InstrumentId::from("BTC-PERPETUAL.DERIBIT"),
+                order_side: OrderSide::Buy,
+                order_type: OrderType::Limit,
+                accepted: false,
+                last_order_signature: None,
+            },
+        );
+
+        handler.pending_requests.insert(
+            1,
+            PendingRequestType::Buy {
+                client_order_id,
+                trader_id: TraderId::from("TRADER-001"),
+                strategy_id: StrategyId::from("S-001"),
+                instrument_id: InstrumentId::from("BTC-PERPETUAL.DERIBIT"),
+                order_side: OrderSide::Buy,
+                order_type: OrderType::Limit,
+            },
+        );
+
+        let message = handler
+            .process_raw_message(&load_test_json("ws_error.json"))
+            .await;
+
+        assert!(message.is_none());
+        assert!(
+            handler
+                .submitted_order_contexts
+                .contains_key(&client_order_id)
+        );
+        assert!(handler.pending_requests.is_empty());
+    }
+
+    #[tokio::test]
+    async fn submit_error_response_emits_order_rejected() {
+        let mut handler = routing_test_handler();
+        let client_order_id = ClientOrderId::from("O-19700101-000000-001-001-1");
+        handler.submitted_order_contexts.insert(
+            client_order_id,
+            OrderContext {
+                client_order_id,
+                trader_id: TraderId::from("TRADER-001"),
+                strategy_id: StrategyId::from("S-001"),
+                instrument_id: InstrumentId::from("BTC-PERPETUAL.DERIBIT"),
+                order_side: OrderSide::Buy,
+                order_type: OrderType::Market,
+                accepted: false,
+                last_order_signature: None,
+            },
+        );
+
+        handler.pending_requests.insert(
+            42,
+            PendingRequestType::Buy {
+                client_order_id,
+                trader_id: TraderId::from("TRADER-001"),
+                strategy_id: StrategyId::from("S-001"),
+                instrument_id: InstrumentId::from("BTC-PERPETUAL.DERIBIT"),
+                order_side: OrderSide::Buy,
+                order_type: OrderType::Market,
+            },
+        );
+
+        let response = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 42,
+            "error": { "code": 11050, "message": "bad_request" }
+        });
+
+        let event = handler.process_raw_message(&response.to_string()).await;
+
+        let Some(NautilusWsMessage::OrderRejected(rejected)) = event else {
+            panic!("expected OrderRejected, was {event:?}");
+        };
+
+        assert_eq!(rejected.client_order_id, client_order_id);
+        assert_eq!(rejected.reason.as_str(), "bad_request");
+        assert!(!rejected.due_post_only);
+        assert!(handler.pending_outgoing.is_empty());
+        assert!(
+            !handler
+                .submitted_order_contexts
+                .contains_key(&client_order_id)
+        );
+    }
+
+    #[tokio::test]
+    async fn submit_result_rejected_sets_due_post_only() {
+        let mut handler = routing_test_handler();
+        let client_order_id = ClientOrderId::from("routed-904");
+        let trader_id = TraderId::from("TRADER-001");
+        let strategy_id = StrategyId::from("S-001");
+        let instrument_id = InstrumentId::from("BTC_USDC.DERIBIT");
+        handler.submitted_order_contexts.insert(
+            client_order_id,
+            OrderContext {
+                client_order_id,
+                trader_id,
+                strategy_id,
+                instrument_id,
+                order_side: OrderSide::Buy,
+                order_type: OrderType::Limit,
+                accepted: false,
+                last_order_signature: None,
+            },
+        );
+
+        handler.pending_requests.insert(
+            42,
+            PendingRequestType::Buy {
+                client_order_id,
+                trader_id,
+                strategy_id,
+                instrument_id,
+                order_side: OrderSide::Buy,
+                order_type: OrderType::Limit,
+            },
+        );
+
+        let mut messages: Vec<serde_json::Value> = serde_json::from_str(include_str!(
+            "../../test_data/ws_routed_spot_execution.json"
+        ))
+        .unwrap();
+        messages[0]["id"] = 42.into();
+        messages[0]["result"]["order"]["order_state"] = "rejected".into();
+        messages[0]["result"]["order"]["reject_reason"] = "post_only_reject".into();
+
+        let event = handler
+            .process_raw_message(&messages[0].to_string())
+            .await
+            .expect("rejected result should emit");
+
+        let NautilusWsMessage::OrderRejected(rejected) = event else {
+            panic!("expected OrderRejected, was {event:?}");
+        };
+
+        assert_eq!(rejected.client_order_id, client_order_id);
+        assert_eq!(rejected.reason.as_str(), "post_only_reject");
+        assert!(rejected.due_post_only);
+        assert!(
+            !handler
+                .submitted_order_contexts
+                .contains_key(&client_order_id)
+        );
+    }
+
+    #[rstest]
+    #[case(DeribitWsMethod::PublicSubscribe)]
+    #[case(DeribitWsMethod::PrivateSubscribe)]
+    #[case(DeribitWsMethod::PublicUnsubscribe)]
+    #[case(DeribitWsMethod::PrivateUnsubscribe)]
+    fn subscription_batches_bound_serialized_bytes(#[case] method: DeribitWsMethod) {
+        let mut channels: Vec<String> = (0..1500)
+            .map(|i| format!("book.BTC-27DEC30-{}-C.none.20.100ms", 100000 + i))
+            .collect();
+        channels.push("quoted.\"\\\n.é".repeat(100));
+        let batches = subscription_batches(channels.clone(), &method).unwrap();
+        assert_eq!(batches.len(), 3);
+        let mut actual = Vec::new();
+
+        for channels in batches {
+            let request = DeribitJsonRpcRequest::new(
+                u64::MAX,
+                method.as_method_str(),
+                DeribitSubscribeParams { channels },
+            );
+            let payload = serde_json::to_string(&request).unwrap();
+            assert!(payload.len() <= SUBSCRIPTION_REQUEST_MAX_BYTES);
+            actual.extend(request.params.channels);
+        }
+
+        assert_eq!(actual, channels);
+    }
+
+    #[rstest]
+    fn subscription_batches_exact_boundary_and_oversized_channel() {
+        let method = DeribitWsMethod::PrivateSubscribe;
+
+        let request = DeribitJsonRpcRequest::new(
+            u64::MAX,
+            method.as_method_str(),
+            DeribitSubscribeParams {
+                channels: vec![String::new()],
+            },
+        );
+
+        let overhead = serde_json::to_string(&request).unwrap().len();
+        let channel = "a".repeat(SUBSCRIPTION_REQUEST_MAX_BYTES - overhead);
+        assert_eq!(
+            subscription_batches(vec![channel.clone()], &method).unwrap(),
+            vec![vec![channel.clone()]],
+        );
+        assert!(matches!(
+            subscription_batches(vec![format!("{channel}a")], &method),
+            Err(DeribitWsError::Subscribe(_)),
+        ));
+        assert!(
+            subscription_batches(Vec::new(), &method)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn subscription_batches_correlate_rejections_and_reconnect() {
+        let mut handler = routing_test_handler();
+        let channels: Vec<String> = (0..1500)
+            .map(|i| format!("book.BTC-27DEC30-{}-C.none.20.100ms", 100000 + i))
+            .collect();
+
+        for channel in &channels {
+            handler.subscriptions_state.add_reference(channel);
+            handler.subscriptions_state.mark_subscribe(channel);
+        }
+
+        handler.handle_subscribe(&channels).unwrap();
+        assert_eq!(handler.subscription_requests.len(), 2);
+        let requests: Vec<_> = handler.subscription_requests.iter().cloned().collect();
+        for (index, (request_id, payload)) in requests.iter().enumerate() {
+            let request: serde_json::Value = serde_json::from_str(payload).unwrap();
+
+            let result = if index == 0 {
+                serde_json::json!({"jsonrpc": "2.0", "id": request_id, "result": request["params"]["channels"]})
+            } else {
+                serde_json::json!({"jsonrpc": "2.0", "id": request_id, "error": {"code": 10028, "message": "too_many_requests"}})
+            };
+
+            handler.process_raw_message(&result.to_string()).await;
+        }
+
+        let rejected: serde_json::Value = serde_json::from_str(&requests[1].1).unwrap();
+        let rejected: Vec<String> =
+            serde_json::from_value(rejected["params"]["channels"].clone()).unwrap();
+        let mut pending = handler.subscriptions_state.pending_subscribe_topics();
+        pending.sort();
+        assert_eq!(pending, rejected);
+        assert!(handler.pending_requests.is_empty());
+        assert_eq!(handler.subscribe_errors.lock().len(), 1);
+        let mut restored = handler.subscriptions_state.reset_after_reconnect();
+        restored.sort();
+        assert_eq!(restored, channels);
+        handler.process_raw_message(RECONNECTED).await;
+        assert!(handler.subscription_requests.is_empty());
+        assert!(handler.subscription_send.is_none());
+        assert_eq!(
+            handler
+                .subscriptions_state
+                .get_reference_count(&channels[0]),
+            1
+        );
+    }
+
+    #[rstest]
+    #[case::full("full")]
+    #[case::partial("partial")]
+    #[case::empty("empty")]
+    #[case::missing("missing")]
+    #[case::null("null")]
+    #[case::object("object")]
+    #[case::scalar("scalar")]
+    #[case::mixed_types("mixed_types")]
+    #[case::unrelated("unrelated")]
+    #[case::mixed_unrelated("mixed_unrelated")]
+    #[case::duplicates("duplicates")]
+    #[case::full_duplicates("full_duplicates")]
+    #[tokio::test]
+    async fn subscription_acknowledgements_correlate_batches(
+        #[case] response_kind: &str,
+        #[values(true, false)] subscribe: bool,
+    ) {
+        let mut handler = routing_test_handler();
+        let channels: Vec<String> = (0..1500)
+            .map(|i| format!("book.BTC-27DEC30-{}-C.none.20.100ms", 100000 + i))
+            .collect();
+
+        for channel in &channels {
+            handler.subscriptions_state.add_reference(channel);
+            handler.subscriptions_state.add_reference(channel);
+            handler.subscriptions_state.mark_subscribe(channel);
+            if !subscribe {
+                handler.subscriptions_state.confirm_subscribe(channel);
+                handler.subscriptions_state.remove_reference(channel);
+                handler.subscriptions_state.remove_reference(channel);
+                handler.subscriptions_state.mark_unsubscribe(channel);
+            }
+        }
+
+        handler
+            .queue_subscription_requests(channels.clone(), subscribe)
+            .unwrap();
+        let requests: Vec<_> = handler.subscription_requests.drain(..).collect();
+        assert_eq!(requests.len(), 2);
+        let mut acknowledged = Vec::new();
+
+        for (index, (request_id, payload)) in requests.iter().enumerate().rev() {
+            let request: serde_json::Value = serde_json::from_str(payload).unwrap();
+            let batch: Vec<String> =
+                serde_json::from_value(request["params"]["channels"].clone()).unwrap();
+            let other: serde_json::Value = serde_json::from_str(&requests[1 - index].1).unwrap();
+            let unrelated = other["params"]["channels"][0].as_str().unwrap();
+            let mut full = batch.clone();
+            full.reverse();
+
+            let result = match response_kind {
+                "full" => serde_json::json!(full),
+                "partial" => serde_json::json!([batch[0]]),
+                "empty" | "missing" => serde_json::json!([]),
+                "null" => serde_json::Value::Null,
+                "object" => serde_json::json!({"channels": batch}),
+                "scalar" => serde_json::json!("ok"),
+                "mixed_types" => serde_json::json!([batch[0], 17]),
+                "unrelated" => serde_json::json!([unrelated]),
+                "mixed_unrelated" => serde_json::json!([batch[0], unrelated]),
+                "duplicates" => serde_json::json!([batch[0], batch[0]]),
+                "full_duplicates" => {
+                    full.push(batch[0].clone());
+                    serde_json::json!(full)
+                }
+                _ => unreachable!(),
+            };
+
+            let mut response = serde_json::json!({
+                "jsonrpc": "2.0", "id": request_id, "result": result,
+            });
+
+            if response_kind == "missing" {
+                response.as_object_mut().unwrap().remove("result");
+            }
+
+            match response_kind {
+                "full" | "full_duplicates" => acknowledged.extend(batch),
+                "partial" | "mixed_unrelated" | "duplicates" => {
+                    acknowledged.push(batch[0].clone());
+                }
+                _ => {}
+            }
+
+            handler.process_raw_message(&response.to_string()).await;
+        }
+
+        let mut expected_pending: Vec<_> = channels
+            .iter()
+            .filter(|ch| !acknowledged.contains(ch))
+            .cloned()
+            .collect();
+        expected_pending.sort();
+
+        let mut pending = if subscribe {
+            handler.subscriptions_state.pending_subscribe_topics()
+        } else {
+            handler.subscriptions_state.pending_unsubscribe_topics()
+        };
+
+        pending.sort();
+
+        assert_eq!(pending, expected_pending);
+        assert_eq!(
+            handler.subscriptions_state.len(),
+            if subscribe { acknowledged.len() } else { 0 }
+        );
+        assert!(handler.pending_requests.is_empty());
+        let expected_errors =
+            usize::from(subscribe && !matches!(response_kind, "full" | "full_duplicates"))
+                * requests.len();
+        assert_eq!(handler.subscribe_errors.lock().len(), expected_errors);
+
+        for (error, (request_id, _)) in handler
+            .subscribe_errors
+            .lock()
+            .iter()
+            .zip(requests.iter().rev())
+        {
+            assert!(error.starts_with("Subscribe acknowledgement "));
+            assert!(error.ends_with(&format!("request_id={request_id}")));
+        }
+
+        for channel in &channels {
+            assert_eq!(
+                handler.subscriptions_state.get_reference_count(channel),
+                if subscribe { 2 } else { 0 }
+            );
+        }
+
+        let mut replay = handler.subscriptions_state.reset_after_reconnect();
+        replay.sort();
+        assert_eq!(replay, if subscribe { channels } else { Vec::new() });
+    }
+
+    #[tokio::test]
+    async fn subscription_acknowledgements_accept_duplicate_requests() {
+        let mut handler = routing_test_handler();
+        let first = "ticker.BTC-PERPETUAL.100ms".to_string();
+        let last = "ticker.ETH-PERPETUAL.100ms".to_string();
+        for channel in [&first, &last] {
+            handler.subscriptions_state.add_reference(channel);
+            handler.subscriptions_state.add_reference(channel);
+            handler.subscriptions_state.mark_subscribe(channel);
+        }
+
+        let (cmd_tx, cmd_rx) = tokio::sync::mpsc::unbounded_channel();
+        handler.cmd_rx = cmd_rx;
+        cmd_tx
+            .send(HandlerCommand::Subscribe {
+                channels: vec![first.clone(), last.clone()],
+            })
+            .unwrap();
+
+        let coalesced = handler.coalesce_subscriptions(vec![first.clone()]);
+        assert_eq!(coalesced, [first.clone(), first.clone(), last.clone()]);
+        handler.handle_subscribe(&coalesced).unwrap();
+        let (request_id, _) = handler.subscription_requests.pop_front().unwrap();
+        let ack =
+            serde_json::json!({"jsonrpc": "2.0", "id": request_id, "result": [last, first, first]});
+        handler.process_raw_message(&ack.to_string()).await;
+
+        assert_eq!(handler.subscriptions_state.len(), 2);
+        assert!(
+            handler
+                .subscriptions_state
+                .pending_subscribe_topics()
+                .is_empty()
+        );
+        assert!(handler.subscribe_errors.lock().is_empty());
+        assert_eq!(handler.subscriptions_state.get_reference_count(&first), 2);
+        assert_eq!(handler.subscriptions_state.get_reference_count(&last), 2);
+
+        let book_first = "book.BTC-PERPETUAL.100ms".to_string();
+        let book_last = "book.BTC-PERPETUAL.raw".to_string();
+        for channel in [&book_first, &book_last] {
+            handler.subscriptions_state.add_reference(channel);
+            handler.subscriptions_state.mark_subscribe(channel);
+            handler.subscriptions_state.confirm_subscribe(channel);
+        }
+
+        let key = BookKey::Raw(Ustr::from("BTC-PERPETUAL"));
+        handler
+            .book_sync
+            .record_subscription(key.clone(), InstrumentId::from("BTC-PERPETUAL.DERIBIT"));
+        let recovery = handler.book_sync.claim(&key).unwrap();
+        let (completion, _rx) = tokio::sync::oneshot::channel();
+        assert!(handler.book_sync.begin_recovery_write(
+            &key,
+            &recovery,
+            recovery.gate.clone(),
+            completion,
+            vec![book_first.clone(), book_last.clone()],
+        ));
+        handler
+            .handle_unsubscribe(vec![
+                book_first.clone(),
+                book_first.clone(),
+                book_last.clone(),
+            ])
+            .unwrap();
+        let (request_id, _) = handler.subscription_requests.pop_front().unwrap();
+        let ack = serde_json::json!({"jsonrpc": "2.0", "id": request_id, "result": [book_last, book_first]});
+        handler.process_raw_message(&ack.to_string()).await;
+        let (_, payload) = handler.subscription_requests.pop_front().unwrap();
+        let replay: serde_json::Value = serde_json::from_str(&payload).unwrap();
+
+        assert_eq!(
+            replay["params"]["channels"],
+            serde_json::json!([book_first, book_last])
+        );
+        assert_eq!(handler.subscription_requests.len(), 0);
+        assert_eq!(handler.subscriptions_state.get_reference_count(&first), 2);
+        assert_eq!(handler.subscriptions_state.get_reference_count(&last), 2);
+    }
+
+    #[tokio::test]
+    async fn subscription_acknowledgements_preserve_cancellation_and_replay() {
+        let mut handler = routing_test_handler();
+        let retained = "ticker.BTC-PERPETUAL.100ms".to_string();
+        let canceled = "ticker.ETH-PERPETUAL.100ms".to_string();
+        for channel in [&retained, &canceled] {
+            handler.subscriptions_state.add_reference(channel);
+            handler.subscriptions_state.add_reference(channel);
+            handler.subscriptions_state.mark_subscribe(channel);
+        }
+
+        handler
+            .handle_subscribe(&[retained.clone(), canceled.clone()])
+            .unwrap();
+        let (request_id, _) = handler.subscription_requests.pop_front().unwrap();
+        let ack = serde_json::json!({"jsonrpc": "2.0", "id": request_id, "result": []});
+        handler.process_raw_message(&ack.to_string()).await;
+
+        assert!(!handler.subscriptions_state.remove_reference(&retained));
+        assert!(!handler.subscriptions_state.remove_reference(&canceled));
+        assert!(handler.subscriptions_state.remove_reference(&canceled));
+        handler.subscriptions_state.mark_unsubscribe(&canceled);
+        handler.process_raw_message(RECONNECTED).await;
+        let replay = handler.subscriptions_state.reset_after_reconnect();
+        handler.handle_subscribe(&replay).unwrap();
+        let (request_id, _) = handler.subscription_requests.pop_front().unwrap();
+        let ack = serde_json::json!({"jsonrpc": "2.0", "id": request_id, "result": [retained]});
+        handler.process_raw_message(&ack.to_string()).await;
+
+        assert_eq!(replay, [retained.as_str()]);
+        assert_eq!(
+            handler.subscriptions_state.all_topics(),
+            [retained.as_str()]
+        );
+        assert_eq!(handler.subscriptions_state.len(), 1);
+        assert_eq!(
+            handler.subscriptions_state.get_reference_count(&retained),
+            1
+        );
+        assert_eq!(
+            handler.subscriptions_state.get_reference_count(&canceled),
+            0
+        );
+        assert!(
+            handler
+                .subscriptions_state
+                .pending_subscribe_topics()
+                .is_empty()
+        );
+        assert!(
+            handler
+                .subscriptions_state
+                .pending_unsubscribe_topics()
+                .is_empty()
+        );
+    }
+
+    #[rstest]
+    #[case::full("full")]
+    #[case::partial("partial")]
+    #[case::empty("empty")]
+    #[case::malformed("malformed")]
+    #[case::error("error")]
+    #[tokio::test]
+    async fn subscription_acknowledgements_gate_book_recovery(
+        #[case] response_kind: &str,
+        #[values(false, true)] cancel: bool,
+    ) {
+        let mut handler = routing_test_handler();
+        let channels = [
+            BOOK_CHANNEL.to_string(),
+            "book.BTC-PERPETUAL.raw".to_string(),
+        ];
+
+        for channel in &channels {
+            handler.subscriptions_state.add_reference(channel);
+            handler.subscriptions_state.add_reference(channel);
+            handler.subscriptions_state.mark_subscribe(channel);
+            handler.subscriptions_state.confirm_subscribe(channel);
+        }
+
+        let key = BookKey::Raw(Ustr::from("BTC-PERPETUAL"));
+        handler
+            .book_sync
+            .record_subscription(key.clone(), InstrumentId::from("BTC-PERPETUAL.DERIBIT"));
+        let recovery = handler.book_sync.claim(&key).unwrap();
+        let (completion, _rx) = tokio::sync::oneshot::channel();
+        assert!(handler.book_sync.begin_recovery_write(
+            &key,
+            &recovery,
+            recovery.gate.clone(),
+            completion,
+            channels.to_vec(),
+        ));
+        handler.handle_unsubscribe(channels.to_vec()).unwrap();
+        let (request_id, _) = handler.subscription_requests.pop_front().unwrap();
+        if cancel {
+            handler.subscriptions_state.remove_reference(&channels[0]);
+            handler.subscriptions_state.remove_reference(&channels[0]);
+            handler.subscriptions_state.mark_unsubscribe(&channels[0]);
+        }
+
+        let response = match response_kind {
+            "full" => serde_json::json!({"jsonrpc": "2.0", "id": request_id, "result": channels}),
+            "partial" => {
+                serde_json::json!({"jsonrpc": "2.0", "id": request_id, "result": [channels[0]]})
+            }
+            "empty" => serde_json::json!({"jsonrpc": "2.0", "id": request_id, "result": []}),
+            "malformed" => serde_json::json!({"jsonrpc": "2.0", "id": request_id, "result": "ok"}),
+            "error" => {
+                serde_json::json!({"jsonrpc": "2.0", "id": request_id, "error": {"code": 10028, "message": "too_many_requests"}})
+            }
+            _ => unreachable!(),
+        };
+
+        handler.process_raw_message(&response.to_string()).await;
+
+        let mut resubscribed: Vec<String> = handler
+            .pending_requests
+            .values()
+            .flat_map(|request| match request {
+                PendingRequestType::Subscribe { channels } => channels.clone(),
+                _ => panic!("unexpected request: {request:?}"),
+            })
+            .collect();
+
+        resubscribed.sort();
+
+        let mut expected = match (response_kind, cancel) {
+            ("full", false) => channels.to_vec(),
+            ("full", true) => vec![channels[1].clone()],
+            _ => Vec::new(),
+        };
+
+        expected.sort();
+
+        assert_eq!(resubscribed, expected);
+        assert!(
+            handler
+                .subscriptions_state
+                .pending_subscribe_topics()
+                .is_empty()
+        );
+        assert_eq!(
+            handler.subscriptions_state.len(),
+            if cancel { 1 } else { 2 }
+        );
+        assert_eq!(
+            handler
+                .subscriptions_state
+                .get_reference_count(&channels[0]),
+            if cancel { 0 } else { 2 }
+        );
+        assert_eq!(
+            handler
+                .subscriptions_state
+                .get_reference_count(&channels[1]),
+            2
+        );
+    }
+
+    #[rstest]
+    fn subscription_coalescing_preserves_barriers_and_authentication() {
+        let mut handler = routing_test_handler();
+        let (cmd_tx, cmd_rx) = tokio::sync::mpsc::unbounded_channel();
+        handler.cmd_rx = cmd_rx;
+        cmd_tx
+            .send(HandlerCommand::Subscribe {
+                channels: vec!["ticker.ETH-PERPETUAL.100ms".into()],
+            })
+            .unwrap();
+
+        cmd_tx
+            .send(HandlerCommand::Unsubscribe {
+                channels: vec!["ticker.BTC-PERPETUAL.100ms".into()],
+            })
+            .unwrap();
+
+        cmd_tx
+            .send(HandlerCommand::Subscribe {
+                channels: vec!["ticker.SOL_USDC-PERPETUAL.100ms".into()],
+            })
+            .unwrap();
+
+        let combined = handler.coalesce_subscriptions(vec!["ticker.BTC-PERPETUAL.100ms".into()]);
+        assert_eq!(
+            combined,
+            vec!["ticker.BTC-PERPETUAL.100ms", "ticker.ETH-PERPETUAL.100ms"]
+        );
+        assert!(matches!(
+            handler.pending_command.take(),
+            Some(HandlerCommand::Unsubscribe { .. })
+        ));
+        assert!(matches!(
+            handler.cmd_rx.try_recv(),
+            Ok(HandlerCommand::Subscribe { .. })
+        ));
+        cmd_tx
+            .send(HandlerCommand::Subscribe {
+                channels: vec!["user.orders.any.any.raw".into()],
+            })
+            .unwrap();
+
+        let combined = handler.coalesce_subscriptions(vec!["ticker.BTC-PERPETUAL.100ms".into()]);
+        assert_eq!(combined, vec!["ticker.BTC-PERPETUAL.100ms"]);
+        assert!(matches!(
+            handler.pending_command,
+            Some(HandlerCommand::Subscribe { .. })
+        ));
+    }
+
+    #[rstest]
+    #[case::reconnect(true)]
+    #[case::shutdown(false)]
+    #[tokio::test]
+    async fn subscription_quota_wait_keeps_messages_and_lifecycle_responsive(
+        #[case] reconnect: bool,
+    ) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            tokio_tungstenite::accept_async(stream).await.unwrap()
+        });
+
+        let (message_handler, raw_rx) = channel_message_handler();
+        let config = WebSocketConfig::builder()
+            .url(format!("ws://{addr}"))
+            .build()
+            .unwrap();
+        let quota = Quota::with_period(Duration::from_secs(60)).unwrap();
+        let ws_client = WebSocketClient::builder()
+            .config(config)
+            .message_handler(message_handler)
+            .keyed_quotas(vec![(DERIBIT_WS_SUBSCRIPTION_KEY.to_string(), quota)])
+            .connect()
+            .await
+            .unwrap();
+        let mut socket = server.await.unwrap();
+        ws_client
+            .send_text(
+                "reserve".to_string(),
+                Some(&[Ustr::from(DERIBIT_WS_SUBSCRIPTION_KEY)]),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            socket.next().await.unwrap().unwrap(),
+            Message::Text("reserve".into())
+        );
+
+        let mut handler = routing_test_handler();
+        handler.inner = Some(Arc::new(ws_client));
+        handler.raw_rx = raw_rx;
+        let (out_tx, mut out_rx) = tokio::sync::mpsc::unbounded_channel();
+        handler.out_tx = out_tx;
+        handler
+            .handle_authenticate(
+                serde_json::json!({"grant_type":"client_credentials"})
+                    .to_string()
+                    .into(),
+            )
+            .await;
+        let auth: serde_json::Value =
+            serde_json::from_str(socket.next().await.unwrap().unwrap().to_text().unwrap()).unwrap();
+        assert_eq!(auth["method"], "public/auth");
+        assert_eq!(auth["id"], 1);
+        let channels = vec![
+            "ticker.BTC-PERPETUAL.100ms".to_string(),
+            "ticker.ETH-PERPETUAL.100ms".to_string(),
+        ];
+
+        for channel in &channels {
+            handler.subscriptions_state.add_reference(channel);
+            handler.subscriptions_state.mark_subscribe(channel);
+            handler
+                .handle_subscribe(std::slice::from_ref(channel))
+                .unwrap();
+        }
+
+        handler.subscriptions_state.add_reference(&channels[0]);
+        assert!(futures_util::poll!(Box::pin(handler.next())).is_pending());
+        assert!(handler.subscription_send.is_some());
+        assert_eq!(handler.subscription_requests.len(), 1);
+
+        let incoming = serde_json::json!({"value":17});
+        socket
+            .send(Message::Text(
+                subscription("unknown.channel", &incoming).into(),
+            ))
+            .await
+            .unwrap();
+        socket.send(Message::Text(serde_json::json!({"jsonrpc":"2.0","method":"heartbeat","params":{"type":"test_request"}}).to_string().into())).await.unwrap();
+        socket
+            .send(Message::Ping(vec![7, 11].into()))
+            .await
+            .unwrap();
+        socket
+            .send(Message::Text(
+                serde_json::json!({
+                    "jsonrpc":"2.0", "id":1, "result":{
+                        "access_token":"access", "refresh_token":"refresh", "expires_in":901,
+                        "scope":"session:test", "token_type":"bearer", "enabled_features":[]
+                    }
+                })
+                .to_string()
+                .into(),
+            ))
+            .await
+            .unwrap();
+        let authenticated = tokio::time::timeout(Duration::from_millis(500), handler.next())
+            .await
+            .unwrap();
+
+        let Some(NautilusWsMessage::Authenticated(auth)) = authenticated else {
+            panic!("Expected authentication response during quota wait");
+        };
+
+        assert_eq!(auth.access_token.expose_secret(), "access");
+        assert_eq!(auth.refresh_token.expose_secret(), "refresh");
+        assert_eq!(auth.expires_in, 901);
+        assert_eq!(auth.scope, "session:test");
+        assert_eq!(auth.token_type, "bearer");
+        assert_eq!(auth.enabled_features, Vec::<String>::new());
+        assert!(
+            matches!(out_rx.try_recv().unwrap(), NautilusWsMessage::Raw(data) if serde_json::from_str::<serde_json::Value>(data.get()).unwrap() == incoming)
+        );
+        let mut heartbeat = None;
+        let mut pong = None;
+
+        for _ in 0..2 {
+            let message = tokio::time::timeout(Duration::from_millis(500), socket.next())
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+
+            match message {
+                Message::Text(text) => {
+                    heartbeat = Some(serde_json::from_str::<serde_json::Value>(&text).unwrap());
+                }
+                Message::Pong(data) => pong = Some(data.to_vec()),
+                message => panic!("Unexpected response: {message:?}"),
+            }
+        }
+
+        assert_eq!(
+            heartbeat,
+            Some(serde_json::json!({"jsonrpc":"2.0", "id":4, "method":"public/test", "params":{}}))
+        );
+        assert_eq!(pong, Some(vec![7, 11]));
+        assert!(handler.subscription_send.is_some());
+        assert_eq!(handler.subscription_requests.len(), 1);
+
+        if reconnect {
+            socket
+                .send(Message::Text(RECONNECTED.into()))
+                .await
+                .unwrap();
+            let result = tokio::time::timeout(Duration::from_millis(500), handler.next())
+                .await
+                .unwrap();
+            assert!(matches!(result, Some(NautilusWsMessage::Reconnected)));
+            assert!(handler.subscription_send.is_none());
+            assert!(handler.subscription_requests.is_empty());
+            assert!(handler.pending_requests.is_empty());
+            let mut restored = handler.subscriptions_state.reset_after_reconnect();
+            restored.sort();
+            assert_eq!(restored, channels);
+            assert_eq!(
+                handler
+                    .subscriptions_state
+                    .get_reference_count(&channels[0]),
+                2
+            );
+            assert_eq!(
+                handler
+                    .subscriptions_state
+                    .get_reference_count(&channels[1]),
+                1
+            );
+        }
+
+        handler.signal.store(true, Ordering::Relaxed);
+        let result = tokio::time::timeout(Duration::from_millis(500), handler.next())
+            .await
+            .unwrap();
+        assert!(result.is_none());
+        assert!(handler.subscription_send.is_none());
+        let close = tokio::time::timeout(Duration::from_millis(500), socket.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert!(matches!(close, Message::Close(_)));
+    }
+
+    #[rstest]
+    #[case(true, "private/subscribe")]
+    #[case(false, "private/unsubscribe")]
+    fn mixed_subscription_batches_keep_original_private_method(
+        #[case] subscribe: bool,
+        #[case] method: &str,
+    ) {
+        let mut handler = routing_test_handler();
+        let mut channels: Vec<String> = (0..1500)
+            .map(|i| format!("ticker.BTC-27DEC30-{}-C.100ms", 100000 + i))
+            .collect();
+        channels.push("user.orders.any.any.raw".into());
+        handler
+            .queue_subscription_requests(channels.clone(), subscribe)
+            .unwrap();
+        assert_eq!(handler.subscription_requests.len(), 2);
+        let mut actual = Vec::new();
+
+        for (_, payload) in &handler.subscription_requests {
+            let request: serde_json::Value = serde_json::from_str(payload).unwrap();
+            assert_eq!(request["method"], method);
+            actual.extend(
+                serde_json::from_value::<Vec<String>>(request["params"]["channels"].clone())
+                    .unwrap(),
+            );
+        }
+
+        assert_eq!(actual, channels);
+    }
+
+    #[tokio::test]
+    async fn subscription_send_wait_processes_heartbeat_and_authentication() {
+        let mut handler = routing_test_handler();
+        let (raw_tx, raw_rx) = tokio::sync::mpsc::unbounded_channel();
+        handler.raw_rx = raw_rx;
+        handler.subscription_send = Some(Box::pin(std::future::pending()));
+        handler
+            .pending_requests
+            .insert(42, PendingRequestType::Authenticate);
+        raw_tx
+            .send(Message::Text(load_test_json("ws_test_request.json").into()))
+            .unwrap();
+        let response = serde_json::json!({
+            "jsonrpc": "2.0", "id": 42,
+            "result": {
+                "access_token": "test-access", "refresh_token": "test-refresh", "expires_in": 900,
+                "scope": "connection", "token_type": "bearer"
+            }
+        });
+        raw_tx
+            .send(Message::Text(response.to_string().into()))
+            .unwrap();
+        let result = tokio::time::timeout(std::time::Duration::from_millis(500), handler.next())
+            .await
+            .unwrap();
+        assert!(matches!(result, Some(NautilusWsMessage::Authenticated(_))));
+        assert!(handler.subscription_send.is_some());
+        assert!(!handler.pending_requests.contains_key(&42));
+        assert!(matches!(
+            handler.pending_requests.get(&1),
+            Some(PendingRequestType::Test)
+        ));
+    }
+
+    #[tokio::test]
+    async fn subscription_send_wait_preserves_command_order() {
+        let mut handler = routing_test_handler();
+        let (cmd_tx, cmd_rx) = tokio::sync::mpsc::unbounded_channel();
+        handler.cmd_rx = cmd_rx;
+        handler.subscription_send = Some(Box::pin(std::future::pending()));
+        cmd_tx
+            .send(HandlerCommand::SetHeartbeat { interval: 37 })
+            .unwrap();
+        {
+            let next = handler.next();
+            tokio::pin!(next);
+            assert!(futures_util::poll!(next).is_pending());
+        }
+
+        assert!(handler.pending_requests.is_empty());
+        assert_eq!(handler.cmd_rx.len(), 1);
+        handler.subscription_send = None;
+        {
+            let next = handler.next();
+            tokio::pin!(next);
+            assert!(futures_util::poll!(next).is_pending());
+        }
+
+        assert_eq!(handler.cmd_rx.len(), 0);
+        assert_eq!(handler.pending_requests.len(), 1);
+        assert!(matches!(
+            handler.pending_requests.get(&1),
+            Some(PendingRequestType::SetHeartbeat)
+        ));
+    }
+
+    #[rstest]
+    #[case(true)]
+    #[case(false)]
+    #[tokio::test]
+    async fn subscription_send_failure_removes_request_correlation(#[case] subscribe: bool) {
+        let mut handler = routing_test_handler();
+        let channels = vec!["ticker.BTC-PERPETUAL.100ms".into()];
+        let request = if subscribe {
+            PendingRequestType::Subscribe { channels }
+        } else {
+            PendingRequestType::Unsubscribe { channels }
+        };
+
+        handler.pending_requests.insert(73, request);
+
+        handler.subscription_send =
+            Some(Box::pin(async { (73, Err(DeribitWsError::NotConnected)) }));
+        {
+            let next = handler.next();
+            tokio::pin!(next);
+            assert!(futures_util::poll!(next).is_pending());
+        }
+
+        assert!(handler.pending_requests.is_empty());
+        assert!(handler.subscription_send.is_none());
+
+        let expected_errors = if subscribe {
+            vec![DeribitWsError::NotConnected.to_string()]
+        } else {
+            Vec::new()
+        };
+
+        assert_eq!(*handler.subscribe_errors.lock(), expected_errors);
+    }
+}

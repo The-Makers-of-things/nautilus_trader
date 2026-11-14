@@ -1,0 +1,86 @@
+# nautilus-derive
+
+[![build](https://github.com/nautechsystems/nautilus_trader/actions/workflows/build.yml/badge.svg?branch=master)](https://github.com/nautechsystems/nautilus_trader/actions/workflows/build.yml)
+[![Documentation](https://img.shields.io/docsrs/nautilus-derive)](https://docs.rs/nautilus-derive/latest/nautilus_derive/)
+[![crates.io version](https://img.shields.io/crates/v/nautilus-derive.svg)](https://crates.io/crates/nautilus-derive)
+![license](https://img.shields.io/github/license/nautechsystems/nautilus_trader?color=blue)
+[![Discord](https://img.shields.io/badge/Discord-%235865F2.svg?logo=discord&logoColor=white)](https://discord.gg/NautilusTrader)
+
+[NautilusTrader](https://nautilustrader.io) adapter for the
+[Derive](https://www.derive.xyz) decentralized derivatives exchange.
+
+The `nautilus-derive` crate implements the Derive adapter for NautilusTrader, including typed HTTP
+and WebSocket clients, REST and stream models, venue parsing, data and execution client wiring, and
+EIP-712 signing for the official **Derive API**.
+
+Derive offers European-style options, perpetual swaps, and spot markets. The v3 API authenticates
+the owner's EOA or multisig through a session-key signer. Orders match off-chain, and operations
+are batched for settlement on Ethereum while users retain custody.
+
+Order quantities must use base units. The adapter denies quote-denominated quantities before
+submission, including conditional orders and every leg of an affected order list. Public payload
+converters also reject quote-denominated quantities.
+
+The official Derive API reference can be found at <https://docs.derive.xyz/>.
+
+## NautilusTrader
+
+[NautilusTrader](https://nautilustrader.io) is an open-source, production-grade, Rust-native trading engine
+with a deterministic, event-driven architecture for multi-asset, multi-venue systems.
+
+The system spans research, simulation, and live execution, providing research-to-live semantic parity.
+
+## Configuration
+
+See the [integration guide](../../../docs/integrations/derive.md) for client settings,
+credentials, and connection setup.
+
+## Feature flags
+
+Feature flags control code inclusion for Rust builds and Python bindings:
+
+- `examples`: Enables the crate's example binaries.
+- `extension-module`: Builds as a Python extension module.
+- `fuzz`: Enables libFuzzer integration for fuzz targets.
+- `high-precision` (default): Enables
+  [high-precision mode](https://nautilustrader.io/docs/nightly/getting_started/installation/#precision-mode)
+  to use 128-bit value types.
+- `python`: Enables Python bindings from [PyO3](https://pyo3.rs).
+- `simulation`: Enables deterministic simulation with `cfg(madsim)`.
+
+## Integrator attribution
+
+Signed order, replace, and trigger-order payloads set `referral_code` to `nautilus`,
+with no additional trading cost.
+
+See [attribution details](../../../docs/integrations/derive.md#referral-code-attribution).
+
+## Fuzzing
+
+Coverage-guided fuzz targets for Derive wire models, parsers, signing payloads, and nonce sequencing
+live in [`fuzz/`](fuzz/README.md). They require the workspace-pinned `cargo-fuzz` binary and a Rust
+nightly toolchain.
+
+## Documentation
+
+- [Rust API reference](https://docs.rs/nautilus-derive)
+- [Integration guide](../../../docs/integrations/derive.md)
+- [Rust examples](examples/)
+- [Python examples](../../../examples/live/derive/)
+
+## License
+
+The source code for NautilusTrader is available on GitHub under the
+[GNU Lesser General Public License v3.0](https://www.gnu.org/licenses/lgpl-3.0.en.html).
+
+---
+
+NautilusTrader™ is developed and maintained by Nautech Systems, a technology
+company specializing in the development of high-performance trading systems.
+For more information, visit <https://nautilustrader.io>.
+
+Use of this software is subject to the [Disclaimer](https://nautilustrader.io/legal/disclaimer/).
+
+<img src="https://github.com/nautechsystems/nautilus_trader/raw/develop/assets/nautilus-logo-white.png" alt="logo" width="300" height="auto"/>
+
+© 2015-2026 Nautech Systems Pty Ltd. All rights reserved.
